@@ -112,6 +112,15 @@ type Manager interface {
 	// the scaleset listener's HandleJobStarted callback.
 	MarkRunning(ctx context.Context, vmid int, runnerID int64) error
 
+	// SetRunnerID stamps the GitHub runner ID on the row without
+	// changing its state. Called by the scaler immediately after
+	// GenerateJitRunnerConfig returns so a sub-15s job that completes
+	// before the gh.Reconciler observes the runner still has a
+	// runner_id available for OnRunnerOrphaned to deregister.
+	// Idempotent — a no-op if the row is missing or already has the
+	// same id.
+	SetRunnerID(ctx context.Context, vmid int, runnerID int64) error
+
 	// MarkCompleted transitions a VM out of Running, queues it for
 	// destruction, and signals a refill. Called from HandleJobCompleted.
 	MarkCompleted(ctx context.Context, vmid int) error

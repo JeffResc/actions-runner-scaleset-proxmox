@@ -54,6 +54,11 @@ type fakeProv struct {
 	// destroys (e.g. block on a channel until the test releases).
 	onDestroy func()
 
+	// powerStateBy lets tests drive per-VMID PowerState replies for the
+	// power-state poller. Default (nil) returns "running" for any VMID,
+	// matching the steady-state expectation of an Assigned/Running VM.
+	powerStateBy map[int]string
+
 	clones       []provisioner.CloneOptions
 	destroys     []int
 	starts       []int
@@ -124,7 +129,7 @@ func (f *fakeProv) WaitReady(_ context.Context, _ *provisioner.VM, _ time.Durati
 	return f.waitErr
 }
 
-func (f *fakeProv) InjectJITConfig(_ context.Context, v *provisioner.VM, _ string, _ map[string]string) error {
+func (f *fakeProv) InjectJITConfig(_ context.Context, v *provisioner.VM, _ string) error {
 	f.mu.Lock()
 	f.injects = append(f.injects, v.VMID)
 	f.mu.Unlock()
@@ -137,6 +142,15 @@ func (f *fakeProv) ReadAgentFile(_ context.Context, _ *provisioner.VM, _ string)
 
 func (f *fakeProv) ListOwnedVMs(_ context.Context) ([]*provisioner.VM, error) {
 	return f.listOwnedRet, f.listErr
+}
+
+func (f *fakeProv) PowerState(_ context.Context, v *provisioner.VM) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if s, ok := f.powerStateBy[v.VMID]; ok {
+		return s, nil
+	}
+	return "running", nil
 }
 
 // testWriter routes slog output to t.Log.
@@ -1058,6 +1072,125 @@ func TestDestroyAsync_BoundedByDestroySem(t *testing.T) {
 	// Drain wg via the public surface.
 	mgr.workerCancel()
 	mgr.wg.Wait()
+}
+
+// TestPowerPoller_DestroysStoppedRunningVM: a row in Running state whose
+// Proxmox VM is observed "stopped" (the in-VM runner powered off after
+// the job) must be queued for destruction by the poller. This is the
+// replacement for the in-VM runner-hook completed callback.
+func TestPowerPoller_DestroysStoppedRunningVM(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID:     71001,
+		Node:     "pve1",
+		Name:     "stopped-on-poll",
+		PoolKind: store.PoolKindHot,
+		State:    store.StateRunning,
+	}))
+	fp := &fakeProv{powerStateBy: map[int]string{71001: "stopped"}}
+	mgr := newTestManager(t, st, fp, Config{})
+
+	mgr.powerPollOnce(context.Background())
+
+	// MarkCompleted transitions the row to Draining and queues destroy.
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		for _, v := range fp.destroys {
+			if v == 71001 {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond, "stopped VM must be queued for destruction")
+}
+
+// TestPowerPoller_NoopOnRunning: a Running row whose VM reports
+// "running" is left alone — the poller is the completion signal, not a
+// general health probe.
+func TestPowerPoller_NoopOnRunning(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID:     71002,
+		Node:     "pve1",
+		Name:     "still-running",
+		PoolKind: store.PoolKindHot,
+		State:    store.StateRunning,
+	}))
+	fp := &fakeProv{} // default returns "running"
+	mgr := newTestManager(t, st, fp, Config{})
+
+	mgr.powerPollOnce(context.Background())
+
+	// Give any spurious goroutine time to run.
+	time.Sleep(50 * time.Millisecond)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.destroys, "running VM must NOT be queued for destruction")
+}
+
+// TestPowerPoller_IgnoresHotAndWarmRows: the poller only acts on
+// Assigned/Running rows. Hot/Warm/Booting/Provisioning VMs are managed
+// by the reconciler's own state machine, and a "stopped" status there is
+// often normal (Warm rows are stopped by design).
+func TestPowerPoller_IgnoresHotAndWarmRows(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 71010, Node: "pve1", Name: "warm-stopped",
+		PoolKind: store.PoolKindWarm, State: store.StateWarm,
+	}))
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 71011, Node: "pve1", Name: "hot-running",
+		PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	fp := &fakeProv{powerStateBy: map[int]string{
+		71010: "stopped",
+		71011: "stopped",
+	}}
+	mgr := newTestManager(t, st, fp, Config{})
+
+	mgr.powerPollOnce(context.Background())
+	time.Sleep(50 * time.Millisecond)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.destroys, "poller must not act on Hot/Warm rows")
+}
+
+// TestSetRunnerID_StampsRowField: the scaler stamps runner_id on the row
+// immediately after GenerateJitRunnerConfig so a sub-15s job that
+// completes before the gh.Reconciler observes the runner still has a
+// runner_id available for OnRunnerOrphaned.
+func TestSetRunnerID_StampsRowField(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 71020, Node: "pve1", Name: "fresh-assigned",
+		PoolKind: store.PoolKindHot, State: store.StateAssigned,
+	}))
+	mgr := newTestManager(t, st, &fakeProv{}, Config{})
+
+	require.NoError(t, mgr.SetRunnerID(context.Background(), 71020, 12345))
+
+	row, err := st.Get(71020)
+	require.NoError(t, err)
+	require.Equal(t, int64(12345), row.RunnerID)
+	require.Equal(t, store.StateAssigned, row.State, "state must not change")
+}
+
+// TestSetRunnerID_NoopOnMissingRow: a runner_id stamp for a vmid that
+// has already been destroyed (rare end-of-job race) must be a clean
+// no-op, not an error.
+func TestSetRunnerID_NoopOnMissingRow(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{})
+
+	require.NoError(t, mgr.SetRunnerID(context.Background(), 99999, 42))
 }
 
 // TestDrain_CompletesNaturallyWhenWorkersFinish: when destroys finish on

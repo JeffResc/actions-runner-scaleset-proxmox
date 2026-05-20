@@ -30,7 +30,6 @@ import (
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/runnertoken"
 )
 
 // Compile-time assertion that *Scaler satisfies the listener.Scaler contract.
@@ -41,18 +40,6 @@ type Config struct {
 	ScaleSetID int
 	WorkFolder string // "_work" by default
 	NamePrefix string // matches the pool's VM name prefix
-
-	// HookCallbackURL is the URL the in-VM runner-hook script POSTs
-	// lifecycle events to. Empty means hooks are disabled and the
-	// per-job token is not minted/injected.
-	HookCallbackURL string
-
-	// HookTokenMinter mints a per-job HMAC JWT bound to the VM's vmid
-	// and the runner's runner_id. The minted token is injected into the
-	// VM as SCALESET_HOOK_TOKEN and presented by the in-VM hook script
-	// when calling back the runner_hook receiver. Required when
-	// HookCallbackURL is set.
-	HookTokenMinter *runnertoken.Minter
 }
 
 // Scaler implements scaleset.Scaler against the orchestrator's pool.
@@ -219,9 +206,21 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	if jitCfg.Runner != nil {
 		runnerID = int64(jitCfg.Runner.ID)
 	}
+	// Stamp the runner_id on the row before injection. This closes the
+	// race where a sub-15s job completes and is destroyed before the
+	// gh.Reconciler observes the runner — without an id on the row,
+	// OnRunnerOrphaned has nothing to deregister and the GitHub-side
+	// registration leaks.
+	if runnerID > 0 {
+		if err := s.pool.SetRunnerID(ctx, vmObj.VMID, runnerID); err != nil {
+			// Non-fatal: the reconciler will set it on its next pass.
+			s.log.Warn("set runner id failed", "vmid", vmObj.VMID, "runner_id", runnerID, "err", err)
+		}
+	}
+
 	if err := s.injectWithRetry(ctx, &provisioner.VM{
 		VMID: vmObj.VMID, Node: vmObj.Node, Name: vmObj.Name,
-	}, jitCfg.EncodedJITConfig, runnerID); err != nil {
+	}, jitCfg.EncodedJITConfig); err != nil {
 		s.log.Error("jit injection failed (after retries); releasing vm", "vmid", vmObj.VMID, "err", err)
 		if s.metrics != nil {
 			s.metrics.ProxmoxErrors.WithLabelValues("inject_jit", vmObj.Node).Inc()
@@ -266,24 +265,6 @@ func (s *Scaler) cleanupStaleRunnerByName(ctx context.Context, name string) {
 	s.log.Info("removed stale runner registration", "name", name, "id", existing.ID)
 }
 
-// hookEnv returns the extra env-file lines to inject alongside the JIT
-// config, or nil when in-VM runner hooks are not configured. Each call
-// mints a fresh per-job HMAC-signed JWT bound to (vmid, runnerID) — see
-// internal/runnertoken for the threat model.
-func (s *Scaler) hookEnv(vmid int, runnerID int64) (map[string]string, error) {
-	if s.cfg.HookCallbackURL == "" || s.cfg.HookTokenMinter == nil {
-		return nil, nil
-	}
-	token, err := s.cfg.HookTokenMinter.Mint(vmid, runnerID)
-	if err != nil {
-		return nil, fmt.Errorf("mint runner-hook token: %w", err)
-	}
-	return map[string]string{
-		"SCALESET_HOOK_URL":   s.cfg.HookCallbackURL,
-		"SCALESET_HOOK_TOKEN": token,
-	}, nil
-}
-
 // injectWithRetry calls InjectJITConfig with a longer retry budget than
 // the underlying HTTP transport for the specific "VM is not running"
 // transient error. This error is misleading — Proxmox returns it when
@@ -291,11 +272,7 @@ func (s *Scaler) hookEnv(vmid int, runnerID int64) (map[string]string, error) {
 // in-VM firstboot scripts churn systemd). The VM is usually fine
 // within 10-30s; we retry the inject so an unlucky timing window
 // doesn't burn a VM.
-func (s *Scaler) injectWithRetry(ctx context.Context, vm *provisioner.VM, jit string, runnerID int64) error {
-	extraEnv, err := s.hookEnv(vm.VMID, runnerID)
-	if err != nil {
-		return err
-	}
+func (s *Scaler) injectWithRetry(ctx context.Context, vm *provisioner.VM, jit string) error {
 	// Bound by both attempts (6) and wall-clock (60s) so a stuck VM
 	// can't pin the scaler past the listener's response deadline.
 	const (
@@ -306,7 +283,7 @@ func (s *Scaler) injectWithRetry(ctx context.Context, vm *provisioner.VM, jit st
 	defer cancel()
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := s.prov.InjectJITConfig(retryCtx, vm, jit, extraEnv)
+		err := s.prov.InjectJITConfig(retryCtx, vm, jit)
 		if err == nil {
 			if attempt > 1 {
 				s.log.Info("jit inject recovered", "vmid", vm.VMID, "attempts", attempt)

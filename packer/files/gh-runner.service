@@ -21,15 +21,6 @@ WorkingDirectory=/opt/actions-runner
 # the same command worked perfectly from a shell.
 EnvironmentFile=/opt/actions-runner/jitconfig.env
 
-# Runner-side lifecycle hooks. The runner invokes these before/after
-# every job and they POST to the orchestrator's :9103 endpoint. Path
-# values point at scripts installed by provision.sh; the scripts read
-# SCALESET_HOOK_URL / SCALESET_HOOK_SECRET from the EnvironmentFile and
-# silently no-op if either is empty (so the image stays compatible with
-# orchestrators that don't enable runner_hook).
-Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/actions-runner/hook-job-started.sh
-Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/actions-runner/hook-job-completed.sh
-
 ExecStart=/opt/actions-runner/run.sh --jitconfig ${JIT_CONFIG}
 
 # Regardless of the runner's exit code, power the VM off so the

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -18,17 +17,6 @@ import (
 
 var tracer = otel.Tracer(observability.TracerName)
 
-// sortedKeys returns m's keys in lexicographic order so the env-file
-// content is deterministic across runs (helpful for tests + diffs).
-func sortedKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // Proxmox guest-agent file-write enforces a per-call body cap around 60 KiB
 // (the QGA command channel limit). JIT runner configs are a few KB so this
 // is plenty of headroom; if a future caller needs to write larger files we
@@ -40,12 +28,6 @@ const agentFileWriteMaxBytes = 60 * 1024
 // environment-file. The runner unit loads the env file and passes
 // JIT_CONFIG to `run.sh --jitconfig`.
 //
-// extraEnv lines are written to the same env file before JIT_CONFIG.
-// Typical caller passes SCALESET_HOOK_URL + SCALESET_HOOK_SECRET so the
-// in-VM hook scripts know where to call back. Keys must be ASCII
-// [A-Z0-9_]; values are wrapped in single quotes to allow arbitrary
-// content. A nil/empty map is fine.
-//
 // We use the env-file form (rather than passing via shell substitution
 // in ExecStart) because shell substitution under systemd was unreliable:
 // the runner intermittently received an empty value and exited with
@@ -56,7 +38,7 @@ const agentFileWriteMaxBytes = 60 * 1024
 // luthermonson/go-proxmox v0.5.1 does not expose a typed wrapper for it.
 // We use the library's authenticated Client.Post so token rotation and
 // transport configuration still go through the library.
-func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string, extraEnv map[string]string) error {
+func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) error {
 	if vm == nil {
 		return fmt.Errorf("inject jit: nil vm")
 	}
@@ -67,10 +49,9 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string, ex
 		attribute.Int("vm.id", vm.VMID),
 		attribute.String("vm.node", vm.Node),
 		attribute.Int("jit.bytes", len(jitConfig)),
-		attribute.Int("extra_env.count", len(extraEnv)),
 	))
 	defer span.End()
-	err := wrapGuestAgent(p.injectJITConfigInner(ctx, vm, jitConfig, extraEnv))
+	err := wrapGuestAgent(p.injectJITConfigInner(ctx, vm, jitConfig))
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "inject failed")
@@ -78,21 +59,12 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string, ex
 	return err
 }
 
-func (p *pmox) injectJITConfigInner(ctx context.Context, vm *VM, jitConfig string, extraEnv map[string]string) error {
+func (p *pmox) injectJITConfigInner(ctx context.Context, vm *VM, jitConfig string) error {
 	// Quoting: JIT configs are pure ASCII base64 (chars in [A-Za-z0-9+/=]),
 	// none of which need escaping in a systemd env-file value. We still
 	// wrap in single quotes as a defensive measure against future format
-	// changes. Same for extraEnv values: wrap in single quotes and
-	// disallow embedded single quotes (which the in-VM hook secret
-	// generator never produces).
+	// changes.
 	var b strings.Builder
-	for _, k := range sortedKeys(extraEnv) {
-		v := extraEnv[k]
-		if strings.ContainsAny(v, "'\n") {
-			return fmt.Errorf("inject jit: extra env %q contains unsupported character", k)
-		}
-		fmt.Fprintf(&b, "%s='%s'\n", k, v)
-	}
 	fmt.Fprintf(&b, "JIT_CONFIG='%s'\n", jitConfig)
 	envContent := b.String()
 

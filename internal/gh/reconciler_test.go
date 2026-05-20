@@ -121,6 +121,7 @@ func (f *fakeManager) Acquire(context.Context, int64) (*pool.VM, error) {
 	return nil, pool.ErrNoneAvailable
 }
 func (f *fakeManager) MarkRunning(context.Context, int, int64) error { return nil }
+func (f *fakeManager) SetRunnerID(context.Context, int, int64) error  { return nil }
 func (f *fakeManager) MarkCompleted(context.Context, int) error      { return nil }
 func (f *fakeManager) Stats(context.Context) (pool.Stats, error)     { return pool.Stats{}, nil }
 func (f *fakeManager) Recover(context.Context) error                 { return nil }
@@ -153,11 +154,14 @@ func (s *stubProv) Clone(context.Context, provisioner.CloneOptions) (*provisione
 func (s *stubProv) Start(context.Context, *provisioner.VM) error                    { return nil }
 func (s *stubProv) Stop(context.Context, *provisioner.VM) error                     { return nil }
 func (s *stubProv) WaitReady(context.Context, *provisioner.VM, time.Duration) error { return nil }
-func (s *stubProv) InjectJITConfig(context.Context, *provisioner.VM, string, map[string]string) error {
+func (s *stubProv) InjectJITConfig(context.Context, *provisioner.VM, string) error {
 	return nil
 }
 func (s *stubProv) ReadAgentFile(context.Context, *provisioner.VM, string) ([]byte, error) {
 	return nil, nil
+}
+func (s *stubProv) PowerState(context.Context, *provisioner.VM) (string, error) {
+	return "running", nil
 }
 func (s *stubProv) Ping(context.Context) error { return nil }
 func (s *stubProv) TemplateNode() string       { return "pve1" }

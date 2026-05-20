@@ -203,9 +203,8 @@ pool: {}
 	require.Equal(t, 30*time.Second, cfg.GitHub.RunningIdleGraceD)
 	require.Equal(t, 2*time.Minute, cfg.GitHub.AssignedOfflineGraceD)
 
-	// Runner-hook is off by default; the orchestrator must still parse.
-	require.Empty(t, cfg.RunnerHook.HTTPAddr)
-	require.Empty(t, cfg.RunnerHook.HMACSecret)
+	// Power-state poller default.
+	require.Equal(t, 3*time.Second, cfg.Pool.PowerPollIntervalD)
 }
 
 // TestParse_GitHubReconcilerOverrides confirms the YAML keys map to the
@@ -240,77 +239,6 @@ pool: {}
 	require.Equal(t, 99*time.Minute, cfg.GitHub.AssignedGraceD)
 	require.Equal(t, 11*time.Second, cfg.GitHub.RunningIdleGraceD)
 	require.Equal(t, 45*time.Second, cfg.GitHub.AssignedOfflineGraceD)
-}
-
-// TestParse_RunnerHookRequiresSecretAndCallback validates the
-// cross-field requirement that enabling http_addr also requires both
-// hmac_secret_env and callback_url. The opposite — leaving http_addr
-// empty — must allow the other fields to be absent.
-func TestParse_RunnerHookRequiresSecretAndCallback(t *testing.T) {
-	withHook := func(extra string) string {
-		return `
-github:
-  auth_mode: pat
-  pat: { token_env: TEST_GH_TOKEN }
-  scope: { org: o }
-scaleset: { name: x, max_concurrent_runners: 5 }
-proxmox:
-  endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
-  template_vmid: 9000
-  vmid_range: { min: 10000, max: 19999 }
-  storage: { disk: d, snippets: s }
-  network: { bridge: br0 }
-nodes:
-  strategy: single
-  single_node: n1
-pool: {}
-runner_hook:
-  http_addr: "0.0.0.0:9103"
-` + extra
-	}
-	setEnv(t, map[string]string{
-		"TEST_GH_TOKEN":   "x",
-		"TEST_PVE_TOKEN":  "y",
-		"TEST_HOOK_SEC":   "this-secret-must-be-at-least-32-bytes-long",
-		"TEST_HOOK_SHORT": "too-short",
-	})
-
-	// http_addr set, no secret env → error.
-	_, err := config.Parse([]byte(withHook("  callback_url: \"http://x:9103\"\n")))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "hmac_secret_env")
-
-	// http_addr + secret set, no callback_url → error.
-	_, err = config.Parse([]byte(withHook("  hmac_secret_env: TEST_HOOK_SEC\n")))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "callback_url")
-
-	// Too-short HMAC secret → rejected at config-load (defense against
-	// accidental weak secrets in deployment). Has to fail BEFORE the
-	// callback_url check so a misconfigured operator doesn't see a
-	// downstream error first.
-	_, err = config.Parse([]byte(withHook("  hmac_secret_env: TEST_HOOK_SHORT\n  callback_url: \"http://x:9103\"\n")))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "32 bytes")
-
-	// All three set → resolves cleanly and exposes the secret on the
-	// resolved sibling field. Default TTL is also applied.
-	setEnv(t, map[string]string{
-		"TEST_GH_TOKEN":  "x",
-		"TEST_PVE_TOKEN": "y",
-		"TEST_HOOK_SEC":  "this-secret-must-be-at-least-32-bytes-long",
-	})
-	cfg, err := config.Parse([]byte(withHook("  hmac_secret_env: TEST_HOOK_SEC\n  callback_url: \"http://x:9103\"\n")))
-	require.NoError(t, err)
-	require.Equal(t, "this-secret-must-be-at-least-32-bytes-long", cfg.RunnerHook.HMACSecret)
-	require.Equal(t, "http://x:9103", cfg.RunnerHook.CallbackURL)
-	require.Equal(t, 6*time.Hour, cfg.RunnerHook.TokenTTLD, "default token_ttl is 6h")
-
-	// Explicit token_ttl overrides the default.
-	cfg, err = config.Parse([]byte(withHook("  hmac_secret_env: TEST_HOOK_SEC\n  callback_url: \"http://x:9103\"\n  token_ttl: 30m\n")))
-	require.NoError(t, err)
-	require.Equal(t, 30*time.Minute, cfg.RunnerHook.TokenTTLD)
 }
 
 func TestParse_AppAuthRequiresAppBlock(t *testing.T) {

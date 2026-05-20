@@ -18,8 +18,6 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"gopkg.in/yaml.v3"
-
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/runnertoken"
 )
 
 // Config is the full orchestrator configuration parsed from YAML.
@@ -31,7 +29,6 @@ type Config struct {
 	Pool          PoolConfig          `yaml:"pool" validate:"required"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	AdminAPI      AdminAPIConfig      `yaml:"admin_api"`
-	RunnerHook    RunnerHookConfig    `yaml:"runner_hook"`
 }
 
 // GitHubConfig configures GitHub authentication, scope, and the
@@ -195,10 +192,20 @@ type PoolConfig struct {
 	DrainTimeout      string `yaml:"drain_timeout"`
 	BootMaxAttempts   int    `yaml:"boot_max_attempts" validate:"gte=1"`
 
+	// PowerPollInterval is how often the manager polls Proxmox for the
+	// power state of Assigned/Running VMs. When a row's VM is observed
+	// "stopped" (the in-VM gh-runner.service powers off on job
+	// completion), the row is queued for destruction. This replaces
+	// the previous in-VM runner-hook callback channel — Proxmox is
+	// the single source of truth for "is the job over".
+	// Default "3s"; must be > 0.
+	PowerPollInterval string `yaml:"power_poll_interval"`
+
 	// Resolved durations (populated by Resolve).
 	ReconcileIntervalD time.Duration `yaml:"-"`
 	VMMaxAgeD          time.Duration `yaml:"-"`
 	DrainTimeoutD      time.Duration `yaml:"-"`
+	PowerPollIntervalD time.Duration `yaml:"-"`
 }
 
 // ObservabilityConfig configures logging, metrics, and tracing endpoints.
@@ -233,79 +240,6 @@ type AdminAPIConfig struct {
 	HTTPAddr        string `yaml:"http_addr"`
 	SharedSecretEnv string `yaml:"shared_secret_env"`
 	SharedSecret    string `yaml:"-"`
-}
-
-// RunnerHookConfig configures the in-VM runner-side hook receiver. The
-// runner posts lifecycle events to this endpoint via the
-// ACTIONS_RUNNER_HOOK_JOB_* hooks. Disabled when HTTPAddr is empty.
-//
-// Auth model: each job gets its own short-lived HMAC-signed JWT (see
-// internal/runnertoken). HMACSecretEnv names the env var holding the
-// HMAC secret used for both signing and verification; TokenTTL bounds
-// how long a minted token remains valid.
-type RunnerHookConfig struct {
-	// HTTPAddr is what the server binds to (e.g. "0.0.0.0:9103"). Must
-	// be reachable from the VM bridge network, NOT just localhost.
-	HTTPAddr string `yaml:"http_addr"`
-
-	// HMACSecretEnv names the env var holding the HMAC-SHA256 secret
-	// used to sign per-job runner-hook JWTs. The secret must be at least
-	// 16 bytes; 32 random bytes is the recommended size.
-	HMACSecretEnv string `yaml:"hmac_secret_env"`
-	HMACSecret    string `yaml:"-"`
-
-	// TokenTTL is the lifetime of a minted per-job JWT. Default 6h
-	// (covers practical job durations with headroom); shorter is
-	// stricter and longer means leaked tokens stay valid longer.
-	TokenTTL  string        `yaml:"token_ttl"`
-	TokenTTLD time.Duration `yaml:"-"`
-
-	// CallbackURL is what gets injected into each VM's JIT env file as
-	// SCALESET_HOOK_URL — i.e. the URL the in-VM hook script uses to
-	// reach this receiver. Typically the LAN-routable form of HTTPAddr
-	// (e.g. "http://192.168.0.20:9103"). Required when HTTPAddr is set.
-	CallbackURL string `yaml:"callback_url"`
-
-	// RateLimit controls per-source-IP request throttling on the
-	// receiver. Defaults are tuned for direct VM-to-orchestrator
-	// traffic; tune or disable if fronting with a proxy that rate
-	// limits on its own.
-	RateLimit RunnerHookRateLimitConfig `yaml:"rate_limit"`
-}
-
-// RunnerHookRateLimitConfig configures the per-IP token-bucket limiter
-// in front of the runner-hook receiver and how the receiver determines
-// the "real" client IP when behind a trusted reverse proxy.
-type RunnerHookRateLimitConfig struct {
-	// Disabled turns off rate limiting entirely. Use only when a
-	// fronting reverse proxy enforces rate limits of its own.
-	Disabled bool `yaml:"disabled"`
-
-	// RPS is the sustained per-IP request rate before the receiver
-	// returns 429. Zero selects the default (5 RPS).
-	RPS float64 `yaml:"rps"`
-
-	// Burst is the per-IP burst budget. Zero selects the default (10).
-	Burst int `yaml:"burst"`
-
-	// IdleTTL is how long an idle per-IP entry lives in the limiter's
-	// map before the sweeper evicts it. Zero selects the default (10m).
-	IdleTTL  string        `yaml:"idle_ttl"`
-	IdleTTLD time.Duration `yaml:"-"`
-
-	// TrustedProxies is a list of CIDR ranges. When a request arrives
-	// from a source IP in one of these ranges, the receiver consults
-	// proxy headers (Cf-Connecting-Ip, X-Real-Ip, then X-Forwarded-For
-	// right-to-left, skipping trusted hops) to determine the real
-	// client IP used for rate limiting and logs. Requests from outside
-	// the trusted set always use the direct peer address — proxy
-	// headers from untrusted sources are ignored entirely so a direct
-	// connection cannot spoof its origin.
-	//
-	// Empty disables proxy-header trust. Examples: ["127.0.0.1/32"]
-	// when behind a local nginx; ["173.245.48.0/20", ...] for the
-	// published Cloudflare ranges.
-	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 // Load reads, parses, defaults, env-resolves, and validates a YAML config
@@ -351,6 +285,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Pool.BootMaxAttempts == 0 {
 		c.Pool.BootMaxAttempts = 3
+	}
+	if c.Pool.PowerPollInterval == "" {
+		c.Pool.PowerPollInterval = "3s"
 	}
 	// Observability
 	if c.Observability.HTTPAddr == "" {
@@ -424,50 +361,6 @@ func (c *Config) Resolve() error {
 		}
 		c.AdminAPI.SharedSecret = v
 	}
-	// Runner hook HMAC secret (optional feature, but required and strict
-	// when enabled — no insecure defaults).
-	if c.RunnerHook.HTTPAddr != "" {
-		if c.RunnerHook.HMACSecretEnv == "" {
-			return errors.New("runner_hook.hmac_secret_env is required when http_addr is set")
-		}
-		v, err := mustEnv(c.RunnerHook.HMACSecretEnv)
-		if err != nil {
-			return fmt.Errorf("runner_hook.hmac_secret_env: %w", err)
-		}
-		if len(v) < runnertoken.MinHMACSecretBytes {
-			return fmt.Errorf("runner_hook.hmac_secret_env (%s): secret must be at least %d bytes (got %d) — generate with `openssl rand -hex 32`",
-				c.RunnerHook.HMACSecretEnv, runnertoken.MinHMACSecretBytes, len(v))
-		}
-		c.RunnerHook.HMACSecret = v
-		if c.RunnerHook.CallbackURL == "" {
-			return errors.New("runner_hook.callback_url is required when http_addr is set")
-		}
-		if c.RunnerHook.TokenTTL == "" {
-			c.RunnerHook.TokenTTL = "6h"
-		}
-		c.RunnerHook.TokenTTLD, err = time.ParseDuration(c.RunnerHook.TokenTTL)
-		if err != nil {
-			return fmt.Errorf("runner_hook.token_ttl: %w", err)
-		}
-		if c.RunnerHook.TokenTTLD <= 0 {
-			return errors.New("runner_hook.token_ttl must be positive")
-		}
-		if c.RunnerHook.RateLimit.IdleTTL != "" {
-			c.RunnerHook.RateLimit.IdleTTLD, err = time.ParseDuration(c.RunnerHook.RateLimit.IdleTTL)
-			if err != nil {
-				return fmt.Errorf("runner_hook.rate_limit.idle_ttl: %w", err)
-			}
-			if c.RunnerHook.RateLimit.IdleTTLD <= 0 {
-				return errors.New("runner_hook.rate_limit.idle_ttl must be positive")
-			}
-		}
-		if c.RunnerHook.RateLimit.RPS < 0 {
-			return errors.New("runner_hook.rate_limit.rps must be non-negative")
-		}
-		if c.RunnerHook.RateLimit.Burst < 0 {
-			return errors.New("runner_hook.rate_limit.burst must be non-negative")
-		}
-	}
 	// Node selector consistency.
 	switch c.Nodes.Strategy {
 	case "single":
@@ -492,6 +385,13 @@ func (c *Config) Resolve() error {
 	c.Pool.DrainTimeoutD, err = time.ParseDuration(c.Pool.DrainTimeout)
 	if err != nil {
 		return fmt.Errorf("pool.drain_timeout: %w", err)
+	}
+	c.Pool.PowerPollIntervalD, err = time.ParseDuration(c.Pool.PowerPollInterval)
+	if err != nil {
+		return fmt.Errorf("pool.power_poll_interval: %w", err)
+	}
+	if c.Pool.PowerPollIntervalD <= 0 {
+		return errors.New("pool.power_poll_interval must be positive")
 	}
 	c.GitHub.PollIntervalD, err = time.ParseDuration(c.GitHub.PollInterval)
 	if err != nil {

@@ -52,6 +52,13 @@ type Config struct {
 	DrainTimeout         time.Duration
 	BootMaxAttempts      int
 
+	// PowerPollInterval is the cadence at which the manager polls
+	// Proxmox for the power state of Assigned/Running VMs. When a row's
+	// VM appears stopped, the row is queued for destruction — this is
+	// the orchestrator's "job completed" signal in lieu of the deleted
+	// in-VM runner-hook. Zero falls back to a sane default (3s).
+	PowerPollInterval time.Duration
+
 	ScaleSetName string
 	VMNamePrefix string // e.g. "gh-runner-<scaleset>-"
 	VMIDRange    config.VMIDRange
@@ -127,6 +134,9 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 	}
 	if cfg.GuestAgentTO <= 0 {
 		cfg.GuestAgentTO = 90 * time.Second
+	}
+	if cfg.PowerPollInterval <= 0 {
+		cfg.PowerPollInterval = 3 * time.Second
 	}
 	if cfg.BootMaxAttempts <= 0 {
 		cfg.BootMaxAttempts = 3
@@ -248,6 +258,27 @@ func (m *manager) Acquire(ctx context.Context, jobID int64) (*VM, error) {
 	)
 	m.SignalRefill()
 	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name}, nil
+}
+
+// SetRunnerID stamps RunnerID on the row without changing state. Used by
+// the scaler right after GenerateJitRunnerConfig so the row carries the
+// id before any job/runner-side transition has a chance to fire — closes
+// the race where a sub-15s job completes before MarkRunning/PromoteToRunning
+// runs and OnRunnerOrphaned then leaks the GitHub registration.
+func (m *manager) SetRunnerID(_ context.Context, vmid int, runnerID int64) error {
+	if runnerID <= 0 {
+		return nil
+	}
+	_, err := m.store.Update(vmid, func(v *store.VM) {
+		v.RunnerID = runnerID
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("set runner id: %w", err)
+	}
+	return nil
 }
 
 // MarkRunning transitions Assigned → Running and stamps the runner ID.
@@ -442,12 +473,27 @@ func (m *manager) Recover(ctx context.Context) error {
 // then force-cancels workerCtx so in-flight Proxmox calls see ctx.Done
 // and unwind — without that escalation a single stuck destroy could pin
 // the process well past DrainTimeout.
+//
+// A second goroutine runs the power-state poller — it watches every
+// Assigned/Running row and treats a Proxmox-side "stopped" power state
+// as the JobCompleted signal (the in-VM gh-runner.service powers off
+// when the runner exits). The poller exits when ctx is cancelled; like
+// the reconcile loop it's bounded by the manager's lifetime.
 func (m *manager) Run(ctx context.Context) error {
 	tick := time.NewTicker(m.cfg.ReconcileInterval)
 	defer tick.Stop()
 
 	// Kick once on entry.
 	m.SignalRefill()
+
+	// Power-state poller. Runs independently of the reconcile loop so
+	// a slow Proxmox reply doesn't delay reconcile and vice versa.
+	pollerDone := make(chan struct{})
+	go func() {
+		defer close(pollerDone)
+		m.runPowerPoll(ctx)
+	}()
+	defer func() { <-pollerDone }()
 
 	for {
 		select {
@@ -458,6 +504,62 @@ func (m *manager) Run(ctx context.Context) error {
 			m.reconcileOnce(ctx)
 		case <-m.refill:
 			m.reconcileOnce(ctx)
+		}
+	}
+}
+
+// runPowerPoll observes Proxmox-side power state for Assigned/Running
+// VMs and queues a MarkCompleted on any that have flipped to "stopped".
+// This is the orchestrator's job-completion signal: the runner unit's
+// ExecStopPost is `systemctl poweroff`, so a stopped VM means the job
+// finished and the runner exited.
+//
+// Errors are logged and skipped per-VM — one Proxmox API blip mustn't
+// short-circuit the whole pass. The next tick will pick up rows we
+// missed.
+func (m *manager) runPowerPoll(ctx context.Context) {
+	tick := time.NewTicker(m.cfg.PowerPollInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			m.powerPollOnce(ctx)
+		}
+	}
+}
+
+// powerPollOnce does a single pass over Assigned/Running rows. Exposed
+// (lower-case) so tests can drive it deterministically without spinning
+// the time-based Run loop.
+func (m *manager) powerPollOnce(ctx context.Context) {
+	rows, err := m.store.ListByState(store.StateAssigned, store.StateRunning)
+	if err != nil {
+		m.log.Warn("power-poll: list rows failed", "err", err)
+		return
+	}
+	for _, row := range rows {
+		state, err := m.prov.PowerState(ctx, &provisioner.VM{
+			VMID: row.VMID, Node: row.Node, Name: row.Name,
+		})
+		if err != nil {
+			m.log.Debug("power-poll: query failed; will retry", "vmid", row.VMID, "err", err)
+			continue
+		}
+		// Empty string means "unknown" (VM not found). Skip — the
+		// stuck-state sweep will reap genuinely-missing rows.
+		if state == "" || state == "running" {
+			continue
+		}
+		// Anything else ("stopped", "paused", ...) signals the job is
+		// no longer executing. MarkCompleted is idempotent and refuses
+		// rows already in Draining/Destroying, so a duplicate poll
+		// observation is harmless.
+		m.log.Info("power-poll: vm not running; marking completed",
+			"vmid", row.VMID, "state", state, "db_state", row.State)
+		if err := m.MarkCompleted(ctx, row.VMID); err != nil {
+			m.log.Warn("power-poll: mark completed failed", "vmid", row.VMID, "err", err)
 		}
 	}
 }

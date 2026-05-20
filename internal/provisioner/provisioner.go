@@ -85,9 +85,19 @@ type Provisioner interface {
 	Stop(ctx context.Context, vm *VM) error
 	Destroy(ctx context.Context, vm *VM) error
 	WaitReady(ctx context.Context, vm *VM, timeout time.Duration) error
-	InjectJITConfig(ctx context.Context, vm *VM, jitConfig string, extraEnv map[string]string) error
+	InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) error
 	ReadAgentFile(ctx context.Context, vm *VM, path string) ([]byte, error)
 	ListOwnedVMs(ctx context.Context) ([]*VM, error)
+
+	// PowerState returns the Proxmox status string for the VM —
+	// typically "running", "stopped", or "paused". Returns an empty
+	// string when the VM cannot be located (callers should treat that
+	// as "unknown" and skip — not as "stopped"). Used by the pool
+	// manager's power-state poller to detect job completion: the
+	// in-VM gh-runner.service powers off after the runner exits, and
+	// observing "stopped" on an Assigned/Running row is the orchestrator's
+	// completion signal in lieu of an in-VM hook.
+	PowerState(ctx context.Context, vm *VM) (string, error)
 
 	// Ping does the cheapest possible Proxmox API call (GET /version) so
 	// callers can drive readiness probes. Returns nil iff the API is
@@ -400,6 +410,23 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		return fmt.Errorf("await delete: %w", err)
 	}
 	return nil
+}
+
+// PowerState returns the Proxmox status string ("running"/"stopped"/...)
+// for the VM. A missing VM returns ("", nil) — callers treat that as
+// "unknown" and skip the row rather than confuse it with "stopped".
+func (p *pmox) PowerState(ctx context.Context, vm *VM) (string, error) {
+	if vm == nil {
+		return "", fmt.Errorf("power state: nil vm")
+	}
+	pVM, err := p.getVM(ctx, vm)
+	if err != nil {
+		if isNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return pVM.Status, nil
 }
 
 // WaitReady blocks until the qemu-guest-agent inside the VM is responsive

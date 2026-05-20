@@ -2,61 +2,9 @@ package scaler
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/runnertoken"
 )
-
-const testHMACSecret = "0123456789abcdef0123456789abcdef"
-
-// TestHookEnv verifies the env-file lines we inject into each VM's JIT
-// payload so the in-VM lifecycle hook scripts know where to call back.
-// The contract is "callback URL + minter both present → token minted;
-// either missing → no entries". We don't try to inject a half-config.
-func TestHookEnv(t *testing.T) {
-	t.Parallel()
-	minter, err := runnertoken.NewMinter([]byte(testHMACSecret), time.Hour, "test-scaleset")
-	require.NoError(t, err)
-
-	t.Run("both set mints token", func(t *testing.T) {
-		t.Parallel()
-		s := &Scaler{cfg: Config{
-			HookCallbackURL: "http://192.168.0.20:9103",
-			HookTokenMinter: minter,
-		}}
-		got, err := s.hookEnv(10042, 88)
-		require.NoError(t, err)
-		require.Equal(t, "http://192.168.0.20:9103", got["SCALESET_HOOK_URL"])
-		require.NotEmpty(t, got["SCALESET_HOOK_TOKEN"])
-
-		// Verifier should accept the minted token and the claims should
-		// match what we asked for.
-		v, err := runnertoken.NewVerifier([]byte(testHMACSecret), "test-scaleset")
-		require.NoError(t, err)
-		claims, err := v.Verify(got["SCALESET_HOOK_TOKEN"])
-		require.NoError(t, err)
-		require.Equal(t, 10042, claims.VMID)
-		require.Equal(t, int64(88), claims.RunnerID)
-	})
-
-	t.Run("missing url disables", func(t *testing.T) {
-		t.Parallel()
-		s := &Scaler{cfg: Config{HookTokenMinter: minter}}
-		got, err := s.hookEnv(1, 1)
-		require.NoError(t, err)
-		require.Nil(t, got)
-	})
-
-	t.Run("missing minter disables", func(t *testing.T) {
-		t.Parallel()
-		s := &Scaler{cfg: Config{HookCallbackURL: "http://x:9103"}}
-		got, err := s.hookEnv(1, 1)
-		require.NoError(t, err)
-		require.Nil(t, got)
-	})
-}
 
 func TestVMIDFromRunnerName(t *testing.T) {
 	t.Parallel()

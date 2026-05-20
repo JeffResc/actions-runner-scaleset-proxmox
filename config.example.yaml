@@ -7,7 +7,6 @@
 #   - GITHUB_PAT             (when github.auth_mode = pat)
 #   - PROXMOX_TOKEN_SECRET   (Proxmox API token secret)
 #   - SCALESET_ADMIN_SECRET  (admin HTTP API bearer token; optional)
-#   - SCALESET_HOOK_HMAC     (runner-hook HMAC signing secret; optional)
 
 github:
   # "app" or "pat".
@@ -78,6 +77,12 @@ pool:
   vm_max_age: 24h                 # idle Hot/Warm VMs older than this are recycled
   drain_timeout: 30m              # max wait for running jobs on SIGTERM
   boot_max_attempts: 3            # after this many WaitReady failures the VM is "poisoned"
+  # How often the orchestrator polls Proxmox for the power state of
+  # Assigned/Running VMs. The in-VM gh-runner.service powers off on job
+  # completion (ExecStopPost=poweroff), so observing "stopped" here is
+  # the signal to mark the row completed and queue destroy. Lower =
+  # snappier end-of-job tail; higher = lighter Proxmox load.
+  power_poll_interval: 3s
 
 observability:
   http_addr: ":9100"              # exposes /metrics /healthz /readyz
@@ -93,45 +98,3 @@ observability:
 admin_api:                        # optional escape hatch HTTP API
   # http_addr: "127.0.0.1:9101"
   # shared_secret_env: SCALESET_ADMIN_SECRET
-
-# Optional in-VM runner-side hook receiver. The runner posts to this
-# endpoint via ACTIONS_RUNNER_HOOK_JOB_{STARTED,COMPLETED} hook scripts
-# baked into the Packer image, giving us millisecond-precision lifecycle
-# signals independent of the scaleset listener.
-#
-# Authentication: each job receives its own HMAC-SHA256-signed JWT
-# (bound to vmid + runner_id, with a short TTL). A leaked token can only
-# target one VM and is dead after `token_ttl`. No static shared bearer.
-#
-# REQUIRED when http_addr is set:
-#   - hmac_secret_env: names the env var holding the HMAC secret. The
-#     secret MUST be at least 32 bytes (RFC 7518 §3.2 floor for HS256);
-#     anything shorter is rejected at startup. Generate with:
-#         openssl rand -hex 32
-#   - callback_url: LAN-routable URL the in-VM hook script POSTs to.
-#
-# Leave http_addr empty to disable the feature. When enabled, http_addr
-# MUST be reachable from the VM bridge network (NOT 127.0.0.1).
-runner_hook:
-  # http_addr: "0.0.0.0:9103"
-  # hmac_secret_env: SCALESET_HOOK_HMAC     # REQUIRED (>= 32 bytes)
-  # callback_url: "http://192.168.0.20:9103"
-  # token_ttl: 6h                           # lifetime of a minted per-job JWT
-  #
-  # Per-source-IP rate limiting. Sits IN FRONT of HMAC token verification
-  # so brute-force attempts against the JWT cost the attacker tokens too.
-  # rate_limit:
-  #   disabled: false                       # disable only if a fronting proxy enforces its own limits
-  #   rps: 5                                # sustained per-IP request rate; default 5
-  #   burst: 10                             # per-IP burst budget; default 10
-  #   idle_ttl: 10m                         # how long an idle per-IP entry is retained
-  #   # CIDRs of trusted reverse proxies. When a request arrives from one
-  #   # of these ranges, the receiver consults proxy headers
-  #   # (Cf-Connecting-Ip, X-Real-Ip, then X-Forwarded-For right-to-left,
-  #   # skipping trusted hops) to determine the real client IP for rate
-  #   # limiting and logs. Requests from outside this set always use the
-  #   # direct peer — proxy headers from untrusted sources are ignored
-  #   # entirely so a direct connection cannot spoof its origin.
-  #   trusted_proxies:
-  #     - "127.0.0.1/32"
-  #     # - "173.245.48.0/20"               # example: Cloudflare

@@ -135,20 +135,13 @@ func TestInjectJITConfig_RoutesToCorrectPath(t *testing.T) {
 	defer srv.Close()
 
 	p := newTestProvisioner(t, srv, "pve1")
-	err := p.InjectJITConfig(context.Background(), &VM{VMID: 12345, Node: "pve3"}, "encoded-jit-config-blob", map[string]string{
-		"SCALESET_HOOK_URL":    "http://10.0.0.5:9103",
-		"SCALESET_HOOK_SECRET": "s3cret",
-	})
+	err := p.InjectJITConfig(context.Background(), &VM{VMID: 12345, Node: "pve3"}, "encoded-jit-config-blob")
 	require.NoError(t, err)
 
 	require.Equal(t, "/nodes/pve3/qemu/12345/agent/file-write", captured.writePath)
 	require.Equal(t, "/opt/actions-runner/jitconfig.env.tmp", captured.writeBody["file"])
 	require.Contains(t, captured.writeBody["content"], "JIT_CONFIG=")
 	require.Contains(t, captured.writeBody["content"], "encoded-jit-config-blob")
-	// Hook env vars are injected before JIT_CONFIG so a downstream
-	// read-and-source picks them up in the same pass.
-	require.Contains(t, captured.writeBody["content"], "SCALESET_HOOK_URL='http://10.0.0.5:9103'")
-	require.Contains(t, captured.writeBody["content"], "SCALESET_HOOK_SECRET='s3cret'")
 	// And the exec call should be the atomic rename.
 	cmd, _ := captured.execBody["command"].([]any)
 	require.Equal(t, []any{"mv", "/opt/actions-runner/jitconfig.env.tmp", "/opt/actions-runner/jitconfig.env"}, cmd)
@@ -158,24 +151,8 @@ func TestInjectJITConfig_RejectsNilOrEmpty(t *testing.T) {
 	t.Parallel()
 	p := newTestProvisioner(t, mockServer(t, &captured{}, http.StatusOK, `{}`), "pve1")
 
-	require.Error(t, p.InjectJITConfig(context.Background(), nil, "x", nil))
-	require.Error(t, p.InjectJITConfig(context.Background(), &VM{VMID: 1, Node: "pve1"}, "", nil))
-}
-
-// TestInjectJITConfig_RejectsBadExtraEnvValue guards the env-file
-// quoting: a value containing a single quote or newline would break
-// systemd's env-file parser, so we surface it as an error instead of
-// silently corrupting the file.
-func TestInjectJITConfig_RejectsBadExtraEnvValue(t *testing.T) {
-	t.Parallel()
-	srv := mockServer(t, &captured{}, http.StatusOK, `{"data": null}`)
-	defer srv.Close()
-	p := newTestProvisioner(t, srv, "pve1")
-
-	err := p.InjectJITConfig(context.Background(), &VM{VMID: 1, Node: "pve1"}, "x",
-		map[string]string{"BAD": "val' with quote"})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "unsupported character")
+	require.Error(t, p.InjectJITConfig(context.Background(), nil, "x"))
+	require.Error(t, p.InjectJITConfig(context.Background(), &VM{VMID: 1, Node: "pve1"}, ""))
 }
 
 func TestReadAgentFile_DecodesPayload(t *testing.T) {

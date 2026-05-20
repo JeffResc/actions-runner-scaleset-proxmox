@@ -111,23 +111,6 @@ systemctl daemon-reload
 systemctl enable gh-runner.path
 
 # -----------------------------------------------------------------------------
-# Runner-side lifecycle hooks.
-#
-# The GitHub Actions runner invokes ACTIONS_RUNNER_HOOK_JOB_STARTED /
-# ACTIONS_RUNNER_HOOK_JOB_COMPLETED scripts at the obvious moments. Our
-# scripts POST a JSON payload to the orchestrator's :9103 endpoint,
-# giving us millisecond-precision lifecycle signals that don't depend
-# on the scaleset listener. The orchestrator's runner_hook.shared_secret
-# is provisioned per-clone via the JIT env file, NOT baked into the
-# image — so a leaked image alone can't impersonate runners.
-# -----------------------------------------------------------------------------
-log "installing runner lifecycle hook scripts"
-install -m 0755 -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
-    "${STAGE_DIR}/hook-job-started.sh"   /opt/actions-runner/hook-job-started.sh
-install -m 0755 -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
-    "${STAGE_DIR}/hook-job-completed.sh" /opt/actions-runner/hook-job-completed.sh
-
-# -----------------------------------------------------------------------------
 # Kernel hardening.
 # -----------------------------------------------------------------------------
 log "installing sysctl hardening"

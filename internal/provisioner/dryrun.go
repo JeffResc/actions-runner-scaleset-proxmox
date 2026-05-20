@@ -56,9 +56,9 @@ func (d *dryRun) Destroy(_ context.Context, vm *VM) error {
 	return nil
 }
 
-func (d *dryRun) InjectJITConfig(_ context.Context, vm *VM, jitConfig string, extraEnv map[string]string) error {
+func (d *dryRun) InjectJITConfig(_ context.Context, vm *VM, jitConfig string) error {
 	d.log.Info("[dry-run] InjectJITConfig", "vmid", vm.VMID, "node", vm.Node,
-		"jit_bytes", len(jitConfig), "extra_env_keys", len(extraEnv))
+		"jit_bytes", len(jitConfig))
 	return nil
 }
 
@@ -71,6 +71,9 @@ func (d *dryRun) ReadAgentFile(ctx context.Context, vm *VM, path string) ([]byte
 }
 func (d *dryRun) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 	return d.inner.ListOwnedVMs(ctx)
+}
+func (d *dryRun) PowerState(ctx context.Context, vm *VM) (string, error) {
+	return d.inner.PowerState(ctx, vm)
 }
 func (d *dryRun) Ping(ctx context.Context) error { return d.inner.Ping(ctx) }
 func (d *dryRun) TemplateNode() string           { return d.inner.TemplateNode() }
