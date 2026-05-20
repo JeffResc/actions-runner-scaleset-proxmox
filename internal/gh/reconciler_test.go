@@ -481,6 +481,46 @@ func TestReconcile_OrphanFirstTickProtectedByGrace(t *testing.T) {
 	require.NotContains(t, r.orphanFirstSeen, "gh-runner-test-7777")
 }
 
+// TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow: a
+// transient tick where the GitHub runners list is empty (e.g., between
+// jobs) must NOT reset the orphan-grace clock for runners that reappear
+// later. The previous early-return wiped the map entirely, so a runner
+// that was orphan-for-25s, briefly invisible, and then visible again
+// would have its grace clock restart at 0 and never get reaped.
+func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T) {
+	t.Parallel()
+	mgr := &fakeManager{rows: nil}
+	r, err := New(baseCfg(), github.NewClient(nil), mgr, &stubProv{}, silentLogger(), nil)
+	require.NoError(t, err)
+
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return t0 }
+
+	// Tick 1: runner A observed without a DB row → tracked.
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]runnerState{
+		"gh-runner-test-1": {id: 1, online: true, busy: false},
+	})
+	first, ok := r.orphanFirstSeen["gh-runner-test-1"]
+	require.True(t, ok, "orphan must be tracked after first observation")
+	require.Equal(t, t0, first)
+
+	// Tick 2: runners list comes back empty (transient). The bug: the
+	// previous implementation wiped orphanFirstSeen entirely here.
+	r.now = func() time.Time { return t0.Add(10 * time.Second) }
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]runnerState{})
+
+	// Tick 3: runner A observed again. Its grace clock must still be
+	// anchored at t0, not restarted to t0+20s.
+	r.now = func() time.Time { return t0.Add(20 * time.Second) }
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]runnerState{
+		"gh-runner-test-1": {id: 1, online: true, busy: false},
+	})
+	preserved, ok := r.orphanFirstSeen["gh-runner-test-1"]
+	require.True(t, ok, "orphan tracking must survive an empty-runners tick")
+	require.Equal(t, t0, preserved,
+		"orphan first-seen timestamp must NOT be reset by an empty-runners tick")
+}
+
 // 13. Proxmox VM exists but no DB row → reconciler destroys it.
 func TestReconcile_ProxmoxOrphan_Destroys(t *testing.T) {
 	t.Parallel()

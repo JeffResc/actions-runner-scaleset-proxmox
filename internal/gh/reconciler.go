@@ -346,26 +346,29 @@ func (r *Reconciler) reconcileHot(ctx context.Context, row pool.RowSnapshot, gr 
 // State for the grace logic lives in r.orphanFirstSeen, which is pruned
 // here as runners reappear matched to rows.
 func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSnapshot, runners map[string]runnerState) {
-	if len(runners) == 0 {
-		// Pool drained — clear tracking so a future re-registration of
-		// the same name isn't immediately considered "long-orphaned".
-		r.orphanFirstSeen = make(map[string]time.Time)
-		return
-	}
 	known := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
 		known[row.Name] = struct{}{}
 	}
 	now := r.now()
-	// Prune entries that are no longer orphaned.
+	// Prune entries that are no longer orphaned. Two cases:
+	//   - matched to a DB row this tick: drop unconditionally.
+	//   - not in `runners` AND `runners` is non-empty: drop, because
+	//     GitHub authoritatively says the runner is gone.
+	// We deliberately do NOT drop entries when `runners` is empty —
+	// that's almost always a transient state between jobs, and resetting
+	// the grace clock here is the bug this code path is guarding
+	// against. Entries left behind by a genuinely-removed runner will
+	// be pruned on the next tick that returns a non-empty list.
 	for name := range r.orphanFirstSeen {
-		if _, ok := runners[name]; !ok {
-			// Runner is gone from GitHub entirely.
+		if _, ok := known[name]; ok {
 			delete(r.orphanFirstSeen, name)
 			continue
 		}
-		if _, ok := known[name]; ok {
-			// Runner matched to a row this tick — no longer orphaned.
+		if len(runners) == 0 {
+			continue
+		}
+		if _, ok := runners[name]; !ok {
 			delete(r.orphanFirstSeen, name)
 		}
 	}
