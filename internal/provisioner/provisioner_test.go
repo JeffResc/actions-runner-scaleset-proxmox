@@ -170,6 +170,61 @@ func TestReadAgentFile_DecodesPayload(t *testing.T) {
 	require.Equal(t, []string{"/opt/actions-runner/jitconfig"}, got.Query["file"])
 }
 
+// TestDiscoverTemplateNode_OneHungNodeDoesNotBlock: a single unreachable
+// node in the cluster (its /nodes/<name>/status hangs) must not pin
+// orchestrator startup. Before the per-node timeout fix, the unbounded
+// cli.Node call would block discoverTemplateNode forever.
+func TestDiscoverTemplateNode_OneHungNodeDoesNotBlock(t *testing.T) {
+	t.Parallel()
+
+	// Shorter per-node budget for the test so we don't sit on 30s.
+	prev := templateDiscoveryTimeoutPerNode
+	templateDiscoveryTimeoutPerNode = 200 * time.Millisecond
+	t.Cleanup(func() { templateDiscoveryTimeoutPerNode = prev })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nodes", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[{"node":"hung"},{"node":"fast"}]}`)
+	})
+	mux.HandleFunc("/nodes/hung/status", func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done() // hang until the per-node timeout fires
+	})
+	mux.HandleFunc("/nodes/fast/status", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{}}`)
+	})
+	mux.HandleFunc("/nodes/fast/qemu/9000/status/current", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"vmid":9000,"template":1,"name":"runner-template","status":"stopped"}}`)
+	})
+	mux.HandleFunc("/nodes/fast/qemu/9000/config", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"template":1,"name":"runner-template"}}`)
+	})
+	mux.HandleFunc("/nodes/hung/qemu/9000/status/current", func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/nodes/hung/qemu/9000/config", func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := config.ProxmoxConfig{
+		Endpoint:           srv.URL,
+		InsecureSkipVerify: true,
+		Auth:               config.ProxmoxAuth{TokenID: "a!b", TokenSecret: "x"},
+		TemplateVMID:       9000,
+	}
+	p := &pmox{cfg: cfg, cli: newProxmoxClient(cfg), scaleSetName: "t", log: quietLogger()}
+
+	start := time.Now()
+	err := p.discoverTemplateNode(context.Background())
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	require.Equal(t, "fast", p.templateNode)
+	// Must complete within a small multiple of the per-node timeout.
+	require.Less(t, elapsed, 2*time.Second,
+		"discoverTemplateNode took %s; expected one hung node to be bounded by templateDiscoveryTimeoutPerNode", elapsed)
+}
+
 func TestClone_LinkedRejectsCrossNode(t *testing.T) {
 	t.Parallel()
 	srv := mockServer(t, &captured{}, http.StatusOK, `{}`)

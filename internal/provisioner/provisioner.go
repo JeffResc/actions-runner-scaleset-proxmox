@@ -207,11 +207,21 @@ func (p *pmox) Ping(ctx context.Context) error {
 	return nil
 }
 
+// templateDiscoveryTimeoutPerNode caps how long a single per-node call
+// in discoverTemplateNode may block. Without it, one unreachable
+// Proxmox node would pin startup forever — the scan is sequential and
+// the underlying HTTP client has no per-request deadline once a
+// connection is established. Tests may override this.
+var templateDiscoveryTimeoutPerNode = 30 * time.Second
+
 // discoverTemplateNode walks the cluster to find the node hosting the
 // configured template VMID. If a node has the VMID but the VM isn't a
 // template, the scan continues (the VMID might appear on multiple nodes
 // in some HA configurations) and the non-template hit is reported at
 // end if no real template was found.
+//
+// Each per-node interaction is bounded by templateDiscoveryTimeoutPerNode
+// so a single hung node can't pin startup.
 func (p *pmox) discoverTemplateNode(ctx context.Context) error {
 	statuses, err := p.cli.Nodes(ctx)
 	if err != nil {
@@ -219,12 +229,15 @@ func (p *pmox) discoverTemplateNode(ctx context.Context) error {
 	}
 	var nonTemplateHits []string
 	for _, ns := range statuses {
-		node, err := p.cli.Node(ctx, ns.Node)
+		nodeCtx, cancel := context.WithTimeout(ctx, templateDiscoveryTimeoutPerNode)
+		node, err := p.cli.Node(nodeCtx, ns.Node)
 		if err != nil {
+			cancel()
 			p.log.Warn("provisioner: get node failed; continuing scan", "node", ns.Node, "err", err)
 			continue
 		}
-		vm, err := node.VirtualMachine(ctx, p.cfg.TemplateVMID)
+		vm, err := node.VirtualMachine(nodeCtx, p.cfg.TemplateVMID)
+		cancel()
 		if err != nil {
 			continue
 		}
