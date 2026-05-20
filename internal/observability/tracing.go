@@ -72,8 +72,18 @@ func InitTracer(ctx context.Context, opts TracingOptions, log *slog.Logger) (Tra
 		return nil, fmt.Errorf("tracing: build resource: %w", err)
 	}
 
-	sampler := sdktrace.AlwaysSample()
-	if r := opts.SampleRatio; r > 0 && r < 1 {
+	// Sample-rate dispatch:
+	//   ≤ 0: NeverSample — operator-explicit "no traces". The previous
+	//        AlwaysSample fall-through silently turned 0 into 100%.
+	//   ≥ 1: AlwaysSample — record every root span.
+	//   else: ratio-based, parent-respecting.
+	var sampler sdktrace.Sampler
+	switch r := opts.SampleRatio; {
+	case r <= 0:
+		sampler = sdktrace.NeverSample()
+	case r >= 1:
+		sampler = sdktrace.AlwaysSample()
+	default:
 		sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(r))
 	}
 

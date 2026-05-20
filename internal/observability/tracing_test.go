@@ -36,6 +36,35 @@ func TestInitTracer_DisabledNoEndpoint(t *testing.T) {
 	require.NotNil(t, ctx)
 }
 
+// TestInitTracer_ZeroRatioMeansNeverSample: an operator who sets
+// sample_ratio: 0 expects "no traces", not "all traces". The previous
+// branch logic fell through to AlwaysSample for any value not strictly
+// between 0 and 1, which silently turned 0 into 100%.
+func TestInitTracer_ZeroRatioMeansNeverSample(t *testing.T) {
+	t.Parallel()
+	shutdown, err := observability.InitTracer(context.Background(),
+		observability.TracingOptions{
+			Endpoint:       "127.0.0.1:1",
+			Insecure:       true,
+			SampleRatio:    0,
+			ServiceName:    "scaleset-test",
+			ServiceVersion: "test",
+		}, discardLogger())
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+	defer func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_ = shutdown(ctx)
+	}()
+
+	tr := otel.Tracer(observability.TracerName)
+	_, span := tr.Start(context.Background(), "test-zero-ratio")
+	require.False(t, span.SpanContext().IsSampled(),
+		"sample_ratio: 0 must select NeverSample, not AlwaysSample")
+	span.End()
+}
+
 // TestInitTracer_EnabledBuildsProvider: a non-empty endpoint builds a
 // real provider; shutdown flushes cleanly. We don't actually export to
 // a real OTLP collector — the exporter just buffers and the BatchSpan
