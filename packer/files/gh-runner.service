@@ -1,0 +1,64 @@
+[Unit]
+Description=GitHub Actions ephemeral runner (one job, then poweroff)
+Documentation=https://github.com/jeffresc/github-actions-proxmox-scaleset
+# Wait for the network so the runner can reach github.com.
+After=network-online.target
+Wants=network-online.target
+# The path-unit triggers us; we don't auto-start at boot.
+ConditionPathExists=/opt/actions-runner/jitconfig.env
+
+[Service]
+Type=simple
+User=runner
+Group=runner
+WorkingDirectory=/opt/actions-runner
+
+# The orchestrator writes the JIT config as a systemd env file
+# (single `JIT_CONFIG=…` line). Using EnvironmentFile avoids the
+# `bash -c '$(cat …)'` shell-substitution path that, for reasons we
+# never fully tracked down under Proxmox guest-agent + path-unit
+# triggering, produced empty arguments to run.sh under systemd while
+# the same command worked perfectly from a shell.
+EnvironmentFile=/opt/actions-runner/jitconfig.env
+
+# Runner-side lifecycle hooks. The runner invokes these before/after
+# every job and they POST to the orchestrator's :9103 endpoint. Path
+# values point at scripts installed by provision.sh; the scripts read
+# SCALESET_HOOK_URL / SCALESET_HOOK_SECRET from the EnvironmentFile and
+# silently no-op if either is empty (so the image stays compatible with
+# orchestrators that don't enable runner_hook).
+Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/actions-runner/hook-job-started.sh
+Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/actions-runner/hook-job-completed.sh
+
+ExecStart=/opt/actions-runner/run.sh --jitconfig ${JIT_CONFIG}
+
+# Regardless of the runner's exit code, power the VM off so the
+# orchestrator's destroy path doesn't have to wait on shutdown.
+# The `+` prefix tells systemd to run this regardless of the User= above
+# (poweroff requires root privileges; the runner user can't issue it).
+ExecStopPost=+/usr/bin/systemctl poweroff
+
+Restart=no
+TimeoutStartSec=0
+
+# Hardening — these are conservative enough that most CI workloads still
+# work. Loosen on a per-deployment basis if a specific workflow needs
+# more (e.g. mounting block devices, modifying kernel modules).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/actions-runner /home/runner /tmp /var/tmp
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# docker/podman in CI need access to namespaces.
+RestrictNamespaces=false
+# Some build tools legitimately use setuid/setgid binaries.
+RestrictSUIDSGID=false
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+# Triggered by the path unit, not WantedBy=multi-user.target.

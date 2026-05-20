@@ -1,0 +1,39 @@
+# Compiled binaries
+/bin/
+/dist/
+scaleset
+scaleset.exe
+
+# Go test/coverage artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config / secrets — never check in
+/config.yaml
+/.env
+/config.local.yaml
+*.pem
+*.key
+
+# Vendor directory (we rely on the module proxy)
+/vendor/
+
+# Packer
+packer/variables.auto.pkrvars.hcl
+packer/*.pkrvars.hcl
+!packer/variables.auto.pkrvars.hcl.example
+packer/manifest.json
+packer/packer_cache/
+packer/.packer.d/

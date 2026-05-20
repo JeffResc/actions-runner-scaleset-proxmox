@@ -1,0 +1,67 @@
+#cloud-config
+# Ubuntu Subiquity autoinstall config consumed by the live installer.
+# See https://canonical-subiquity.readthedocs-hosted.com/en/latest/reference/autoinstall-reference.html
+#
+# Everything here is BUILD-TIME ONLY. The provision.sh script locks the
+# build user, removes SSH, and finalises hardening before the template
+# is converted.
+autoinstall:
+  version: 1
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # No network changes at install time; the live image gets DHCP automatically.
+  network:
+    network:
+      version: 2
+      ethernets:
+        any:
+          match:
+            name: "e*"
+          dhcp4: true
+
+  # Mirror selection — leave default, falls back to ubuntu.com.
+  apt:
+    geoip: true
+    preserve_sources_list: false
+
+  storage:
+    layout:
+      name: direct
+
+  identity:
+    hostname: ubuntu-runner-template
+    realname: "Packer build user"
+    # Replace this hash if you change build_password. Generate with:
+    #   mkpasswd --method=SHA-512 --rounds=4096
+    # Default below corresponds to the password "ubuntu".
+    username: ubuntu
+    password: "$6$scaleset$yuLqayge75SPHLr01sp7lmD1bPgFZCCNPRwYFPbEHCPqnMc40.zdNdsdVmGLZxPg1v8Pa5kLT0UyY1tDsalCx/"
+
+  ssh:
+    install-server: true
+    allow-pw: true
+    authorized-keys: []
+
+  packages:
+    - openssh-server
+    - qemu-guest-agent
+    - curl
+    - ca-certificates
+
+  # Trim the install to the bare minimum; provision.sh removes more later.
+  drivers:
+    install: false
+  oem:
+    install: false
+  codecs:
+    install: false
+
+  updates: security
+  shutdown: reboot
+  # No late-commands needed: the Packer shell provisioner pipes the build
+  # password into `sudo -S`, and Ubuntu's installer puts the build user
+  # in the `sudo` group by default. provision.sh removes that grant and
+  # locks the account before the template is finalised.

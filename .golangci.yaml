@@ -1,0 +1,64 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - unparam
+    - unconvert
+    - gocritic
+    - revive
+    - bodyclose
+    - errname
+    - exhaustive
+    - nilerr
+    - prealloc
+  settings:
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+    exhaustive:
+      # State / PoolKind enums shouldn't be satisfied by a 'default' arm —
+      # every value should be explicit so a new state surfaces as a lint
+      # error.
+      default-signifies-exhaustive: false
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unparam
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/jeffresc/github-actions-proxmox-scaleset

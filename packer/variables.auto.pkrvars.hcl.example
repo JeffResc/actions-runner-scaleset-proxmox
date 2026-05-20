@@ -1,0 +1,31 @@
+# Copy this file to `variables.auto.pkrvars.hcl` (gitignored) and fill in
+# values for your environment. Sensitive values (proxmox_token,
+# build_password) can also be supplied via PKR_VAR_<name> env vars.
+
+proxmox_url      = "https://pve.example.com:8006/api2/json"
+proxmox_username = "packer@pve!automation"
+proxmox_node     = "pve1"
+# proxmox_token = "set via PKR_VAR_proxmox_token instead of writing it here"
+
+storage_pool     = "local-lvm"
+iso_storage_pool = "local"
+snippets_pool    = "local"
+
+network_bridge   = "vmbr0"
+network_vlan_tag = 0
+
+template_vm_id = 9000
+template_name  = "ubuntu-2604-runner-template"
+
+vm_cores         = 4
+vm_memory_mb     = 4096
+vm_disk_size_gb  = 32
+
+iso_url = "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso"
+# From https://releases.ubuntu.com/26.04/SHA256SUMS as of 2026-04-20.
+# Verify the current value before each rebuild in case Canonical re-spins the ISO.
+iso_checksum = "sha256:dec49008a71f6098d0bcfc822021f4d042d5f2db279e4d75bdd981304f1ca5d9"
+
+runner_version = "2.334.0"
+runner_arch    = "x64"
+runner_user    = "runner"

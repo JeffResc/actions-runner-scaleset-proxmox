@@ -1,0 +1,49 @@
+[Unit]
+Description=GitHub Actions Proxmox scale set orchestrator
+Documentation=https://github.com/jeffresc/github-actions-proxmox-scaleset
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scaleset
+Group=scaleset
+
+# Required env vars are loaded from an operator-managed file with 0600
+# perms. Do NOT commit a real EnvironmentFile to source control.
+EnvironmentFile=/etc/scaleset/env
+
+ExecStart=/usr/local/bin/scaleset run --config=/etc/scaleset/config.yaml
+
+# SIGTERM triggers the orchestrator's graceful drain; allow the configured
+# drain_timeout plus a small margin before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=35m
+
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits — sized for an orchestrator that holds long-poll
+# connections to GitHub, an HTTPS keepalive to Proxmox, plus up to a few
+# hundred concurrent goroutines (clones, destroys, boots, listener).
+# The defaults (1024 fds, 4096 tasks) bite around 50 concurrent runners.
+LimitNOFILE=65536
+TasksMax=4096
+
+# Memory: the orchestrator's working set is tiny (in-memory go-memdb
+# bounded by max_concurrent_runners rows + Prometheus metrics + a few
+# HTTP clients). 512MiB is generous headroom; raise if you observe
+# Go's GC churning.
+MemoryHigh=384M
+MemoryMax=512M
+
+# Hardening — adjust to taste.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ConfigurationDirectory=scaleset
+LogsDirectory=scaleset
+
+[Install]
+WantedBy=multi-user.target

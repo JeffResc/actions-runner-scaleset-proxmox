@@ -1,0 +1,137 @@
+# github-actions-proxmox-scaleset — example configuration.
+#
+# Secrets are NEVER stored in this file. Fields ending in `*_env` name an
+# environment variable from which the secret is read at startup.
+#
+# Required env vars (when corresponding fields are used):
+#   - GITHUB_PAT             (when github.auth_mode = pat)
+#   - PROXMOX_TOKEN_SECRET   (Proxmox API token secret)
+#   - SCALESET_ADMIN_SECRET  (admin HTTP API bearer token; optional)
+#   - SCALESET_HOOK_HMAC     (runner-hook HMAC signing secret; optional)
+
+github:
+  # "app" or "pat".
+  auth_mode: pat
+
+  # Used when auth_mode = app. Set exactly one of client_id (newer Apps,
+  # format "Iv23...") or app_id (legacy numeric ID).
+  # app:
+  #   client_id: "Iv23likB94..."
+  #   # app_id: 123456
+  #   installation_id: 789012
+  #   private_key_path: /etc/scaleset/github-app.pem
+
+  # Used when auth_mode = pat.
+  pat:
+    token_env: GITHUB_PAT
+
+  # Exactly one of org or repo.
+  scope:
+    org: my-org
+    # repo: my-org/my-repo
+
+  # GitHub REST reconciler. Periodically lists the runners API and joins
+  # the result against our DB; this catches VMs that the scaleset
+  # listener silently lost (the JobStarted/JobCompleted callbacks the
+  # listener occasionally drops or delivers with empty fields).
+  poll_interval: 15s                # how often to query GitHub
+  assigned_grace: 5m                # destroy assigned VMs whose runner never picked up work
+  running_idle_grace: 30s           # destroy running VMs whose runner went idle (missed JobCompleted)
+  assigned_offline_grace: 2m        # destroy assigned VMs whose runner registered then went offline
+
+scaleset:
+  name: proxmox-ubuntu-x64
+  labels: [self-hosted, linux, x64, proxmox]
+  runner_group: default
+  max_concurrent_runners: 50
+
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  insecure_skip_verify: false
+  auth:
+    token_id: scaleset@pve!automation
+    token_secret_env: PROXMOX_TOKEN_SECRET
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage:
+    disk: local-lvm
+    snippets: local
+  network:
+    bridge: vmbr0
+    vlan_tag: 0       # 0 = untagged
+  clone:
+    linked: true      # linked clones complete in 1-3s but pin to template storage
+  cloud_init:
+    user: runner
+    ssh_authorized_keys: []
+    dns_servers: [1.1.1.1, 8.8.8.8]
+
+nodes:
+  strategy: single                # single | round_robin | least_loaded
+  members: [pve1, pve2, pve3]     # ignored for "single"
+  single_node: pve1               # only used when strategy = single
+
+pool:
+  hot_size: 2                     # always-booted idle runners
+  warm_size: 3                    # pre-cloned, powered-off runners
+  reconcile_interval: 10s
+  vm_max_age: 24h                 # idle Hot/Warm VMs older than this are recycled
+  drain_timeout: 30m              # max wait for running jobs on SIGTERM
+  boot_max_attempts: 3            # after this many WaitReady failures the VM is "poisoned"
+
+observability:
+  http_addr: ":9100"              # exposes /metrics /healthz /readyz
+  log_level: info                 # debug | info | warn | error
+  log_format: json                # json | text
+  # Optional OTLP/HTTP tracing. Leave endpoint empty to disable —
+  # instrumented code paths then use the no-op tracer and are free.
+  tracing:
+    endpoint: ""                  # e.g. "otel-collector:4318" (host:port only)
+    insecure: false               # true = plain HTTP, false = HTTPS
+    sample_ratio: 1.0             # [0.0, 1.0]; 1.0 = sample everything
+
+admin_api:                        # optional escape hatch HTTP API
+  # http_addr: "127.0.0.1:9101"
+  # shared_secret_env: SCALESET_ADMIN_SECRET
+
+# Optional in-VM runner-side hook receiver. The runner posts to this
+# endpoint via ACTIONS_RUNNER_HOOK_JOB_{STARTED,COMPLETED} hook scripts
+# baked into the Packer image, giving us millisecond-precision lifecycle
+# signals independent of the scaleset listener.
+#
+# Authentication: each job receives its own HMAC-SHA256-signed JWT
+# (bound to vmid + runner_id, with a short TTL). A leaked token can only
+# target one VM and is dead after `token_ttl`. No static shared bearer.
+#
+# REQUIRED when http_addr is set:
+#   - hmac_secret_env: names the env var holding the HMAC secret. The
+#     secret MUST be at least 32 bytes (RFC 7518 §3.2 floor for HS256);
+#     anything shorter is rejected at startup. Generate with:
+#         openssl rand -hex 32
+#   - callback_url: LAN-routable URL the in-VM hook script POSTs to.
+#
+# Leave http_addr empty to disable the feature. When enabled, http_addr
+# MUST be reachable from the VM bridge network (NOT 127.0.0.1).
+runner_hook:
+  # http_addr: "0.0.0.0:9103"
+  # hmac_secret_env: SCALESET_HOOK_HMAC     # REQUIRED (>= 32 bytes)
+  # callback_url: "http://192.168.0.20:9103"
+  # token_ttl: 6h                           # lifetime of a minted per-job JWT
+  #
+  # Per-source-IP rate limiting. Sits IN FRONT of HMAC token verification
+  # so brute-force attempts against the JWT cost the attacker tokens too.
+  # rate_limit:
+  #   disabled: false                       # disable only if a fronting proxy enforces its own limits
+  #   rps: 5                                # sustained per-IP request rate; default 5
+  #   burst: 10                             # per-IP burst budget; default 10
+  #   idle_ttl: 10m                         # how long an idle per-IP entry is retained
+  #   # CIDRs of trusted reverse proxies. When a request arrives from one
+  #   # of these ranges, the receiver consults proxy headers
+  #   # (Cf-Connecting-Ip, X-Real-Ip, then X-Forwarded-For right-to-left,
+  #   # skipping trusted hops) to determine the real client IP for rate
+  #   # limiting and logs. Requests from outside this set always use the
+  #   # direct peer — proxy headers from untrusted sources are ignored
+  #   # entirely so a direct connection cannot spoof its origin.
+  #   trusted_proxies:
+  #     - "127.0.0.1/32"
+  #     # - "173.245.48.0/20"               # example: Cloudflare

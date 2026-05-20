@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for the GitHub Actions JIT runner config file
+Documentation=https://github.com/jeffresc/github-actions-proxmox-scaleset
+
+[Path]
+# The orchestrator writes a systemd env file at this path via the
+# qemu-guest-agent once a job has been assigned to this VM.
+# PathExists triggers the matching .service exactly once per appearance.
+PathExists=/opt/actions-runner/jitconfig.env
+Unit=gh-runner.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,292 @@
+// Package observability bundles the orchestrator's cross-cutting concerns:
+// structured logging via log/slog, Prometheus metrics, and HTTP health
+// probes. It is intentionally small — most of it is library glue.
+package observability
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+// NewLogger returns a slog.Logger configured per the config strings.
+// format is one of "json" or "text"; level is one of "debug", "info",
+// "warn", or "error".
+func NewLogger(level, format string) (*slog.Logger, error) {
+	return NewLoggerTo(os.Stderr, level, format)
+}
+
+// NewLoggerTo writes to an explicit destination. Useful for tests.
+func NewLoggerTo(w io.Writer, level, format string) (*slog.Logger, error) {
+	lvl, err := parseLevel(level)
+	if err != nil {
+		return nil, err
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler
+	switch strings.ToLower(format) {
+	case "", "json":
+		h = slog.NewJSONHandler(w, opts)
+	case "text":
+		h = slog.NewTextHandler(w, opts)
+	default:
+		return nil, fmt.Errorf("observability: unknown log format %q (expected json or text)", format)
+	}
+	return slog.New(h), nil
+}
+
+func parseLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(s) {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	}
+	return 0, fmt.Errorf("observability: unknown log level %q", s)
+}
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+// Metrics is the orchestrator's Prometheus instrument set. Construct via
+// [NewMetrics] which registers all instruments on a provided registry.
+type Metrics struct {
+	PoolSize             *prometheus.GaugeVec
+	VMsTotal             *prometheus.CounterVec
+	CloneDuration        *prometheus.HistogramVec
+	BootDuration         *prometheus.HistogramVec
+	AcquireDuration      *prometheus.HistogramVec
+	ProxmoxErrors        *prometheus.CounterVec
+	GitHubErrors         *prometheus.CounterVec
+	ListenerMessages     *prometheus.CounterVec
+	ReconcileDuration    prometheus.Histogram
+	AtCapacityTotal      prometheus.Counter
+	GHAPICalls           *prometheus.CounterVec
+	GHRateLimitRemaining prometheus.Gauge
+	GHStateMismatch      *prometheus.CounterVec
+	RunnerHookEvents     *prometheus.CounterVec
+}
+
+// NewMetrics creates and registers the orchestrator's metric set on reg.
+// Panics on duplicate registration; pass a fresh registry per process.
+func NewMetrics(reg prometheus.Registerer) *Metrics {
+	const ns = "scaleset"
+	m := &Metrics{
+		PoolSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "pool_size",
+			Help: "Number of VMs in each lifecycle state.",
+		}, []string{"state"}),
+		VMsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "vms_total",
+			Help: "Cumulative count of VMs created, partitioned by outcome.",
+		}, []string{"outcome"}),
+		CloneDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "clone_duration_seconds",
+			Help:    "Time to clone a VM from template.",
+			Buckets: prometheus.ExponentialBuckets(0.5, 2, 9), // 0.5s .. ~128s
+		}, []string{"linked", "node"}),
+		BootDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "boot_duration_seconds",
+			Help:    "Time from VM start to guest-agent ready.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 8),
+		}, []string{"node"}),
+		AcquireDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "acquire_duration_seconds",
+			Help:    "Time from Acquire call to a ready VM, by source tier.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
+		}, []string{"tier"}),
+		ProxmoxErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "proxmox_api_errors_total",
+			Help: "Errors from Proxmox API calls, partitioned by operation.",
+		}, []string{"operation", "node"}),
+		GitHubErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "github_api_errors_total",
+			Help: "Errors from GitHub API calls.",
+		}, []string{"endpoint"}),
+		ListenerMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "listener_messages_total",
+			Help: "Inbound listener messages by kind.",
+		}, []string{"kind"}),
+		ReconcileDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: ns, Name: "reconcile_duration_seconds",
+			Help:    "Wall-clock time of one pool reconciliation pass.",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 10),
+		}),
+		AtCapacityTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "at_capacity_total",
+			Help: "Times an Acquire was rejected because the orchestrator was at MaxConcurrentRunners.",
+		}),
+		GHAPICalls: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "gh_api_calls_total",
+			Help: "Outbound GitHub REST API calls, by endpoint group and HTTP status class.",
+		}, []string{"endpoint", "status"}),
+		GHRateLimitRemaining: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns, Name: "gh_rate_limit_remaining",
+			Help: "Most recent X-RateLimit-Remaining value observed on a GitHub REST response.",
+		}),
+		GHStateMismatch: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "gh_runner_state_mismatch_total",
+			Help: "Reconciler events where DB state diverged from GitHub runner state, by action taken.",
+		}, []string{"db_state", "gh_state", "action"}),
+		RunnerHookEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "runner_hook_events_total",
+			Help: "Inbound events from in-VM runner-side lifecycle hooks.",
+		}, []string{"phase", "result"}),
+	}
+	reg.MustRegister(
+		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
+		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors,
+		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
+		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
+	)
+	return m
+}
+
+// ObserveRateLimit satisfies the githubauth.RateLimitObserver contract.
+// Stores the most recent X-RateLimit-Remaining value emitted by GitHub.
+func (m *Metrics) ObserveRateLimit(remaining int) {
+	m.GHRateLimitRemaining.Set(float64(remaining))
+}
+
+// ObserveCall satisfies the githubauth.RateLimitObserver contract by
+// counting GitHub REST calls partitioned by endpoint group and status
+// class (2xx/3xx/4xx/5xx/transport_error).
+func (m *Metrics) ObserveCall(endpoint, statusClass string) {
+	m.GHAPICalls.WithLabelValues(endpoint, statusClass).Inc()
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+// Health tracks readiness state observed across the orchestrator. All
+// methods are safe for concurrent use.
+type Health struct {
+	listenerConnected atomic.Bool
+	recoveryDone      atomic.Bool
+	proxmoxLastSeen   atomic.Pointer[time.Time]
+	proxmoxMaxStale   time.Duration
+}
+
+// NewHealth returns a Health tracker. proxmoxMaxStale defines how long the
+// last successful Proxmox call may be in the past before Ready returns
+// false; defaults to 30s if zero.
+func NewHealth(proxmoxMaxStale time.Duration) *Health {
+	if proxmoxMaxStale == 0 {
+		proxmoxMaxStale = 30 * time.Second
+	}
+	return &Health{proxmoxMaxStale: proxmoxMaxStale}
+}
+
+// MarkProxmoxOK records that a Proxmox API call just succeeded.
+func (h *Health) MarkProxmoxOK() {
+	now := time.Now()
+	h.proxmoxLastSeen.Store(&now)
+}
+
+// MarkListenerConnected records that the scaleset Listener has accepted at
+// least one message session — proof that GitHub credentials and
+// connectivity are working.
+func (h *Health) MarkListenerConnected() { h.listenerConnected.Store(true) }
+
+// MarkRecoveryDone records that the initial crash-recovery pass completed.
+func (h *Health) MarkRecoveryDone() { h.recoveryDone.Store(true) }
+
+// Ready returns true iff all readiness gates have flipped on AND Proxmox
+// was reachable within the staleness window.
+func (h *Health) Ready() bool {
+	if !h.listenerConnected.Load() || !h.recoveryDone.Load() {
+		return false
+	}
+	last := h.proxmoxLastSeen.Load()
+	if last == nil {
+		return false
+	}
+	return time.Since(*last) <= h.proxmoxMaxStale
+}
+
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
+
+// Serve runs an HTTP server exposing /metrics, /healthz, and /readyz on
+// the configured address until ctx is cancelled. Wraps ServeOn with a
+// listener bound to addr.
+func Serve(ctx context.Context, addr string, reg *prometheus.Registry, h *Health, log *slog.Logger) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("observability listen %s: %w", addr, err)
+	}
+	return ServeOn(ctx, ln, reg, h, log)
+}
+
+// ServeOn runs the observability HTTP server on a caller-supplied
+// listener. Lets tests bind to ":0" and discover the bound address via
+// ln.Addr() so they can run in parallel without colliding on a shared
+// hardcoded port.
+func ServeOn(ctx context.Context, ln net.Listener, reg *prometheus.Registry, h *Health, log *slog.Logger) error {
+	r := chi.NewRouter()
+	r.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	})
+	r.Get("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if h.Ready() {
+			_, _ = io.WriteString(w, "ready")
+			return
+		}
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	})
+
+	srv := &http.Server{
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Info("observability http listening", "addr", ln.Addr().String())
+		err := srv.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("observability shutdown: %w", err)
+		}
+		return nil
+	case err := <-errCh:
+		return err
+	}
+}
