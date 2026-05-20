@@ -1,0 +1,38 @@
+# .git: included by COPY . . — strip from build context except for the
+# `git describe` invocation at build time, which uses .git via the
+# golang:alpine builder stage. Comment out the next line if you want
+# version metadata in the binary.
+# .git
+
+# Editor/IDE state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config + secrets (never bake into image)
+config.yaml
+config.local.yaml
+.env
+*.pem
+*.key
+
+# Go test/coverage artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Vendor — image build pulls modules from the proxy
+vendor/
+
+# Tools/runtime artifacts not needed inside the image
+packer/
+deploy/systemd/
+.claude/
+.golangci.yaml
+*.md
