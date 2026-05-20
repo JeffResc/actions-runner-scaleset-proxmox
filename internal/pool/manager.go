@@ -28,13 +28,14 @@ import (
 // so all instrumented paths stay cheap.
 var tracer = otel.Tracer(observability.TracerName)
 
-// recoverPanic is the standard panic-guard for async goroutines. A
-// panic anywhere in clone/destroy/boot would otherwise crash the entire
-// orchestrator and leak whatever Proxmox state was mid-flight. We log,
-// record on the active span if one exists, and let the goroutine
-// unwind normally so wg.Done in the caller's defer still runs.
-func (m *manager) recoverPanic(opName string, vmid int) {
-	r := recover()
+// logRecoveredPanic logs a recovered panic. Callers MUST invoke recover()
+// directly in their deferred closure (Go spec: recover only returns
+// non-nil when called directly by a deferred function — a nested call
+// through this helper would silently no-op). The closure then passes
+// the recovered value here so it can log alongside the op-name and the
+// current vmid (which the closure can capture by reference, letting
+// the log reflect the vmid AT PANIC TIME rather than at defer time).
+func (m *manager) logRecoveredPanic(opName string, vmid int, r any) {
 	if r == nil {
 		return
 	}
@@ -763,7 +764,7 @@ func (m *manager) promoteN(_ context.Context, n int) {
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
-			defer m.recoverPanic("promote", row.VMID)
+			defer func() { m.logRecoveredPanic("promote", row.VMID, recover()) }()
 			if err := m.bootSem.Acquire(m.workerCtx, 1); err != nil {
 				m.log.Debug("promote: cancelled before sem acquired", "vmid", row.VMID, "err", err)
 				// Roll the CAS back so the next pass can try again.
@@ -782,22 +783,30 @@ func (m *manager) promoteN(_ context.Context, n int) {
 // concurrency semaphore. If the semaphore can't be acquired (ctx done
 // during shutdown, or burst already saturated) the spawn is dropped —
 // the next reconcile pass will retry.
+//
+// The deferred panic-recover closure captures vmid by reference so a
+// panic that fires AFTER allocateVMID succeeded logs the real vmid,
+// not the goroutine-entry value of 0.
 func (m *manager) kickClone(ctx context.Context, kind store.PoolKind, poweredOn bool) {
 	if err := m.cloneSem.Acquire(ctx, 1); err != nil {
 		m.log.Debug("clone: dropping spawn (semaphore unavailable)", "kind", kind, "err", err)
 		return
 	}
 	m.wg.Add(1)
+	var vmid int
 	go func() {
 		defer m.wg.Done()
-		defer m.recoverPanic("clone", 0)
+		defer func() { m.logRecoveredPanic("clone", vmid, recover()) }()
 		defer m.cloneSem.Release(1)
-		m.runClone(kind, poweredOn)
+		m.runClone(kind, poweredOn, &vmid)
 	}()
 }
 
-// runClone is the body of an async clone goroutine.
-func (m *manager) runClone(kind store.PoolKind, poweredOn bool) {
+// runClone is the body of an async clone goroutine. The caller passes
+// a *int that runClone writes the allocated vmid into as soon as
+// allocation succeeds — so the surrounding goroutine's panic-recover
+// closure can log the real vmid if a panic fires later in the body.
+func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
 	// Derived from workerCtx so SIGTERM (and drain timeout) propagate
 	// into in-flight Proxmox calls. 15-minute deadline caps a single
 	// stuck call.
@@ -827,6 +836,11 @@ func (m *manager) runClone(kind store.PoolKind, poweredOn bool) {
 		m.allocMu.Unlock()
 		m.log.Warn("clone: allocate vmid failed", "err", err)
 		return
+	}
+	// Publish the allocated id to the caller so a panic later in this
+	// function logs the real vmid rather than 0.
+	if vmidRef != nil {
+		*vmidRef = vmid
 	}
 	name := fmt.Sprintf("%s%d", m.cfg.VMNamePrefix, vmid)
 	row := &store.VM{
@@ -974,7 +988,7 @@ func (m *manager) destroyAsync(vmid int, node string) {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		defer m.recoverPanic("destroyAsync", vmid)
+		defer func() { m.logRecoveredPanic("destroyAsync", vmid, recover()) }()
 		if err := m.destroySem.Acquire(m.workerCtx, 1); err != nil {
 			m.log.Debug("destroy: cancelled before sem acquired", "vmid", vmid, "err", err)
 			return

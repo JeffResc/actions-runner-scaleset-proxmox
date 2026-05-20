@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1129,6 +1130,117 @@ func TestMarkCompleted_RespectsDestroySemaphore(t *testing.T) {
 	close(release)
 	mgr.workerCancel()
 	mgr.wg.Wait()
+}
+
+// TestRunClone_PanicReportsAllocatedVMID: when a clone-goroutine panics
+// after vmid allocation, the recover log line must carry the real vmid
+// — operators need it to know which row to manually clean up. The
+// previous `defer m.recoverPanic("clone", 0)` captured 0 by value at
+// goroutine entry, before the allocator ran.
+func TestRunClone_PanicReportsAllocatedVMID(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	var logBuf strings.Builder
+	logMu := sync.Mutex{}
+	log := slog.New(slog.NewTextHandler(&syncWriter{w: &logBuf, mu: &logMu}, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// fakeProv with Clone that panics — simulates a nil-deref in the
+	// underlying go-proxmox library.
+	fp := &fakeProv{cloneErr: nil}
+	fp.cloneDelay = 0
+	fp.destroyHang = false
+	// Override Clone via the existing hook by patching cloneErr? No — we need to
+	// inject a panic. Use a wrapper.
+	pp := &panickyProv{inner: fp}
+
+	mi, err := NewManager(Config{
+		HotSize:              1,
+		MaxConcurrentRunners: 5,
+		VMIDRange:            config.VMIDRange{Min: 73000, Max: 73099},
+		VMNamePrefix:         "gh-runner-test-",
+		TemplateNode:         "pve1",
+		BootMaxAttempts:      3,
+	}, st, pp, mustSel(t), log, observability.NewMetrics(prometheus.NewRegistry()))
+	require.NoError(t, err)
+	mgr := mi.(*manager)
+
+	// Trigger a single clone goroutine. The panic happens inside Clone,
+	// which is called AFTER allocateVMID — so the log line should
+	// reference the allocated id, not 0.
+	mgr.kickClone(context.Background(), store.PoolKindHot, true)
+
+	require.Eventually(t, func() bool {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return strings.Contains(logBuf.String(), "panic in async pool worker")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	logMu.Lock()
+	out := logBuf.String()
+	logMu.Unlock()
+	require.NotContains(t, out, "vmid=0",
+		"panic log must NOT carry vmid=0 once allocation has happened. log: %s", out)
+	require.Contains(t, out, "vmid=73000",
+		"panic log must reference the allocated vmid. log: %s", out)
+
+	mgr.workerCancel()
+	mgr.wg.Wait()
+}
+
+// panickyProv wraps a Provisioner and panics from Clone. Useful for
+// testing recoverPanic's logging.
+type panickyProv struct{ inner provisioner.Provisioner }
+
+func (p *panickyProv) Clone(context.Context, provisioner.CloneOptions) (*provisioner.VM, error) {
+	panic("simulated nil-deref inside go-proxmox.Clone")
+}
+func (p *panickyProv) Start(ctx context.Context, vm *provisioner.VM) error {
+	return p.inner.Start(ctx, vm)
+}
+func (p *panickyProv) Stop(ctx context.Context, vm *provisioner.VM) error {
+	return p.inner.Stop(ctx, vm)
+}
+func (p *panickyProv) Destroy(ctx context.Context, vm *provisioner.VM) error {
+	return p.inner.Destroy(ctx, vm)
+}
+func (p *panickyProv) WaitReady(ctx context.Context, vm *provisioner.VM, t time.Duration) error {
+	return p.inner.WaitReady(ctx, vm, t)
+}
+func (p *panickyProv) InjectJITConfig(ctx context.Context, vm *provisioner.VM, jit string) error {
+	return p.inner.InjectJITConfig(ctx, vm, jit)
+}
+func (p *panickyProv) ReadAgentFile(ctx context.Context, vm *provisioner.VM, path string) ([]byte, error) {
+	return p.inner.ReadAgentFile(ctx, vm, path)
+}
+func (p *panickyProv) ListOwnedVMs(ctx context.Context) ([]*provisioner.VM, error) {
+	return p.inner.ListOwnedVMs(ctx)
+}
+func (p *panickyProv) PowerState(ctx context.Context, vm *provisioner.VM) (string, error) {
+	return p.inner.PowerState(ctx, vm)
+}
+func (p *panickyProv) Ping(ctx context.Context) error                        { return p.inner.Ping(ctx) }
+func (p *panickyProv) TemplateNode() string                                  { return p.inner.TemplateNode() }
+func (p *panickyProv) Client() *proxmox.Client                               { return p.inner.Client() }
+
+// syncWriter serialises writes to the shared log buffer so concurrent
+// goroutines don't tear the captured output.
+type syncWriter struct {
+	w  *strings.Builder
+	mu *sync.Mutex
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+func mustSel(t *testing.T) nodeselector.Selector {
+	t.Helper()
+	sel, err := nodeselector.NewSingle("pve1")
+	require.NoError(t, err)
+	return sel
 }
 
 // TestPowerPoller_DestroysStoppedRunningVM: a row in Running state whose
