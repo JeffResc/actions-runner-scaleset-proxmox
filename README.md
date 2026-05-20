@@ -8,7 +8,7 @@ Pre-1.0, in active development.
 
 ## How it works
 
-The service implements the [`actions/scaleset`](https://github.com/actions/scaleset) `Scaler` interface and long-polls GitHub for runner-demand signals. When a runner is needed it either (a) takes a fully-booted VM from the **hot pool**, (b) starts a pre-cloned VM from the **warm pool**, or (c) clones a new one from the template VMID. The JIT runner configuration is injected via the QEMU guest agent (no SSH required) and a systemd path-unit inside the VM picks it up and starts the runner. After the job finishes the VM is destroyed.
+The service implements the [`actions/scaleset`](https://github.com/actions/scaleset) `Scaler` interface and long-polls GitHub for runner-demand signals. When a runner is needed it either (a) takes a fully-booted VM from the **hot pool**, (b) starts a pre-cloned VM from the **warm pool**, or (c) clones a new one from the template VMID. The JIT runner configuration is injected via the QEMU guest agent (no SSH required) and a systemd path-unit inside the VM picks it up and starts the runner. When the job finishes the runner unit's `ExecStopPost=poweroff` shuts the VM down; the orchestrator's power-state poller observes that and queues destruction.
 
 State lives in-process in [hashicorp/go-memdb](https://github.com/hashicorp/go-memdb) — no on-disk DB, no migrations. On startup the orchestrator reconciles its empty view against Proxmox by listing VMs tagged as owned by this scale set; any leftovers from a previous process are destroyed.
 
