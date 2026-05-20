@@ -1074,6 +1074,63 @@ func TestDestroyAsync_BoundedByDestroySem(t *testing.T) {
 	mgr.wg.Wait()
 }
 
+// TestMarkCompleted_RespectsDestroySemaphore: a burst of MarkCompleted
+// calls (e.g., end-of-CI run with many jobs finishing nearly
+// simultaneously) must not spawn more concurrent Destroy calls than the
+// destroy semaphore permits. Previously MarkCompleted called destroy()
+// directly via `go m.destroy(...)`, bypassing destroySem; under burst,
+// the orchestrator could hammer Proxmox with N (e.g. 50) parallel
+// destroys.
+func TestMarkCompleted_RespectsDestroySemaphore(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	const want = 20 // > maxConcurrentDestroys (8)
+	for i := range want {
+		require.NoError(t, st.Insert(&store.VM{
+			VMID:     72000 + i,
+			Node:     "pve1",
+			Name:     "burst",
+			PoolKind: store.PoolKindHot,
+			State:    store.StateRunning,
+		}))
+	}
+
+	var inFlight, peak atomic.Int32
+	release := make(chan struct{})
+	fp := &fakeProv{
+		onDestroy: func() {
+			cur := inFlight.Add(1)
+			for {
+				prev := peak.Load()
+				if cur <= prev || peak.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+			<-release
+			inFlight.Add(-1)
+		},
+	}
+	mgr := newTestManager(t, st, fp, Config{DrainTimeout: 5 * time.Second})
+
+	for i := range want {
+		require.NoError(t, mgr.MarkCompleted(context.Background(), 72000+i))
+	}
+
+	// Let the goroutines saturate the semaphore.
+	require.Eventually(t, func() bool {
+		return inFlight.Load() == 8
+	}, 2*time.Second, 5*time.Millisecond,
+		"expected in-flight to saturate at destroy-semaphore cap (8)")
+
+	require.LessOrEqual(t, peak.Load(), int32(8),
+		"peak in-flight destroys (%d) must not exceed destroy-sem cap (8)", peak.Load())
+
+	close(release)
+	mgr.workerCancel()
+	mgr.wg.Wait()
+}
+
 // TestPowerPoller_DestroysStoppedRunningVM: a row in Running state whose
 // Proxmox VM is observed "stopped" (the in-VM runner powered off after
 // the job) must be queued for destruction by the poller. This is the

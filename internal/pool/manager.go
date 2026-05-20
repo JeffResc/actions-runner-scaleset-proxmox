@@ -421,13 +421,11 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 		// Lost the race to another writer — treat as already handled.
 		return nil
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		defer m.recoverPanic("MarkCompleted.destroy", target.VMID)
-		m.destroy(m.workerCtx, target.VMID, target.Node)
-		m.SignalRefill()
-	}()
+	// destroyAsync (not a raw `go m.destroy(...)`): the latter would
+	// bypass destroySem, and a burst of completions could fire many
+	// parallel Destroy calls against Proxmox.
+	m.destroyAsync(target.VMID, target.Node)
+	m.SignalRefill()
 	return nil
 }
 
