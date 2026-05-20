@@ -392,6 +392,36 @@ type stringError struct{ s string }
 
 func (e *stringError) Error() string { return e.s }
 
+// TestAgentExecWait_HandlesBoolAndFloatExited verifies the polymorphic
+// `exited` JSON field is correctly interpreted across Proxmox versions
+// (some emit bool, some emit a JSON number). The previous `case int:`
+// arm in the type switch was unreachable — encoding/json decodes all
+// JSON numbers into float64 when the target is `any` — so the arm has
+// been removed and only the bool/float64 cases remain.
+func TestAgentExecWait_HandlesBoolAndFloatExited(t *testing.T) {
+	t.Parallel()
+	for _, exited := range []string{`true`, `1`, `1.0`} {
+		t.Run("exited="+exited, func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+					_, _ = io.WriteString(w, `{"data": {"pid": 42}}`)
+				case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+					_, _ = io.WriteString(w, `{"data": {"exited": `+exited+`, "exitcode": 0}}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			p := newTestProvisioner(t, srv, "pve1")
+			err := p.agentExecWait(context.Background(), "pve1", 1, []string{"ls"})
+			require.NoError(t, err)
+		})
+	}
+}
+
 // TestAgentExecWait_HonoursCtxCancel: when the in-VM command never
 // finishes, ctx cancellation must unwind agentExecWait promptly rather
 // than waiting for the 30s internal deadline. Regression guard for the

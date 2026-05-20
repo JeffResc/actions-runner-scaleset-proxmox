@@ -124,14 +124,15 @@ func (p *pmox) agentExecWait(ctx context.Context, node string, vmid int, command
 			}
 			return fmt.Errorf("agent exec-status: %w", err)
 		}
-		// `exited` comes back as either int 1 or bool true depending on PVE version.
+		// `exited` comes back as either bool true or a JSON number
+		// (1) depending on PVE version. encoding/json decodes all
+		// numbers into float64 when unmarshalled into an `any`
+		// target, so a `case int:` arm is unreachable here.
 		exited := false
 		switch v := statusResp.Exited.(type) {
 		case bool:
 			exited = v
 		case float64:
-			exited = v == 1
-		case int:
 			exited = v == 1
 		}
 		if exited {
