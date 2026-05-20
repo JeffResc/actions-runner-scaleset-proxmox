@@ -386,6 +386,30 @@ func TestAgentExecWait_HonoursCtxCancel(t *testing.T) {
 		"agentExecWait returned in %s — ctx cancel must propagate promptly", elapsed)
 }
 
+// TestWaitReady_ClassifiesVMNotFound: when go-proxmox surfaces an error
+// whose body says "does not exist", WaitReady must wrap so callers can
+// errors.Is(err, ErrVMNotFound) without depending on which library
+// internal raised it. Uses a 400 response (which go-proxmox preserves
+// the body of) since 500 responses are flattened to just "500 Internal
+// Server Error" inside the library.
+func TestWaitReady_ClassifiesVMNotFound(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("skipping retry-backoff path under -short")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errors":{"vm":"VM does not exist"}}`))
+	}))
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+
+	err := p.WaitReady(context.Background(), &VM{VMID: 9999, Node: "pve1"}, time.Second)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrVMNotFound,
+		"WaitReady must wrap library errors through classifyProxmoxError")
+}
+
 // Sanity: the proxmox.Client we build in tests reaches the test server.
 func TestNewProxmoxClient_ReachesTestServer(t *testing.T) {
 	t.Parallel()

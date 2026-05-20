@@ -376,10 +376,10 @@ func (p *pmox) stopInternal(ctx context.Context, pVM *proxmox.VirtualMachine) er
 	}
 	task, err = pVM.Stop(ctx)
 	if err != nil {
-		return fmt.Errorf("hard stop: %w", err)
+		return fmt.Errorf("hard stop: %w", classifyProxmoxError(err))
 	}
 	if err := task.WaitFor(ctx, 60); err != nil {
-		return fmt.Errorf("await hard stop: %w", err)
+		return fmt.Errorf("await hard stop: %w", classifyProxmoxError(err))
 	}
 	return nil
 }
@@ -404,10 +404,16 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		if isNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("delete vm: %w", err)
+		return fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
 	}
 	if err := task.WaitFor(ctx, 120); err != nil {
-		return fmt.Errorf("await delete: %w", err)
+		// Mid-task 404 → idempotent success (VM disappeared while we
+		// were tearing it down — common with another orchestrator).
+		classified := classifyProxmoxError(err)
+		if errors.Is(classified, ErrVMNotFound) {
+			return nil
+		}
+		return fmt.Errorf("await delete: %w", classified)
 	}
 	return nil
 }
@@ -430,18 +436,20 @@ func (p *pmox) PowerState(ctx context.Context, vm *VM) (string, error) {
 }
 
 // WaitReady blocks until the qemu-guest-agent inside the VM is responsive
-// or the timeout elapses.
+// or the timeout elapses. Errors are routed through classifyProxmoxError
+// so callers can errors.Is against ErrVMNotFound / ErrGuestAgentNotReady
+// regardless of which library internal raised the underlying failure.
 func (p *pmox) WaitReady(ctx context.Context, vm *VM, timeout time.Duration) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
-		return err
+		return classifyProxmoxError(err)
 	}
 	seconds := int(timeout.Seconds())
 	if seconds < 1 {
 		seconds = 60
 	}
 	if err := pVM.WaitForAgent(ctx, seconds); err != nil {
-		return fmt.Errorf("await guest agent: %w", err)
+		return fmt.Errorf("await guest agent: %w", classifyProxmoxError(err))
 	}
 	return nil
 }
