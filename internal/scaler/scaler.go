@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -320,18 +321,17 @@ func isTransientInjectError(err error) bool {
 
 // vmidFromRunnerName extracts the VMID we encoded into the runner name at
 // clone time. Naming convention is "<prefix><vmid>", e.g.
-// "gh-runner-proxmox-ubuntu-x64-10042".
+// "gh-runner-proxmox-ubuntu-x64-10042". strconv.Atoi (not fmt.Sscanf %d)
+// rejects trailing garbage — a malformed name like "<prefix>10042xyz"
+// must not map to vmid 10042.
 func vmidFromRunnerName(name, prefix string) (int, bool) {
 	if !strings.HasPrefix(name, prefix) {
 		return 0, false
 	}
 	rest := strings.TrimPrefix(name, prefix)
-	if rest == "" {
+	vmid, err := strconv.Atoi(rest)
+	if err != nil || vmid <= 0 {
 		return 0, false
 	}
-	var vmid int
-	if _, err := fmt.Sscanf(rest, "%d", &vmid); err != nil {
-		return 0, false
-	}
-	return vmid, vmid > 0
+	return vmid, true
 }
