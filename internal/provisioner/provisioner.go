@@ -582,7 +582,9 @@ func httpStatusFromError(err error) int {
 	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
 		end++
 	}
-	if end < 3 || end > 3 || (end < len(s) && s[end] != ' ') {
+	// HTTP status codes are exactly 3 digits and (when followed by more
+	// text) must be followed by a space.
+	if end != 3 || (end < len(s) && s[end] != ' ') {
 		return 0
 	}
 	n, perr := strconv.Atoi(s[:end])
