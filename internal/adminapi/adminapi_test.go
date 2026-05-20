@@ -222,6 +222,58 @@ func chiHandler(s *Server) http.Handler {
 	return r
 }
 
+// TestAuth_RateLimitsBadTokens: rapid bad-bearer attacks against the
+// admin API must trigger a 429 after the burst budget exhausts. Without
+// the per-IP limiter, an attacker could brute-force the bearer secret
+// at line rate against any operator-chosen string.
+func TestAuth_RateLimitsBadTokens(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestServer(t, "topsecret")
+	h := chiHandler(s)
+
+	var seen401, seen429 int
+	for range 50 {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+		r.Header.Set("Authorization", "Bearer wrong")
+		r.RemoteAddr = "1.2.3.4:5678"
+		h.ServeHTTP(w, r)
+		switch w.Code {
+		case http.StatusUnauthorized:
+			seen401++
+		case http.StatusTooManyRequests:
+			seen429++
+		}
+	}
+	require.Positive(t, seen429, "expected at least one 429 from rapid bad-token requests; got %d 401s and %d 429s", seen401, seen429)
+}
+
+// TestAuth_GoodTokenNotMetered: a valid bearer must never be rate
+// limited, regardless of recent failures from the same IP — operators
+// running tooling shouldn't get throttled because they fat-fingered
+// once.
+func TestAuth_GoodTokenNotMetered(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestServer(t, "topsecret")
+	h := chiHandler(s)
+
+	// Exhaust the bucket with bad tokens from a known IP.
+	for range 30 {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+		r.Header.Set("Authorization", "Bearer wrong")
+		r.RemoteAddr = "5.6.7.8:1234"
+		h.ServeHTTP(w, r)
+	}
+	// Now hit with the correct bearer from the same IP: must succeed.
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	r.RemoteAddr = "5.6.7.8:1234"
+	h.ServeHTTP(w, r)
+	require.Equal(t, http.StatusOK, w.Code, "valid bearer must bypass the auth-failure limiter")
+}
+
 // TestHandleDestroyVM_UsesForceDestroyForHotRow guards the property that
 // the admin destroy endpoint must drop a VM regardless of its state. The
 // previous handler used pool.MarkCompleted, which silently no-ops on

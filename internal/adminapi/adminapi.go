@@ -17,13 +17,16 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/time/rate"
 
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
@@ -46,6 +49,78 @@ type Server struct {
 	// to cancel the orchestrator's root context, which triggers graceful
 	// shutdown across every errgroup goroutine. Nil disables the endpoint.
 	drain func()
+
+	// authFailLimiter throttles unauthenticated requests per source IP.
+	// A successful auth is not metered — operators with the correct
+	// secret never hit it.
+	authFailLimiter *perIPLimiter
+}
+
+// authFail* are the per-IP throttle parameters applied to bad-bearer
+// attempts. Tight enough to make line-rate brute force pointless,
+// loose enough to absorb the occasional fat-fingered operator.
+const (
+	authFailRPS   = 1
+	authFailBurst = 10
+	authFailIdle  = 10 * time.Minute
+)
+
+// perIPLimiter holds one token bucket per source IP, with idle entries
+// swept out to bound memory under attack. It's intentionally a small
+// re-implementation of the same pattern previously used by the
+// runner-hook receiver — kept simple because the admin API has a much
+// smaller call-graph and no proxy-header complexity to worry about.
+type perIPLimiter struct {
+	rps   rate.Limit
+	burst int
+	idle  time.Duration
+
+	mu       sync.Mutex
+	limiters map[string]*ipEntry
+}
+
+type ipEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+func newPerIPLimiter(rps rate.Limit, burst int, idle time.Duration) *perIPLimiter {
+	return &perIPLimiter{
+		rps: rps, burst: burst, idle: idle,
+		limiters: map[string]*ipEntry{},
+	}
+}
+
+func (p *perIPLimiter) allow(ip string, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.limiters[ip]
+	if !ok {
+		e = &ipEntry{limiter: rate.NewLimiter(p.rps, p.burst)}
+		p.limiters[ip] = e
+	}
+	e.lastSeen = now
+	return e.limiter.AllowN(now, 1)
+}
+
+func (p *perIPLimiter) sweep(now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for ip, e := range p.limiters {
+		if now.Sub(e.lastSeen) > p.idle {
+			delete(p.limiters, ip)
+		}
+	}
+}
+
+// remoteIP strips the port from a net.RemoteAddr string; falls back to
+// the input if SplitHostPort can't parse it.
+func remoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
 }
 
 // New builds a Server. Caller invokes Serve to start listening. The
@@ -55,7 +130,10 @@ func New(cfg Config, p pool.Manager, prov provisioner.Provisioner, drain func(),
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, pool: p, prov: prov, drain: drain, log: log}
+	return &Server{
+		cfg: cfg, pool: p, prov: prov, drain: drain, log: log,
+		authFailLimiter: newPerIPLimiter(rate.Limit(authFailRPS), authFailBurst, authFailIdle),
+	}
 }
 
 // Serve runs the admin HTTP server until ctx is cancelled or it errors.
@@ -144,26 +222,43 @@ func (s *Server) maxBody(limit int64) func(http.Handler) http.Handler {
 // SHA-256 before constant-time comparison — comparing the raw bytes
 // directly would short-circuit on length mismatch (per crypto/subtle
 // docs) and leak the secret's length via timing.
+//
+// Failed auths are metered per source IP via authFailLimiter so a
+// brute-force attempt against the configured secret is throttled to
+// the burst budget (10) within idle TTL. Successful auths are never
+// metered — operators with the correct secret pass straight through.
 func (s *Server) requireBearerToken(next http.Handler) http.Handler {
 	const scheme = "Bearer "
 	wantHash := sha256.Sum256([]byte(s.cfg.SharedSecret))
 	secretEmpty := s.cfg.SharedSecret == ""
+	denyUnauthorized := func(w http.ResponseWriter, r *http.Request) {
+		// Apply the rate limiter only on the failure path so a valid
+		// token from the same IP isn't throttled by prior typos.
+		if s.authFailLimiter != nil {
+			if !s.authFailLimiter.allow(remoteIP(r.RemoteAddr), time.Now()) {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "too many failed attempts", http.StatusTooManyRequests)
+				return
+			}
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Defense in depth: refuse to authenticate against an empty
 		// configured secret even if Serve's startup check is bypassed
 		// by a future caller — ConstantTimeCompare("","") returns 1.
 		if secretEmpty {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			denyUnauthorized(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, scheme) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			denyUnauthorized(w, r)
 			return
 		}
 		gotHash := sha256.Sum256([]byte(auth[len(scheme):]))
 		if subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			denyUnauthorized(w, r)
 			return
 		}
 		next.ServeHTTP(w, r)
