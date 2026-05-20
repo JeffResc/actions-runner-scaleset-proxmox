@@ -209,8 +209,13 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
 		return
 	}
-	if err := s.pool.MarkCompleted(r.Context(), vmid); err != nil {
-		s.log.Error("admin destroy: mark completed failed", "vmid", vmid, "err", err)
+	// ForceDestroy (not MarkCompleted): MarkCompleted only acts on
+	// Assigned/Running rows and silently no-ops elsewhere, which means
+	// an operator targeting a Hot/Warm/Booting VM would get 202 with no
+	// effect. ForceDestroy is the unconditional drop the endpoint
+	// promises.
+	if err := s.pool.ForceDestroy(r.Context(), vmid, "admin destroy endpoint"); err != nil {
+		s.log.Error("admin destroy: force destroy failed", "vmid", vmid, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

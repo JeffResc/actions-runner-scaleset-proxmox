@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
@@ -23,6 +24,7 @@ type fakePool struct {
 	stats           pool.Stats
 	statsErr        error
 	markedCompleted []int
+	forceDestroyed  []int
 }
 
 func (f *fakePool) Acquire(_ context.Context, _ int64) (*pool.VM, error) {
@@ -50,7 +52,7 @@ func (f *fakePool) PromoteToRunning(_ context.Context, _ int, _, _ int64) error 
 func (f *fakePool) ForceDestroy(_ context.Context, vmid int, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.markedCompleted = append(f.markedCompleted, vmid)
+	f.forceDestroyed = append(f.forceDestroyed, vmid)
 	return nil
 }
 func (f *fakePool) ListRows(_ context.Context) ([]pool.RowSnapshot, error) {
@@ -208,9 +210,28 @@ func TestState_ReturnsPoolStats(t *testing.T) {
 	require.Equal(t, 2, got.Pool.Warm)
 }
 
-func TestDestroyVM_QueuesAndReturns202(t *testing.T) {
+// chiHandler wires the real production routes onto a chi router so tests
+// exercise the same handler chain (including chi.URLParam) that Serve
+// uses in production.
+func chiHandler(s *Server) http.Handler {
+	r := chi.NewRouter()
+	r.Use(s.requireBearerToken)
+	r.Get("/admin/state", s.handleState)
+	r.Post("/admin/drain", s.handleDrain)
+	r.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
+	return r
+}
+
+// TestHandleDestroyVM_UsesForceDestroyForHotRow guards the property that
+// the admin destroy endpoint must drop a VM regardless of its state. The
+// previous handler used pool.MarkCompleted, which silently no-ops on
+// Hot/Warm/Booting rows — so operators got a 202 with no actual effect.
+// ForceDestroy is the right primitive for an unconditional operator
+// intervention.
+func TestHandleDestroyVM_UsesForceDestroyForHotRow(t *testing.T) {
+	t.Parallel()
 	s, fp := newTestServer(t, "topsecret")
-	h := mountHandler(s)
+	h := chiHandler(s)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/admin/destroy/10042", nil)
@@ -220,7 +241,25 @@ func TestDestroyVM_QueuesAndReturns202(t *testing.T) {
 
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
-	require.Contains(t, fp.markedCompleted, 10042)
+	require.Contains(t, fp.forceDestroyed, 10042,
+		"admin destroy must route through ForceDestroy so it works on Hot/Warm rows")
+	require.NotContains(t, fp.markedCompleted, 10042,
+		"admin destroy must NOT use MarkCompleted — it no-ops on non-busy rows")
+}
+
+func TestDestroyVM_QueuesAndReturns202(t *testing.T) {
+	s, fp := newTestServer(t, "topsecret")
+	h := chiHandler(s)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/admin/destroy/10042", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	h.ServeHTTP(w, r)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Contains(t, fp.forceDestroyed, 10042)
 }
 
 func TestDrain_TriggersCallback(t *testing.T) {
