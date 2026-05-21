@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -82,16 +83,58 @@ type TransportWrap func(http.RoundTripper) http.RoundTripper
 // ---------------------------------------------------------------------------
 
 type patAuth struct {
-	token string
+	token       string
+	configURL   string // empty = use scope.URL() — production default
+	restBaseURL string // empty = use go-github default (https://api.github.com/)
+}
+
+// PATConfig configures a PAT-based [Auth] with optional base-URL overrides
+// for both the scaleset client and the go-github REST client. The
+// override fields are e2e-test hooks — production callers should use
+// [NewPAT] which leaves both empty.
+type PATConfig struct {
+	// Token is the personal access token. Required.
+	Token string
+
+	// ConfigURL, when non-empty, replaces scope.URL() as the
+	// GitHubConfigURL passed to scaleset.NewClientWithPersonalAccessToken.
+	// Use this to point the scaleset listener at a fake GitHub server.
+	ConfigURL string
+
+	// RESTBaseURL, when non-empty, overrides the go-github client's
+	// BaseURL. Must end with a trailing slash (go-github requirement);
+	// the constructor enforces this. Use this to point the gh
+	// reconciler at a fake GitHub REST server.
+	RESTBaseURL string
+}
+
+// NewPATWithConfig constructs a PAT-based Auth with optional base-URL
+// overrides. See [PATConfig] for field semantics. Production callers
+// should prefer [NewPAT].
+func NewPATWithConfig(c PATConfig) (Auth, error) {
+	if c.Token == "" {
+		return nil, errors.New("githubauth: PAT token is required")
+	}
+	if c.RESTBaseURL != "" {
+		if _, err := url.Parse(c.RESTBaseURL); err != nil {
+			return nil, fmt.Errorf("githubauth: rest base url %q: %w", c.RESTBaseURL, err)
+		}
+		if !strings.HasSuffix(c.RESTBaseURL, "/") {
+			return nil, fmt.Errorf("githubauth: rest base url %q must end with /", c.RESTBaseURL)
+		}
+	}
+	return &patAuth{
+		token:       c.Token,
+		configURL:   c.ConfigURL,
+		restBaseURL: c.RESTBaseURL,
+	}, nil
 }
 
 // NewPAT constructs a PAT-based Auth. The token must already be resolved
-// (e.g. from an env var by the config package).
+// (e.g. from an env var by the config package). For test scenarios that
+// need to redirect to a fake GitHub server, use [NewPATWithConfig].
 func NewPAT(token string) (Auth, error) {
-	if token == "" {
-		return nil, errors.New("githubauth: PAT token is required")
-	}
-	return &patAuth{token: token}, nil
+	return NewPATWithConfig(PATConfig{Token: token})
 }
 
 func (p *patAuth) NewScaleSetClient(
@@ -103,8 +146,12 @@ func (p *patAuth) NewScaleSetClient(
 	if err := scope.Validate(); err != nil {
 		return nil, err
 	}
+	configURL := p.configURL
+	if configURL == "" {
+		configURL = scope.URL()
+	}
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
-		GitHubConfigURL:     scope.URL(),
+		GitHubConfigURL:     configURL,
 		PersonalAccessToken: p.token,
 		SystemInfo:          sys,
 	}, opts...)
@@ -112,7 +159,15 @@ func (p *patAuth) NewScaleSetClient(
 
 func (p *patAuth) NewRESTClient(_ context.Context, transportWraps ...TransportWrap) (*github.Client, error) {
 	httpClient := &http.Client{Transport: applyWraps(http.DefaultTransport, transportWraps)}
-	return github.NewClient(httpClient).WithAuthToken(p.token), nil
+	cli := github.NewClient(httpClient).WithAuthToken(p.token)
+	if p.restBaseURL != "" {
+		base, err := url.Parse(p.restBaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("githubauth: rest base url %q: %w", p.restBaseURL, err)
+		}
+		cli.BaseURL = base
+	}
+	return cli, nil
 }
 
 // ---------------------------------------------------------------------------
