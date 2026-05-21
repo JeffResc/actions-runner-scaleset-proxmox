@@ -2,7 +2,6 @@ package cluster
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -34,11 +33,6 @@ func NewForwarder(coord Coordinator) *Forwarder {
 	}
 	return f
 }
-
-// ErrNoLeader is sent through Forwarder.ErrorHandler when LeaderEndpoint
-// returns the empty string. The error handler maps it to 503; callers
-// can detect it via errors.Is if they wrap the Forwarder for testing.
-var ErrNoLeader = errors.New("cluster: no leader endpoint available")
 
 // director rewrites the outgoing request URL to point at the leader.
 // Returns nil silently when no leader endpoint is available; the
