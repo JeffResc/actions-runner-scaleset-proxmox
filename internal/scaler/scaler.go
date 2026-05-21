@@ -240,7 +240,16 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	// registration leaks.
 	if runnerID > 0 {
 		if err := s.pool.SetRunnerID(ctx, vmObj.VMID, runnerID); err != nil {
-			// Non-fatal: the reconciler will set it on its next pass.
+			// Non-fatal: the gh.Reconciler will set it on its next pass —
+			// for jobs longer than one reconcile interval. Sub-15s jobs
+			// that complete before the next tick will be destroyed before
+			// the reconciler ever observes their runner_id, and
+			// OnRunnerOrphaned will have nothing to deregister. The
+			// GitHub-side registration then leaks until the orphan-runner
+			// sweep (cleanupOrphanRunners) reaps it on a subsequent tick.
+			// We accept this — SetRunnerID failures here are typically a
+			// row-was-destroyed-mid-flight signal, in which case the VM
+			// is already on its way out and the leak is bounded.
 			s.log.Warn("set runner id failed", "vmid", vmObj.VMID, "runner_id", runnerID, "err", err)
 		}
 	}

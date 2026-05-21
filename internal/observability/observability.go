@@ -102,6 +102,13 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "vms_total",
 			Help: "Cumulative count of VMs created, partitioned by outcome.",
 		}, []string{"outcome"}),
+		// CloneDuration label set is intentionally bounded by node count
+		// (a handful) × linked-bool (2). Do NOT add pool.kind or vm.id
+		// here — pool.kind only adds a fixed factor today but vm.id would
+		// produce one series per VM per scrape, blowing up Prometheus
+		// cardinality. If you need per-VM clone latency, emit a trace
+		// span (we already do — see provisioner.Clone) rather than a
+		// metric.
 		CloneDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "clone_duration_seconds",
 			Help:    "Time to clone a VM from template.",
