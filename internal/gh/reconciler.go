@@ -181,10 +181,17 @@ const orphanGrace = 30 * time.Second
 func (r *Reconciler) Run(ctx context.Context) error {
 	delay := r.cfg.PollInterval
 	for {
+		// time.NewTimer (not time.After) so the timer is reclaimed
+		// immediately on ctx cancellation. With time.After a cancellation
+		// at the start of a 5-minute backoff leaves a runtime timer alive
+		// for the full duration — harmless but noisy under SIGTERM at
+		// scale.
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-time.After(delay):
+		case <-timer.C:
 		}
 		if err := r.Tick(ctx); err != nil {
 			delay *= 2

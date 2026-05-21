@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -14,6 +15,16 @@ import (
 
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
 )
+
+// jitConfigPattern is the character set GitHub's JIT configs are known
+// to use (RFC 4648 standard base64 plus padding). Validating against this
+// before formatting into the systemd env-file blocks two failure modes:
+// an embedded single quote breaking the env-file syntax, and an error
+// string being misread as a config payload after a parse path elsewhere
+// changes upstream. The orchestrator's only data source today is the
+// GitHub API itself, so a mismatch implies an upstream contract break
+// — bail out rather than write a malformed file.
+var jitConfigPattern = regexp.MustCompile(`^[A-Za-z0-9+/=]+$`)
 
 var tracer = otel.Tracer(observability.TracerName)
 
@@ -44,6 +55,9 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) er
 	}
 	if jitConfig == "" {
 		return fmt.Errorf("inject jit: empty config for vm %d", vm.VMID)
+	}
+	if !jitConfigPattern.MatchString(jitConfig) {
+		return fmt.Errorf("inject jit: config for vm %d does not match expected base64 form (chars outside [A-Za-z0-9+/=])", vm.VMID)
 	}
 	ctx, span := tracer.Start(ctx, "provisioner.InjectJITConfig", trace.WithAttributes(
 		attribute.Int("vm.id", vm.VMID),
@@ -149,13 +163,23 @@ func (p *pmox) agentExecWait(ctx context.Context, node string, vmid int, command
 	}
 }
 
-// ReadAgentFile reads a file from inside the VM via the guest agent. Used
-// by crash recovery to inspect /opt/actions-runner/jitconfig.env and
-// decide whether a Hot-state VM has been consumed.
-func (p *pmox) ReadAgentFile(ctx context.Context, vm *VM, path string) ([]byte, error) {
+// ReadJITConfig reads the canonical JIT-config env file from inside the
+// VM via the guest agent. Used by crash recovery to inspect
+// /opt/actions-runner/jitconfig.env and decide whether a Hot-state VM
+// has been consumed. The path is hardcoded so the only thing a caller
+// controls is which VM to ask, not what file to read.
+func (p *pmox) ReadJITConfig(ctx context.Context, vm *VM) ([]byte, error) {
+	const jitConfigPath = "/opt/actions-runner/jitconfig.env"
 	if vm == nil {
-		return nil, fmt.Errorf("read agent file: nil vm")
+		return nil, fmt.Errorf("read jit config: nil vm")
 	}
+	return p.readAgentFile(ctx, vm, jitConfigPath)
+}
+
+// readAgentFile is the unexported guest-agent file-read primitive. Kept
+// private so attacker-influenced paths can't reach it; every public
+// caller goes through a hardcoded path wrapper above.
+func (p *pmox) readAgentFile(ctx context.Context, vm *VM, path string) ([]byte, error) {
 	apiPath := fmt.Sprintf("/nodes/%s/qemu/%d/agent/file-read", vm.Node, vm.VMID)
 	// The library auto-unwraps the {"data": ...} envelope, so the target
 	// struct describes the *inner* payload.

@@ -87,7 +87,7 @@ type Provisioner interface {
 	Destroy(ctx context.Context, vm *VM) error
 	WaitReady(ctx context.Context, vm *VM, timeout time.Duration) error
 	InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) error
-	ReadAgentFile(ctx context.Context, vm *VM, path string) ([]byte, error)
+	ReadJITConfig(ctx context.Context, vm *VM) ([]byte, error)
 	ListOwnedVMs(ctx context.Context) ([]*VM, error)
 
 	// PowerState returns the Proxmox status string for the VM —

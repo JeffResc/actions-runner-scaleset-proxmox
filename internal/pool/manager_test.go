@@ -146,7 +146,7 @@ func (f *fakeProv) InjectJITConfig(_ context.Context, v *provisioner.VM, _ strin
 	return f.injectErr
 }
 
-func (f *fakeProv) ReadAgentFile(_ context.Context, _ *provisioner.VM, _ string) ([]byte, error) {
+func (f *fakeProv) ReadJITConfig(_ context.Context, _ *provisioner.VM) ([]byte, error) {
 	return nil, nil
 }
 
@@ -1021,6 +1021,68 @@ func TestMarkCompleted_IdempotentOnDraining(t *testing.T) {
 	require.Empty(t, fp.destroys, "MarkCompleted on Draining row must not queue another destroy")
 }
 
+// TestDestroyOrSyncFallback_RunsSynchronouslyWhenWorkerCtxCancelled
+// locks the clone-fail VM-leak fix: when workerCtx is already cancelled
+// (drain in progress), the async destroy goroutine would bail out
+// immediately on its sem.Acquire. The fallback runs prov.Destroy
+// against a fresh context so the just-cloned VM still gets cleaned up.
+func TestDestroyOrSyncFallback_RunsSynchronouslyWhenWorkerCtxCancelled(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+
+	// Pre-insert a row so the sync destroy path's store.Delete works.
+	require.NoError(t, st.Insert(&store.VM{
+		VMID:     50050,
+		Node:     "pve1",
+		Name:     "gh-runner-test-50050",
+		PoolKind: store.PoolKindHot,
+		State:    store.StateDestroying,
+	}))
+
+	mgr := newTestManager(t, st, fp, Config{DrainTimeout: 1 * time.Second})
+	// Force the "workerCtx already cancelled" branch.
+	mgr.workerCancel()
+
+	mgr.destroyOrSyncFallback(50050, "pve1")
+
+	fp.mu.Lock()
+	require.Contains(t, fp.destroys, 50050,
+		"synchronous fallback must call prov.Destroy when workerCtx is already cancelled")
+	fp.mu.Unlock()
+
+	_, err := st.Get(50050)
+	require.Error(t, err, "store row should be deleted after the sync destroy succeeds")
+}
+
+// TestDestroyOrSyncFallback_AsyncWhenWorkerCtxLive locks the inverse:
+// in normal operation (workerCtx still live) the fallback delegates to
+// destroyAsync so we keep the existing concurrency budget semantics.
+func TestDestroyOrSyncFallback_AsyncWhenWorkerCtxLive(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{DrainTimeout: 1 * time.Second})
+
+	mgr.destroyOrSyncFallback(50051, "pve1")
+
+	// Wait for the async destroy to land.
+	done := make(chan struct{})
+	go func() {
+		mgr.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("destroyAsync goroutine did not exit")
+	}
+
+	fp.mu.Lock()
+	require.Contains(t, fp.destroys, 50051)
+	fp.mu.Unlock()
+}
+
 // TestDestroyAsync_PanicInProvisionerDoesNotKillProcess: a panic inside
 // the Proxmox library (nil-deref, race, etc.) used to crash the whole
 // orchestrator. The recoverPanic guard now contains it — Run continues,
@@ -1235,8 +1297,8 @@ func (p *panickyProv) WaitReady(ctx context.Context, vm *provisioner.VM, t time.
 func (p *panickyProv) InjectJITConfig(ctx context.Context, vm *provisioner.VM, jit string) error {
 	return p.inner.InjectJITConfig(ctx, vm, jit)
 }
-func (p *panickyProv) ReadAgentFile(ctx context.Context, vm *provisioner.VM, path string) ([]byte, error) {
-	return p.inner.ReadAgentFile(ctx, vm, path)
+func (p *panickyProv) ReadJITConfig(ctx context.Context, vm *provisioner.VM) ([]byte, error) {
+	return p.inner.ReadJITConfig(ctx, vm)
 }
 func (p *panickyProv) ListOwnedVMs(ctx context.Context) ([]*provisioner.VM, error) {
 	return p.inner.ListOwnedVMs(ctx)

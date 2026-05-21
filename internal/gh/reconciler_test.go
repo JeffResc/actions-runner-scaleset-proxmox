@@ -169,7 +169,7 @@ func (s *stubProv) WaitReady(context.Context, *provisioner.VM, time.Duration) er
 func (s *stubProv) InjectJITConfig(context.Context, *provisioner.VM, string) error {
 	return nil
 }
-func (s *stubProv) ReadAgentFile(context.Context, *provisioner.VM, string) ([]byte, error) {
+func (s *stubProv) ReadJITConfig(context.Context, *provisioner.VM) ([]byte, error) {
 	return nil, nil
 }
 func (s *stubProv) PowerState(context.Context, *provisioner.VM) (string, error) {
