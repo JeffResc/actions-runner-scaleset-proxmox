@@ -9,11 +9,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/githubauth"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
 )
 
 // fakePEM is a syntactically valid PEM that scaleset only inspects when it
@@ -202,6 +203,94 @@ func TestPAT_NewRESTClient_HitsBaseURL(t *testing.T) {
 	require.Len(t, obs.calls, 1)
 	require.Equal(t, "runners", obs.calls[0].endpoint)
 	require.Equal(t, "2xx", obs.calls[0].status)
+}
+
+// TestNewPATWithConfig_Validates exercises the new constructor's input
+// validation: empty token, malformed REST base URL, and the trailing-slash
+// requirement go-github imposes on BaseURL.
+func TestNewPATWithConfig_Validates(t *testing.T) {
+	t.Parallel()
+
+	_, err := githubauth.NewPATWithConfig(githubauth.PATConfig{})
+	require.Error(t, err, "empty token must error")
+
+	_, err = githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:       "ghp_test",
+		RESTBaseURL: "http://example.test", // missing trailing slash
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must end with /")
+
+	_, err = githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:       "ghp_test",
+		RESTBaseURL: "http://example.test/",
+	})
+	require.NoError(t, err)
+}
+
+// TestPAT_RESTBaseURLOverride proves the constructor's RESTBaseURL field
+// causes outbound REST calls to land on the override host without the
+// caller having to patch cli.BaseURL manually.
+func TestPAT_RESTBaseURLOverride(t *testing.T) {
+	t.Parallel()
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"total_count": 0, "runners": []}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	a, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:       "ghp_test",
+		RESTBaseURL: srv.URL + "/",
+	})
+	require.NoError(t, err)
+
+	cli, err := a.NewRESTClient(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, srv.URL+"/", cli.BaseURL.String())
+
+	_, _, err = cli.Actions.ListRunners(context.Background(), "octocat", "repo", nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, hits, "REST call must land on the override host")
+}
+
+// TestPAT_ConfigURLOverride confirms a custom ConfigURL replaces
+// scope.URL() inside NewScaleSetClient by observing that the first
+// scaleset API call lands on the override host instead of github.com.
+// The scaleset client's request flow does an unauthenticated discovery
+// hit first — that's the one we watch for. We don't care if the call
+// ultimately errors (the fake doesn't respond like the real Actions
+// service); we only care that the host was the one we configured.
+func TestPAT_ConfigURLOverride(t *testing.T) {
+	t.Parallel()
+	var hit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		http.Error(w, "stub", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	a, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:     "ghp_test",
+		ConfigURL: srv.URL + "/octocat",
+	})
+	require.NoError(t, err)
+
+	c, err := a.NewScaleSetClient(context.Background(),
+		githubauth.Scope{Org: "octocat"}, validSystemInfo)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+
+	// Trigger a request with a tight deadline (the scaleset library
+	// retries internally; we don't need to wait for it to give up).
+	// We don't care about the outcome, only that the outbound HTTP
+	// landed on our override host.
+	callCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = c.GetRunnerScaleSet(callCtx, 1, "any")
+	require.True(t, hit, "ConfigURL override must route scaleset client traffic to the configured host")
 }
 
 // TestApp_NewRESTClient_RejectsNonNumericClientID guards the path where

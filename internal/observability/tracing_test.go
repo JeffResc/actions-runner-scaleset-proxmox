@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 )
 
 func discardLogger() *slog.Logger {

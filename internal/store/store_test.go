@@ -8,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/store"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
 )
 
 func newVM(vmid int, st store.State) *store.VM {

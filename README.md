@@ -1,4 +1,4 @@
-# github-actions-proxmox-scaleset
+# actions-runner-scaleset-proxmox
 
 > Ephemeral, single-use GitHub Actions self-hosted runners backed by Proxmox VMs.
 

@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 )
 
 // jitConfigPattern is the character set GitHub's JIT configs are known

@@ -81,7 +81,7 @@ func TestStandalone_NilCallbacksOK(t *testing.T) {
 // Kubernetes (Lease-backed)
 // ---------------------------------------------------------------------------
 
-func newTestKubeCoord(t *testing.T, identity string, port int) (*kubeCoord, *fake.Clientset, *atomic.Bool, *atomic.Bool) {
+func newTestKubeCoord(t *testing.T, identity string, port int) (Coordinator, *fake.Clientset, *atomic.Bool, *atomic.Bool) {
 	t.Helper()
 	client := fake.NewSimpleClientset()
 	var elected atomic.Bool
@@ -103,11 +103,11 @@ func newTestKubeCoord(t *testing.T, identity string, port int) (*kubeCoord, *fak
 		},
 		OnDeposed: func() { deposed.Store(true) },
 	}
-	return newKubernetesWithClient(cfg, cb, discardLogger(), client), client, &elected, &deposed
+	return NewKubernetesWithClient(cfg, cb, discardLogger(), client), client, &elected, &deposed
 }
 
 func TestKubernetes_WinsElectionAndPublishesEndpoint(t *testing.T) {
-	// Disabled pending fix for jeffresc/github-actions-proxmox-scaleset#12:
+	// Disabled pending fix for jeffresc/actions-runner-scaleset-proxmox#12:
 	// the leader-election library caches the Lease object and overwrites
 	// our endpoint annotation on every renewal, so this assertion can
 	// never reliably pass.
@@ -169,7 +169,7 @@ func TestKubernetes_StandbyReadsAnnotation(t *testing.T) {
 		RenewDeadline:  100 * time.Millisecond,
 		RetryPeriod:    20 * time.Millisecond,
 	}
-	coord := newKubernetesWithClient(cfg, Callbacks{}, discardLogger(), client)
+	coord := NewKubernetesWithClient(cfg, Callbacks{}, discardLogger(), client)
 
 	ep, err := coord.LeaderEndpoint(context.Background())
 	require.NoError(t, err)
@@ -190,7 +190,7 @@ func TestKubernetes_LeaderEndpointEmptyBeforeAnyLeader(t *testing.T) {
 		RenewDeadline:  100 * time.Millisecond,
 		RetryPeriod:    20 * time.Millisecond,
 	}
-	coord := newKubernetesWithClient(cfg, Callbacks{}, discardLogger(), client)
+	coord := NewKubernetesWithClient(cfg, Callbacks{}, discardLogger(), client)
 
 	ep, err := coord.LeaderEndpoint(context.Background())
 	require.NoError(t, err)

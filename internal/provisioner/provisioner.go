@@ -23,8 +23,8 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/luthermonson/go-proxmox"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/config"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/tags"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
 // ErrTemplateNotFound is returned by [New] when the configured template
@@ -673,7 +673,7 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 			continue
 		}
 		for _, v := range vms {
-			vmid := int(v.VMID)
+			vmid := int(v.VMID) // #nosec G115 -- VMIDs are bounded by VMIDRange (typically 10000..19999); overflow unreachable.
 			owned := tags.IsOwnedBy(v.Tags, p.scaleSetName)
 			// Untagged orphan detection — both predicates must hold so
 			// we never reap a human-created VM that just happens to

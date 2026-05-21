@@ -5,7 +5,7 @@
   "packages": {
     ".": {
       "release-type": "go",
-      "package-name": "github-actions-proxmox-scaleset",
+      "package-name": "actions-runner-scaleset-proxmox",
       "release-as": "0.1.0",
       "changelog-sections": [
         {"type": "feat", "section": "Features"},

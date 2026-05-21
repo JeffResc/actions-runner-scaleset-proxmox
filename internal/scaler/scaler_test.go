@@ -12,8 +12,8 @@ import (
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
 )
 
 func TestVMIDFromRunnerName(t *testing.T) {

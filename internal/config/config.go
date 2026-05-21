@@ -314,7 +314,7 @@ type ClusterKubernetesConfig struct {
 // file. The returned Config is ready to use by the rest of the
 // orchestrator; on error the partially-parsed Config is discarded.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path is the operator-supplied config file; we are the trust boundary.
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}

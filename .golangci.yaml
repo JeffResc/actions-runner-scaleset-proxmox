@@ -20,14 +20,6 @@ linters:
     - prealloc
     - gosec
   settings:
-    gosec:
-      excludes:
-        # G304 — file paths are operator-controlled CLI/config inputs;
-        # we are the trust boundary, not a target downstream of one.
-        - G304
-        # G115 — VMID conversions are bounded by the configured VMIDRange
-        # (typically 10000..19999). uint64→int overflow is not reachable.
-        - G115
     revive:
       rules:
         - name: blank-imports
@@ -73,4 +65,4 @@ formatters:
       simplify: true
     goimports:
       local-prefixes:
-        - github.com/jeffresc/github-actions-proxmox-scaleset
+        - github.com/jeffresc/actions-runner-scaleset-proxmox

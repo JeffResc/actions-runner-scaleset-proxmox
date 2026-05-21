@@ -23,10 +23,10 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/githubauth"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
 )
 
 var tracer = otel.Tracer(observability.TracerName)

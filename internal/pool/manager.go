@@ -16,11 +16,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/config"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/nodeselector"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/store"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
 )
 
 // tracer is the package-level OpenTelemetry tracer. When tracing isn't

@@ -1,6 +1,6 @@
 [Unit]
 Description=GitHub Actions ephemeral runner (one job, then poweroff)
-Documentation=https://github.com/jeffresc/github-actions-proxmox-scaleset
+Documentation=https://github.com/jeffresc/actions-runner-scaleset-proxmox
 # Wait for the network so the runner can reach github.com.
 After=network-online.target
 Wants=network-online.target
