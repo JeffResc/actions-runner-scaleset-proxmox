@@ -60,10 +60,6 @@ proxmox:
     vlan_tag: 0       # 0 = untagged
   clone:
     linked: true      # linked clones complete in 1-3s but pin to template storage
-  cloud_init:
-    user: runner
-    ssh_authorized_keys: []
-    dns_servers: [1.1.1.1, 8.8.8.8]
 
 nodes:
   strategy: single                # single | round_robin | least_loaded

@@ -124,7 +124,6 @@ type ProxmoxConfig struct {
 	Storage            ProxmoxStorage `yaml:"storage" validate:"required"`
 	Network            ProxmoxNetwork `yaml:"network" validate:"required"`
 	Clone              CloneConfig    `yaml:"clone"`
-	CloudInit          CloudInit      `yaml:"cloud_init"`
 }
 
 // ProxmoxAuth holds API token credentials. The secret is read from the env
@@ -168,13 +167,6 @@ func (c CloneConfig) LinkedOrDefault() bool {
 		return true
 	}
 	return *c.Linked
-}
-
-// CloudInit configures the cloud-init userdata baked into cold-path clones.
-type CloudInit struct {
-	User              string   `yaml:"user"`
-	SSHAuthorizedKeys []string `yaml:"ssh_authorized_keys"`
-	DNSServers        []string `yaml:"dns_servers"`
 }
 
 // NodesConfig selects the cluster placement strategy.
