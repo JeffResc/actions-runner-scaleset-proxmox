@@ -149,15 +149,6 @@ func NewApp(clientID string, installationID int64, privateKeyPEM []byte) (Auth, 
 	}, nil
 }
 
-// NewAppFromAppID is a convenience wrapper that takes a numeric App ID
-// rather than a Client ID.
-func NewAppFromAppID(appID, installationID int64, privateKeyPEM []byte) (Auth, error) {
-	if appID == 0 {
-		return nil, errors.New("githubauth: app_id is required")
-	}
-	return NewApp(strconv.FormatInt(appID, 10), installationID, privateKeyPEM)
-}
-
 // NewAppFromFile reads the PEM file from disk and constructs an App auth.
 // Refuses to read a key file with world- or group-readable permissions
 // (any bit in 0o077) — the operator's deployment is misconfigured if

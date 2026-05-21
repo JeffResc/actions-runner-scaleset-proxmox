@@ -84,6 +84,12 @@ spec:
             - name: config
               mountPath: /etc/scaleset
               readOnly: true
+            # readOnlyRootFilesystem=true (set in containerSecurityContext)
+            # means a writable /tmp must be provided explicitly. Go's
+            # default os.TempDir is /tmp, and the OTLP exporter and
+            # crash dumps also assume it exists.
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /readyz
@@ -104,6 +110,8 @@ spec:
         - name: config
           configMap:
             name: {{ include "scaleset.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

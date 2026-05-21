@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -13,6 +14,21 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
+
+// redactEndpoint strips any userinfo from a URL-shaped endpoint string
+// before it's logged. An operator who accidentally embeds creds in the
+// configured endpoint (e.g. "https://user:pass@otlp.example.com") would
+// otherwise see them appear verbatim in the orchestrator's structured
+// log output. Returns the input unchanged when it's a bare host:port
+// (the common case — the OTLP exporter accepts both forms).
+func redactEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.User == nil {
+		return endpoint
+	}
+	u.User = url.UserPassword("REDACTED", "")
+	return u.String()
+}
 
 // TracerName is the canonical instrumentation-scope name. Use this when
 // fetching a tracer (e.g. otel.Tracer(observability.TracerName)) so all
@@ -98,7 +114,7 @@ func InitTracer(ctx context.Context, opts TracingOptions, log *slog.Logger) (Tra
 		propagation.Baggage{},
 	))
 
-	log.Info("tracing enabled", "endpoint", opts.Endpoint, "insecure", opts.Insecure, "sample_ratio", opts.SampleRatio)
+	log.Info("tracing enabled", "endpoint", redactEndpoint(opts.Endpoint), "insecure", opts.Insecure, "sample_ratio", opts.SampleRatio)
 
 	shutdown := func(shutdownCtx context.Context) error {
 		shutdownCtx, cancel := context.WithTimeout(shutdownCtx, 5*time.Second)

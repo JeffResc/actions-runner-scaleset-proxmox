@@ -104,20 +104,6 @@ func TestNewApp_Validates(t *testing.T) {
 	}
 }
 
-func TestNewAppFromAppID_ConvertsToString(t *testing.T) {
-	t.Parallel()
-	a, err := githubauth.NewAppFromAppID(123456, 9876, []byte(fakePEM))
-	require.NoError(t, err)
-	require.NotNil(t, a)
-
-	// Indirect verification: building a client succeeds and references the
-	// app-mode constructor's required fields.
-	c, err := a.NewScaleSetClient(context.Background(),
-		githubauth.Scope{Org: "octocat"}, validSystemInfo)
-	require.NoError(t, err)
-	require.NotNil(t, c)
-}
-
 func TestNewAppFromFile_ReadsPEM(t *testing.T) {
 	t.Parallel()
 	p := filepath.Join(t.TempDir(), "app.pem")

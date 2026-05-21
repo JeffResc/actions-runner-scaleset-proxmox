@@ -189,6 +189,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	r := chi.NewRouter()
+	// middleware.RealIP trusts X-Forwarded-For / X-Real-IP unconditionally
+	// to derive r.RemoteAddr — which the per-IP auth-failure limiter
+	// downstream then keys on. SAFE today because the admin port is
+	// expected to be a cluster-internal ClusterIP/NodePort, where these
+	// headers only arrive via an in-cluster reverse-proxy we own (the
+	// standby's cluster.Forwarder). If you ever expose this port to
+	// arbitrary clients, replace this with a trusted-proxy allowlist
+	// (chi has middleware.RealIP variants for that).
 	r.Use(middleware.RealIP)
 	r.Use(s.accessLog)
 	r.Use(s.maxBody(64 * 1024)) // 64 KiB cap on any admin request body
@@ -361,7 +369,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(stateResponse{Pool: stats})
+	if err := json.NewEncoder(w).Encode(stateResponse{Pool: stats}); err != nil {
+		// Headers already sent so we can't surface the error, but logging
+		// it helps forensics if an operator reports a truncated response.
+		s.log.Debug("admin state: response encode failed", "err", err)
+	}
 }
 
 // handleDrain triggers a one-shot graceful drain by invoking the callback
@@ -377,7 +389,9 @@ func (s *Server) handleDrain(w http.ResponseWriter, _ *http.Request) {
 	s.log.Info("admin drain requested")
 	go s.drain()
 	w.WriteHeader(http.StatusAccepted)
-	_, _ = w.Write([]byte("draining"))
+	if _, err := w.Write([]byte("draining")); err != nil {
+		s.log.Debug("admin drain: response write failed", "err", err)
+	}
 }
 
 func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
@@ -404,5 +418,7 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
-	_, _ = w.Write([]byte("queued for destruction"))
+	if _, err := w.Write([]byte("queued for destruction")); err != nil {
+		s.log.Debug("admin destroy: response write failed", "err", err)
+	}
 }

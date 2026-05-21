@@ -41,10 +41,13 @@ service:
 # Liveness and readiness target the always-on observability port.
 # /readyz applies leader-aware semantics: standbys are ready as long
 # as Proxmox is reachable; leaders additionally need a connected
-# listener and a completed crash-recovery pass.
+# listener and a completed crash-recovery pass. initialDelaySeconds
+# on readiness is 15s to give pool.Manager.Recover headroom when
+# walking many Proxmox VMs at startup — at 3s the pod flapped under
+# anything but the smallest fleet.
 probes:
   readiness:
-    initialDelaySeconds: 3
+    initialDelaySeconds: 15
     periodSeconds: 5
   liveness:
     initialDelaySeconds: 10
@@ -74,11 +77,19 @@ resources:
 
 podSecurityContext:
   runAsNonRoot: true
+  runAsUser: 65532                # nobody-equivalent; image must support it
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
 
 containerSecurityContext:
   runAsNonRoot: true
+  runAsUser: 65532
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
+  seccompProfile:
+    type: RuntimeDefault
   capabilities:
     drop: ["ALL"]
 

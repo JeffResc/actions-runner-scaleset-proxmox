@@ -42,6 +42,16 @@ jobs:
           version: v2.12.2
           args: --timeout=5m
 
+      - name: Run deadcode
+        run: |
+          go install golang.org/x/tools/cmd/deadcode@v0.30.0
+          out=$(deadcode ./...)
+          if [ -n "$out" ]; then
+            echo "deadcode found unreachable functions:"
+            echo "$out"
+            exit 1
+          fi
+
   test:
     name: Test
     runs-on: ubuntu-latest
