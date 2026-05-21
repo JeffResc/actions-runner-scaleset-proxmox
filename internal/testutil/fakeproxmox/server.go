@@ -1,5 +1,5 @@
 // Package fakeproxmox is an httptest-backed fake of the Proxmox VE
-// API used by github.com/jeffresc/github-actions-proxmox-scaleset for
+// API used by github.com/jeffresc/actions-runner-scaleset-proxmox for
 // in-process end-to-end testing. It implements the subset of the API
 // the orchestrator actually depends on:
 //

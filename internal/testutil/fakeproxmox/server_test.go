@@ -12,7 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/testutil/fakeproxmox"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakeproxmox"
 )
 
 // do is a tiny helper that wraps a request against the fake and returns
