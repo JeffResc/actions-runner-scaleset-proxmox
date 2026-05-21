@@ -313,7 +313,7 @@ func (r *Reconciler) reconcileAssigned(ctx context.Context, row pool.RowSnapshot
 		// Listener missed JobStarted. Catch up.
 		r.log.Info("reconcile: promoting assigned->running (missed JobStarted)",
 			"vmid", row.VMID, "runner_id", gr.id)
-		_ = r.pool.PromoteToRunning(ctx, row.VMID, gr.id, row.JobID)
+		r.promoteToRunning(ctx, row, gr.id)
 		r.recordMismatch(row.State, ghLabel, "promote_running")
 	case present && !gr.online && age >= r.cfg.AssignedOfflineGrace:
 		// Runner registered then went offline before picking up work.
@@ -354,8 +354,23 @@ func (r *Reconciler) reconcileHot(ctx context.Context, row pool.RowSnapshot, gr 
 	}
 	r.log.Warn("reconcile: hot row observed as busy on GitHub; promoting",
 		"vmid", row.VMID, "runner_id", gr.id)
-	_ = r.pool.PromoteToRunning(ctx, row.VMID, gr.id, row.JobID)
+	r.promoteToRunning(ctx, row, gr.id)
 	r.recordMismatch(row.State, ghLabel, "promote_running")
+}
+
+// promoteToRunning is the shared error-handling wrapper for
+// pool.PromoteToRunning. A silent error here means a persistently stuck
+// row that the reconciler will keep "promoting" every tick with no
+// effect — so we surface it via warn-level log AND a metric (which is
+// suitable for on-call alerting) instead of discarding the error.
+func (r *Reconciler) promoteToRunning(ctx context.Context, row pool.RowSnapshot, runnerID int64) {
+	if err := r.pool.PromoteToRunning(ctx, row.VMID, runnerID, row.JobID); err != nil {
+		r.log.Warn("reconcile: promote to running failed",
+			"vmid", row.VMID, "runner_id", runnerID, "db_state", row.State, "err", err)
+		if r.metrics != nil {
+			r.metrics.ReconcileErrors.WithLabelValues("promote_running").Inc()
+		}
+	}
 }
 
 // cleanupOrphanRunners removes GitHub runner registrations that match
