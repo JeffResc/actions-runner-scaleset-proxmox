@@ -804,9 +804,11 @@ func (m *manager) promoteN(_ context.Context, n int) {
 			if err := m.bootSem.Acquire(m.workerCtx, 1); err != nil {
 				m.log.Debug("promote: cancelled before sem acquired", "vmid", row.VMID, "err", err)
 				// Roll the CAS back so the next pass can try again.
-				_, _ = m.store.UpdateState(row.VMID, store.StateBooting, store.StateWarm, func(v *store.VM) {
+				if _, rbErr := m.store.UpdateState(row.VMID, store.StateBooting, store.StateWarm, func(v *store.VM) {
 					v.PoolKind = store.PoolKindWarm
-				})
+				}); rbErr != nil {
+					m.log.Warn("promote: cas rollback failed", "vmid", row.VMID, "err", rbErr)
+				}
 				return
 			}
 			defer m.bootSem.Release(1)
@@ -910,10 +912,12 @@ func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
 			m.metrics.VMsTotal.WithLabelValues("clone-failed").Inc()
 		}
 		// Mark the row destroying and let the destroy path clean up.
-		_, _ = m.store.Update(vmid, func(v *store.VM) {
+		if _, updErr := m.store.Update(vmid, func(v *store.VM) {
 			v.State = store.StateDestroying
 			v.StateSince = time.Now()
-		})
+		}); updErr != nil {
+			m.log.Warn("clone: mark destroying failed", "vmid", vmid, "err", updErr)
+		}
 		m.destroyOrSyncFallback(vmid, node)
 		return
 	}
@@ -995,17 +999,21 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 		return
 	}
 	if updated.BootAttempts >= m.cfg.BootMaxAttempts {
-		_, _ = m.store.Update(row.VMID, func(v *store.VM) {
+		if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
 			v.State = store.StatePoison
 			v.StateSince = time.Now()
-		})
+		}); updErr != nil {
+			m.log.Warn("poison: mark poison failed", "vmid", row.VMID, "err", updErr)
+		}
 		m.log.Warn("vm marked poison; manual intervention required", "vmid", row.VMID, "attempts", updated.BootAttempts)
 		return
 	}
-	_, _ = m.store.Update(row.VMID, func(v *store.VM) {
+	if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
 		v.State = store.StateDestroying
 		v.StateSince = time.Now()
-	})
+	}); updErr != nil {
+		m.log.Warn("poison: mark destroying failed", "vmid", row.VMID, "err", updErr)
+	}
 	m.destroyAsync(updated.VMID, updated.Node)
 }
 

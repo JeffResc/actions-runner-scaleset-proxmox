@@ -188,7 +188,9 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		vmObj := vmObj
 		if err := sem.Acquire(ctx, 1); err != nil {
 			// ctx cancelled mid-burst — release the rest back to the pool.
-			_ = s.pool.MarkCompleted(ctx, vmObj.VMID)
+			if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
+				s.log.Warn("mark completed failed during cancel", "vmid", vmObj.VMID, "err", mcErr)
+			}
 			continue
 		}
 		wg.Add(1)
@@ -225,7 +227,9 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		if s.metrics != nil {
 			s.metrics.GitHubErrors.WithLabelValues("generate_jit").Inc()
 		}
-		_ = s.pool.MarkCompleted(ctx, vmObj.VMID) // destroy and refill
+		if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
+			s.log.Warn("mark completed failed after jit generation error", "vmid", vmObj.VMID, "err", mcErr)
+		}
 		return false
 	}
 
@@ -264,7 +268,9 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		// Also deregister the runner we just minted; otherwise the
 		// next clone of this VMID will hit a 409.
 		s.cleanupStaleRunnerByName(ctx, vmObj.Name)
-		_ = s.pool.MarkCompleted(ctx, vmObj.VMID)
+		if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
+			s.log.Warn("mark completed failed after jit injection error", "vmid", vmObj.VMID, "err", mcErr)
+		}
 		return false
 	}
 	return true
