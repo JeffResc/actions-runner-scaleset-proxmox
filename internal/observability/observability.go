@@ -295,11 +295,15 @@ func ServeOn(ctx context.Context, ln net.Listener, reg *prometheus.Registry, h *
 	r := chi.NewRouter()
 	r.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "ok")
+		if _, err := io.WriteString(w, "ok"); err != nil {
+			log.Debug("healthz write failed", "err", err)
+		}
 	})
 	r.Get("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if h.Ready() {
-			_, _ = io.WriteString(w, "ready")
+			if _, err := io.WriteString(w, "ready"); err != nil {
+				log.Debug("readyz write failed", "err", err)
+			}
 			return
 		}
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
