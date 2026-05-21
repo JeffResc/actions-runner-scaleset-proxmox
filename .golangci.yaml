@@ -18,7 +18,16 @@ linters:
     - exhaustive
     - nilerr
     - prealloc
+    - gosec
   settings:
+    gosec:
+      excludes:
+        # G304 — file paths are operator-controlled CLI/config inputs;
+        # we are the trust boundary, not a target downstream of one.
+        - G304
+        # G115 — VMID conversions are bounded by the configured VMIDRange
+        # (typically 10000..19999). uint64→int overflow is not reachable.
+        - G115
     revive:
       rules:
         - name: blank-imports
@@ -51,6 +60,9 @@ linters:
           - errcheck
           - unparam
           - bodyclose
+          # gosec G101 flags fake PEM/token fixtures inside test files —
+          # these are intentional test data, not real credentials.
+          - gosec
 
 formatters:
   enable:

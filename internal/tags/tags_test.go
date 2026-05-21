@@ -50,7 +50,9 @@ func TestDecode_HandlesEmptyAndWhitespace(t *testing.T) {
 
 func TestIsOwnedBy(t *testing.T) {
 	t.Parallel()
-	wire := tags.Encode([]string{tags.Marker, tags.MustOwnerTag("scaleset-1"), "user-added"})
+	owner, err := tags.OwnerTag("scaleset-1")
+	require.NoError(t, err)
+	wire := tags.Encode([]string{tags.Marker, owner, "user-added"})
 
 	require.True(t, tags.IsOwnedBy(wire, "scaleset-1"))
 	require.False(t, tags.IsOwnedBy(wire, "scaleset-2"))

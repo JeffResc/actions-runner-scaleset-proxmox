@@ -39,16 +39,6 @@ func OwnerTag(scaleSetName string) (string, error) {
 	return ownerPrefix + sanitize(scaleSetName), nil
 }
 
-// MustOwnerTag is OwnerTag for static initialization paths where the name
-// is known-good. Panics on invalid input.
-func MustOwnerTag(scaleSetName string) string {
-	t, err := OwnerTag(scaleSetName)
-	if err != nil {
-		panic(err)
-	}
-	return t
-}
-
 // Initial returns the canonical initial tag set for a newly-created VM.
 // The slice is sorted so it produces a stable on-the-wire representation.
 func Initial(scaleSetName string) ([]string, error) {
