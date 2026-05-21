@@ -235,12 +235,14 @@ func NewKubernetes(cfg Config, cb Callbacks, log *slog.Logger) (Coordinator, err
 	if err != nil {
 		return nil, fmt.Errorf("cluster: kubernetes client: %w", err)
 	}
-	return newKubernetesWithClient(cfg, cb, log, client), nil
+	return NewKubernetesWithClient(cfg, cb, log, client), nil
 }
 
-// newKubernetesWithClient builds a kubeCoord against a caller-supplied
-// kubernetes.Interface. Used by tests with client-go's fake client.
-func newKubernetesWithClient(cfg Config, cb Callbacks, log *slog.Logger, client kubernetes.Interface) *kubeCoord {
+// NewKubernetesWithClient builds a kubeCoord against a caller-supplied
+// kubernetes.Interface. The intended caller is the app package wiring in
+// a fake client for e2e tests; production code goes through
+// [NewKubernetes].
+func NewKubernetesWithClient(cfg Config, cb Callbacks, log *slog.Logger, client kubernetes.Interface) Coordinator {
 	cfg.applyDefaults()
 	if log == nil {
 		log = slog.Default()
