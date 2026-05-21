@@ -6,6 +6,7 @@
     ".": {
       "release-type": "go",
       "package-name": "github-actions-proxmox-scaleset",
+      "release-as": "0.1.0",
       "changelog-sections": [
         {"type": "feat", "section": "Features"},
         {"type": "fix", "section": "Bug Fixes"},
