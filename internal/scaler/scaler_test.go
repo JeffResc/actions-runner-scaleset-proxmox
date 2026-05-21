@@ -144,7 +144,7 @@ func (stubProvForScaler) Stop(context.Context, *provisioner.VM) error           
 func (stubProvForScaler) Destroy(context.Context, *provisioner.VM) error                  { return nil }
 func (stubProvForScaler) WaitReady(context.Context, *provisioner.VM, time.Duration) error { return nil }
 func (stubProvForScaler) InjectJITConfig(context.Context, *provisioner.VM, string) error  { return nil }
-func (stubProvForScaler) ReadAgentFile(context.Context, *provisioner.VM, string) ([]byte, error) {
+func (stubProvForScaler) ReadJITConfig(context.Context, *provisioner.VM) ([]byte, error) {
 	return nil, nil
 }
 func (stubProvForScaler) ListOwnedVMs(context.Context) ([]*provisioner.VM, error) { return nil, nil }

@@ -914,7 +914,7 @@ func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
 			v.State = store.StateDestroying
 			v.StateSince = time.Now()
 		})
-		m.destroyAsync(vmid, node)
+		m.destroyOrSyncFallback(vmid, node)
 		return
 	}
 	if m.metrics != nil {
@@ -1032,6 +1032,34 @@ func (m *manager) destroyAsync(vmid int, node string) {
 		defer m.destroySem.Release(1)
 		m.destroy(m.workerCtx, vmid, node)
 	}()
+}
+
+// destroyOrSyncFallback is the clone-failure destroy path. The async
+// route used by every other site bails out fast if m.workerCtx is
+// already cancelled (the destroyAsync goroutine's destroySem.Acquire
+// returns immediately on a cancelled ctx), which leaks the just-cloned
+// VM during a hard drain. The clone-fail case is the only one where
+// the VM was created by THIS goroutine in THIS tick — if we don't
+// destroy it now, no other code path will. So when we observe
+// workerCtx already cancelled, fall back to a synchronous destroy
+// against a fresh background context with a short cap, accepting the
+// extra drain wait against a guaranteed-leak.
+func (m *manager) destroyOrSyncFallback(vmid int, node string) {
+	if m.workerCtx.Err() == nil {
+		m.destroyAsync(vmid, node)
+		return
+	}
+	m.log.Warn("clone-fail destroy: workerCtx already cancelled; running synchronous fallback",
+		"vmid", vmid, "node", node)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := m.prov.Destroy(ctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
+		m.log.Warn("clone-fail destroy: synchronous fallback failed; vm may leak", "vmid", vmid, "err", err)
+		return
+	}
+	if err := m.store.Delete(vmid); err != nil {
+		m.log.Warn("clone-fail destroy: row delete failed after sync destroy", "vmid", vmid, "err", err)
+	}
 }
 
 // destroy invokes the provisioner to delete the VM and removes the

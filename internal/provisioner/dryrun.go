@@ -10,7 +10,7 @@ import (
 
 // dryRun wraps a real Provisioner and logs intended side effects instead
 // of executing them. Read-only operations (Ping, ListOwnedVMs,
-// ReadAgentFile, WaitReady, TemplateNode, Client) pass through to the
+// ReadJITConfig, WaitReady, TemplateNode, Client) pass through to the
 // real provisioner so the rest of the orchestrator can still observe
 // real-world state.
 //
@@ -66,8 +66,8 @@ func (d *dryRun) InjectJITConfig(_ context.Context, vm *VM, jitConfig string) er
 func (d *dryRun) WaitReady(ctx context.Context, vm *VM, timeout time.Duration) error {
 	return d.inner.WaitReady(ctx, vm, timeout)
 }
-func (d *dryRun) ReadAgentFile(ctx context.Context, vm *VM, path string) ([]byte, error) {
-	return d.inner.ReadAgentFile(ctx, vm, path)
+func (d *dryRun) ReadJITConfig(ctx context.Context, vm *VM) ([]byte, error) {
+	return d.inner.ReadJITConfig(ctx, vm)
 }
 func (d *dryRun) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 	return d.inner.ListOwnedVMs(ctx)

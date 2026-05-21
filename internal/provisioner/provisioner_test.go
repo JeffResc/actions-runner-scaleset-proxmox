@@ -137,13 +137,14 @@ func TestInjectJITConfig_RoutesToCorrectPath(t *testing.T) {
 	defer srv.Close()
 
 	p := newTestProvisioner(t, srv, "pve1")
-	err := p.InjectJITConfig(context.Background(), &VM{VMID: 12345, Node: "pve3"}, "encoded-jit-config-blob")
+	const jit = "ZW5jb2RlZGppdGNvbmZpZ2Jsb2I=" // base64("encodedjitconfigblob"); shape matches GitHub's JIT output
+	err := p.InjectJITConfig(context.Background(), &VM{VMID: 12345, Node: "pve3"}, jit)
 	require.NoError(t, err)
 
 	require.Equal(t, "/nodes/pve3/qemu/12345/agent/file-write", captured.writePath)
 	require.Equal(t, "/opt/actions-runner/jitconfig.env.tmp", captured.writeBody["file"])
 	require.Contains(t, captured.writeBody["content"], "JIT_CONFIG=")
-	require.Contains(t, captured.writeBody["content"], "encoded-jit-config-blob")
+	require.Contains(t, captured.writeBody["content"], jit)
 	// And the exec call should be the atomic rename.
 	cmd, _ := captured.execBody["command"].([]any)
 	require.Equal(t, []any{"mv", "/opt/actions-runner/jitconfig.env.tmp", "/opt/actions-runner/jitconfig.env"}, cmd)
@@ -153,23 +154,51 @@ func TestInjectJITConfig_RejectsNilOrEmpty(t *testing.T) {
 	t.Parallel()
 	p := newTestProvisioner(t, mockServer(t, &captured{}, http.StatusOK, `{}`), "pve1")
 
-	require.Error(t, p.InjectJITConfig(context.Background(), nil, "x"))
+	require.Error(t, p.InjectJITConfig(context.Background(), nil, "validbase64=="))
 	require.Error(t, p.InjectJITConfig(context.Background(), &VM{VMID: 1, Node: "pve1"}, ""))
 }
 
-func TestReadAgentFile_DecodesPayload(t *testing.T) {
+// TestInjectJITConfig_RejectsNonBase64 guards the syntax check that
+// blocks a non-base64 payload (anything that could carry an embedded
+// single quote, newline, or shell metachar) from being written into
+// the systemd env-file. The orchestrator's data source for this config
+// is the GitHub API; a non-base64 value implies upstream returned an
+// error string in the wrong field.
+func TestInjectJITConfig_RejectsNonBase64(t *testing.T) {
+	t.Parallel()
+	p := newTestProvisioner(t, mockServer(t, &captured{}, http.StatusOK, `{}`), "pve1")
+	vm := &VM{VMID: 9, Node: "pve1"}
+
+	// Embedded single quote — would otherwise break the env-file syntax.
+	err := p.InjectJITConfig(context.Background(), vm, "abc'def==")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "expected base64")
+
+	// Newline — would split the env-file into a second line under
+	// systemd's parser.
+	err = p.InjectJITConfig(context.Background(), vm, "abc\ndef==")
+	require.Error(t, err)
+
+	// Shell metachar — irrelevant under env-file syntax but a useful
+	// fuzz boundary.
+	err = p.InjectJITConfig(context.Background(), vm, "abc;rm -rf /;def")
+	require.Error(t, err)
+}
+
+func TestReadJITConfig_DecodesPayload(t *testing.T) {
 	t.Parallel()
 	got := &captured{}
 	srv := mockServer(t, got, http.StatusOK, `{"data": {"content": "some file contents"}}`)
 	defer srv.Close()
 
 	p := newTestProvisioner(t, srv, "pve1")
-	out, err := p.ReadAgentFile(context.Background(), &VM{VMID: 555, Node: "pve9"}, "/opt/actions-runner/jitconfig")
+	out, err := p.ReadJITConfig(context.Background(), &VM{VMID: 555, Node: "pve9"})
 	require.NoError(t, err)
 	require.Equal(t, []byte("some file contents"), out)
 
 	require.Equal(t, "/nodes/pve9/qemu/555/agent/file-read", got.Path)
-	require.Equal(t, []string{"/opt/actions-runner/jitconfig"}, got.Query["file"])
+	require.Equal(t, []string{"/opt/actions-runner/jitconfig.env"}, got.Query["file"],
+		"ReadJITConfig must always request the canonical jitconfig path; no caller controls it")
 }
 
 // TestDiscoverTemplateNode_OneHungNodeDoesNotBlock: a single unreachable
@@ -374,7 +403,7 @@ func TestAgentFileWrite_BubblesServerErrors(t *testing.T) {
 // Proxmox returns 500 when the in-VM agent reports a file-not-found from
 // QGA. The go-proxmox library special-cases 500/501 to errors, which we
 // rely on here.
-func TestReadAgentFile_AgentErrorSurfaces(t *testing.T) {
+func TestReadJITConfig_AgentErrorSurfaces(t *testing.T) {
 	t.Parallel()
 	if testing.Short() {
 		t.Skip("skipping retry-backoff test under -short")
@@ -383,7 +412,7 @@ func TestReadAgentFile_AgentErrorSurfaces(t *testing.T) {
 	defer srv.Close()
 
 	p := newTestProvisioner(t, srv, "pve1")
-	_, err := p.ReadAgentFile(context.Background(), &VM{VMID: 1, Node: "pve1"}, "/missing")
+	_, err := p.ReadJITConfig(context.Background(), &VM{VMID: 1, Node: "pve1"})
 	require.Error(t, err)
 }
 
