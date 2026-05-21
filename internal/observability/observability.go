@@ -87,6 +87,7 @@ type Metrics struct {
 	GHStateMismatch      *prometheus.CounterVec
 	RunnerHookEvents     *prometheus.CounterVec
 	ReconcileErrors      *prometheus.CounterVec
+	Leader               prometheus.Gauge
 }
 
 // NewMetrics creates and registers the orchestrator's metric set on reg.
@@ -165,13 +166,17 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "reconcile_errors_total",
 			Help: "Errors raised inside the gh.Reconciler when applying state transitions, by operation.",
 		}, []string{"op"}),
+		Leader: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns, Name: "leader",
+			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
+		}),
 	}
 	reg.MustRegister(
 		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
 		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors,
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
-		m.ReconcileErrors,
+		m.ReconcileErrors, m.Leader,
 	)
 	return m
 }
