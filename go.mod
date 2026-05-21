@@ -7,7 +7,9 @@ require (
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/go-playground/validator/v10 v10.30.2
+	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/google/go-github/v84 v84.0.0
+	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-memdb v1.3.5
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/luthermonson/go-proxmox v0.5.1
@@ -21,6 +23,7 @@ require (
 	golang.org/x/sync v0.20.0
 	golang.org/x/time v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
+	k8s.io/api v0.36.1
 	k8s.io/apimachinery v0.36.1
 	k8s.io/client-go v0.36.1
 )
@@ -44,10 +47,8 @@ require (
 	github.com/go-openapi/swag v0.23.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
-	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
@@ -89,7 +90,6 @@ require (
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
-	k8s.io/api v0.36.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a // indirect
 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 // indirect
