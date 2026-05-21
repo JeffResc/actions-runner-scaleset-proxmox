@@ -14,9 +14,12 @@ import (
 
 	"github.com/google/go-github/v84/github"
 	"github.com/luthermonson/go-proxmox"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/githubauth"
+	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
 	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
 )
@@ -82,6 +85,10 @@ type fakeManager struct {
 	rows         []pool.RowSnapshot
 	promoteCalls []promoteCall
 	destroyCalls []destroyCall
+
+	// promoteErr, when non-nil, is returned from every PromoteToRunning
+	// call — used to exercise the warn-and-meter failure path.
+	promoteErr error
 }
 
 type promoteCall struct {
@@ -107,7 +114,7 @@ func (f *fakeManager) PromoteToRunning(_ context.Context, vmid int, runnerID, jo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.promoteCalls = append(f.promoteCalls, promoteCall{vmid, runnerID, jobID})
-	return nil
+	return f.promoteErr
 }
 
 func (f *fakeManager) ForceDestroy(_ context.Context, vmid int, reason string) error {
@@ -408,6 +415,36 @@ func TestReconcile_HotOffline_NoOp(t *testing.T) {
 
 	require.Empty(t, mgr.promoteCalls)
 	require.Empty(t, mgr.destroyCalls)
+}
+
+// TestReconcile_PromoteFailure_MetersAndContinues guards the observability
+// contract on PromoteToRunning failures: the reconciler must surface a
+// metric (and log) rather than silently discarding the error. Without
+// this, a persistently broken row sits in `assigned` forever while every
+// tick logs "promoting…" with no visible failure.
+func TestReconcile_PromoteFailure_MetersAndContinues(t *testing.T) {
+	t.Parallel()
+	srv := runnersServer(t, []fakeRunner{
+		{id: 999, name: "gh-runner-test-9999", status: "online", busy: true},
+	})
+	defer srv.Close()
+
+	mgr := &fakeManager{
+		rows: []pool.RowSnapshot{
+			{VMID: 9999, Name: "gh-runner-test-9999", State: "assigned",
+				JobID: 7, StateSince: time.Now().Add(-time.Minute)},
+		},
+		promoteErr: errors.New("store: row not found"),
+	}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), metrics)
+	require.NoError(t, err)
+	require.NoError(t, r.Tick(context.Background()))
+
+	require.Len(t, mgr.promoteCalls, 1, "reconciler must still attempt the promotion")
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(metrics.ReconcileErrors.WithLabelValues("promote_running")),
+		"failed PromoteToRunning must increment scaleset_reconcile_errors_total{op=promote_running}")
 }
 
 // 12. GH runner not in DB → orphan cleanup via RemoveRunner
