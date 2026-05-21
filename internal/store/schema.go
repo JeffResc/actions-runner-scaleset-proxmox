@@ -10,6 +10,8 @@ import (
 // sole writer; Proxmox tags are not mirrored.
 type State string
 
+// Lifecycle states. Every value must be handled explicitly in switches
+// over State — see the exhaustive linter config in .golangci.yaml.
 const (
 	StateProvisioning State = "provisioning"
 	StateWarm         State = "warm"
@@ -25,6 +27,7 @@ const (
 // PoolKind is the pool budget a VM counts toward.
 type PoolKind string
 
+// Pool budgets a VM can be charged to.
 const (
 	PoolKindHot  PoolKind = "hot"
 	PoolKindWarm PoolKind = "warm"

@@ -1244,9 +1244,9 @@ func (p *panickyProv) ListOwnedVMs(ctx context.Context) ([]*provisioner.VM, erro
 func (p *panickyProv) PowerState(ctx context.Context, vm *provisioner.VM) (string, error) {
 	return p.inner.PowerState(ctx, vm)
 }
-func (p *panickyProv) Ping(ctx context.Context) error                        { return p.inner.Ping(ctx) }
-func (p *panickyProv) TemplateNode() string                                  { return p.inner.TemplateNode() }
-func (p *panickyProv) Client() *proxmox.Client                               { return p.inner.Client() }
+func (p *panickyProv) Ping(ctx context.Context) error { return p.inner.Ping(ctx) }
+func (p *panickyProv) TemplateNode() string           { return p.inner.TemplateNode() }
+func (p *panickyProv) Client() *proxmox.Client        { return p.inner.Client() }
 func (p *panickyProv) IsRecentlyDestroyed(vmid int, c time.Duration) bool {
 	return p.inner.IsRecentlyDestroyed(vmid, c)
 }

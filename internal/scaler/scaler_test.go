@@ -117,14 +117,14 @@ func (f *fakePool) MarkCompleted(context.Context, int) error {
 }
 
 // Unused by HandleDesiredRunnerCount.
-func (f *fakePool) MarkRunning(context.Context, int, int64) error                 { return nil }
-func (f *fakePool) SetRunnerID(context.Context, int, int64) error                 { return nil }
-func (f *fakePool) PromoteToRunning(context.Context, int, int64, int64) error     { return nil }
-func (f *fakePool) ForceDestroy(context.Context, int, string) error               { return nil }
-func (f *fakePool) ListRows(context.Context) ([]pool.RowSnapshot, error)          { return nil, nil }
-func (f *fakePool) Recover(context.Context) error                                 { return nil }
-func (f *fakePool) Run(context.Context) error                                     { return nil }
-func (f *fakePool) SignalRefill()                                                 {}
+func (f *fakePool) MarkRunning(context.Context, int, int64) error             { return nil }
+func (f *fakePool) SetRunnerID(context.Context, int, int64) error             { return nil }
+func (f *fakePool) PromoteToRunning(context.Context, int, int64, int64) error { return nil }
+func (f *fakePool) ForceDestroy(context.Context, int, string) error           { return nil }
+func (f *fakePool) ListRows(context.Context) ([]pool.RowSnapshot, error)      { return nil, nil }
+func (f *fakePool) Recover(context.Context) error                             { return nil }
+func (f *fakePool) Run(context.Context) error                                 { return nil }
+func (f *fakePool) SignalRefill()                                             {}
 
 func (f *fakePool) acquireCount() int {
 	f.mu.Lock()
@@ -151,11 +151,11 @@ func (stubProvForScaler) ListOwnedVMs(context.Context) ([]*provisioner.VM, error
 func (stubProvForScaler) PowerState(context.Context, *provisioner.VM) (string, error) {
 	return "running", nil
 }
-func (stubProvForScaler) Ping(context.Context) error                            { return nil }
-func (stubProvForScaler) TemplateNode() string                                  { return "pve1" }
-func (stubProvForScaler) Client() *proxmox.Client                               { return nil }
-func (stubProvForScaler) IsRecentlyDestroyed(int, time.Duration) bool           { return false }
-func (stubProvForScaler) InFlightCloneCount() int                               { return 0 }
+func (stubProvForScaler) Ping(context.Context) error                  { return nil }
+func (stubProvForScaler) TemplateNode() string                        { return "pve1" }
+func (stubProvForScaler) Client() *proxmox.Client                     { return nil }
+func (stubProvForScaler) IsRecentlyDestroyed(int, time.Duration) bool { return false }
+func (stubProvForScaler) InFlightCloneCount() int                     { return 0 }
 
 func itoa(n int) string {
 	// Small dependency-free implementation to keep this file standalone.

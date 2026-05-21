@@ -615,8 +615,8 @@ func TestPruneStaleTrackers_HandlesCorruptedEntries(t *testing.T) {
 		inFlightCloneTTL:     time.Minute,
 		recentlyDestroyedTTL: time.Minute,
 	}
-	p.inFlightClones.Store(100, "not a time")    // wrong type
-	p.recentlyDestroyed.Store(200, 12345)        // wrong type
+	p.inFlightClones.Store(100, "not a time") // wrong type
+	p.recentlyDestroyed.Store(200, 12345)     // wrong type
 
 	require.NotPanics(t, func() {
 		p.pruneStaleTrackers(time.Now())

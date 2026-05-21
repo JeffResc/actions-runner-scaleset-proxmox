@@ -122,7 +122,7 @@ func (f *fakeManager) Acquire(context.Context, int64) (*pool.VM, error) {
 	return nil, pool.ErrNoneAvailable
 }
 func (f *fakeManager) MarkRunning(context.Context, int, int64) error { return nil }
-func (f *fakeManager) SetRunnerID(context.Context, int, int64) error  { return nil }
+func (f *fakeManager) SetRunnerID(context.Context, int, int64) error { return nil }
 func (f *fakeManager) MarkCompleted(context.Context, int) error      { return nil }
 func (f *fakeManager) Stats(context.Context) (pool.Stats, error)     { return pool.Stats{}, nil }
 func (f *fakeManager) Recover(context.Context) error                 { return nil }
