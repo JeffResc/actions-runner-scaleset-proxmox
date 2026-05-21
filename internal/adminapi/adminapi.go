@@ -28,8 +28,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/time/rate"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
 )
 
 // Config is the runtime configuration of the admin API server.

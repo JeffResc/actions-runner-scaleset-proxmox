@@ -1,4 +1,4 @@
-# github-actions-proxmox-scaleset — example configuration.
+# actions-runner-scaleset-proxmox — example configuration.
 #
 # Secrets are NEVER stored in this file. Fields ending in `*_env` name an
 # environment variable from which the secret is read at startup.

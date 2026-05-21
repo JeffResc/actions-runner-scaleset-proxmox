@@ -15,7 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 )
 
 // fakePool is a Manager whose calls record state for assertions.

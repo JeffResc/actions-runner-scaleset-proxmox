@@ -1,6 +1,6 @@
 [Unit]
 Description=GitHub Actions Proxmox scale set orchestrator
-Documentation=https://github.com/jeffresc/github-actions-proxmox-scaleset
+Documentation=https://github.com/jeffresc/actions-runner-scaleset-proxmox
 After=network-online.target
 Wants=network-online.target
 

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in contributing to github-actions-proxmox-scaleset!
+Thanks for your interest in contributing to actions-runner-scaleset-proxmox!
 
 ## Dev Setup
 

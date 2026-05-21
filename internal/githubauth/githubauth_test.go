@@ -14,7 +14,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/githubauth"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
 )
 
 // fakePEM is a syntactically valid PEM that scaleset only inspects when it

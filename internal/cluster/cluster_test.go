@@ -107,7 +107,7 @@ func newTestKubeCoord(t *testing.T, identity string, port int) (Coordinator, *fa
 }
 
 func TestKubernetes_WinsElectionAndPublishesEndpoint(t *testing.T) {
-	// Disabled pending fix for jeffresc/github-actions-proxmox-scaleset#12:
+	// Disabled pending fix for jeffresc/actions-runner-scaleset-proxmox#12:
 	// the leader-election library caches the Lease object and overwrites
 	// our endpoint annotation on every renewal, so this assertion can
 	// never reliably pass.

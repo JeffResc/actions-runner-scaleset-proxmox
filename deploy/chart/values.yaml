@@ -5,7 +5,7 @@
 # under `scalesetConfig`.
 
 image:
-  repository: ghcr.io/jeffresc/github-actions-proxmox-scaleset
+  repository: ghcr.io/jeffresc/actions-runner-scaleset-proxmox
   tag: ""                 # defaults to .Chart.AppVersion when empty
   pullPolicy: IfNotPresent
   pullSecrets: []

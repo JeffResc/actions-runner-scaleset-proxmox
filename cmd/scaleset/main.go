@@ -16,7 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/app"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/app"
 )
 
 // version is overridden via -ldflags at build time.

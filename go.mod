@@ -1,4 +1,4 @@
-module github.com/jeffresc/github-actions-proxmox-scaleset
+module github.com/jeffresc/actions-runner-scaleset-proxmox
 
 go 1.26.3
 

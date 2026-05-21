@@ -23,8 +23,8 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/luthermonson/go-proxmox"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/config"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/tags"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
 // ErrTemplateNotFound is returned by [New] when the configured template
