@@ -69,7 +69,7 @@ func (s *Server) handleAgentFileRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeData(w, map[string]any{
-		"content":  "",
+		"content":   "",
 		"truncated": 0,
 	})
 }
