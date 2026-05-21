@@ -60,6 +60,15 @@ type fakeProv struct {
 	// matching the steady-state expectation of an Assigned/Running VM.
 	powerStateBy map[int]string
 
+	// recentlyDestroyedSet drives IsRecentlyDestroyed. Tests set
+	// membership directly; the fake ignores the cooldown arg and just
+	// consults the set, so toggling membership models "time advanced
+	// past the cooldown."
+	recentlyDestroyedSet map[int]bool
+
+	// inFlightClones drives InFlightCloneCount.
+	inFlightClones int
+
 	clones       []provisioner.CloneOptions
 	destroys     []int
 	starts       []int
@@ -152,6 +161,22 @@ func (f *fakeProv) PowerState(_ context.Context, v *provisioner.VM) (string, err
 		return s, nil
 	}
 	return "running", nil
+}
+
+// IsRecentlyDestroyed returns whatever the test seeded into
+// recentlyDestroyedSet. The cooldown arg is ignored — tests model
+// "advance past the cooldown" by toggling map membership.
+func (f *fakeProv) IsRecentlyDestroyed(vmid int, _ time.Duration) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.recentlyDestroyedSet[vmid]
+}
+
+// InFlightCloneCount returns the value the test seeded.
+func (f *fakeProv) InFlightCloneCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inFlightClones
 }
 
 // testWriter routes slog output to t.Log.
@@ -1222,6 +1247,10 @@ func (p *panickyProv) PowerState(ctx context.Context, vm *provisioner.VM) (strin
 func (p *panickyProv) Ping(ctx context.Context) error                        { return p.inner.Ping(ctx) }
 func (p *panickyProv) TemplateNode() string                                  { return p.inner.TemplateNode() }
 func (p *panickyProv) Client() *proxmox.Client                               { return p.inner.Client() }
+func (p *panickyProv) IsRecentlyDestroyed(vmid int, c time.Duration) bool {
+	return p.inner.IsRecentlyDestroyed(vmid, c)
+}
+func (p *panickyProv) InFlightCloneCount() int { return p.inner.InFlightCloneCount() }
 
 // syncWriter serialises writes to the shared log buffer so concurrent
 // goroutines don't tear the captured output.
@@ -1400,4 +1429,144 @@ func TestDrain_CompletesNaturallyWhenWorkersFinish(t *testing.T) {
 	}
 	require.Less(t, time.Since(start), 500*time.Millisecond,
 		"drain should complete immediately when workers finish on their own")
+}
+
+// TestAllocateVMID_RespectsRecentlyDestroyedCooldown locks in the
+// post-destroy cooldown: after a destroy completes, PVE's qmdestroy
+// task and lock-file cleanup may still be settling, so reissuing the
+// same VMID immediately produces "VM N is running - destroy failed"
+// and lock-file timeouts. allocateVMID must consult
+// Provisioner.IsRecentlyDestroyed and skip cooled-down VMIDs.
+func TestAllocateVMID_RespectsRecentlyDestroyedCooldown(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{
+		// 10000 is "recently destroyed"; 10001 is free.
+		recentlyDestroyedSet: map[int]bool{10000: true},
+	}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:           1,
+		VMIDRange:         config.VMIDRange{Min: 10000, Max: 10005},
+		VMIDReuseCooldown: 30 * time.Second,
+	})
+
+	// First allocate skips 10000 because it's recently destroyed.
+	vmid, err := mgr.allocateVMID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 10001, vmid,
+		"allocateVMID must skip 10000 while it's in the cooldown window; reusing it would race with PVE-side teardown")
+
+	// Simulate time-advance past the cooldown: 10000 is no longer
+	// recent. The next allocate should pick it again.
+	fp.mu.Lock()
+	delete(fp.recentlyDestroyedSet, 10000)
+	fp.mu.Unlock()
+
+	vmid, err = mgr.allocateVMID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 10000, vmid,
+		"after the cooldown expires, the freed VMID becomes eligible again")
+}
+
+// TestAllocateVMID_AllRangeRecentlyDestroyedReturnsError covers the
+// boundary case where a burst of destroys leaves every VMID in range
+// inside the cooldown window. The allocator must surface an error
+// rather than block, retry forever, or return a stale ID.
+func TestAllocateVMID_AllRangeRecentlyDestroyedReturnsError(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{
+		recentlyDestroyedSet: map[int]bool{
+			10000: true, 10001: true, 10002: true,
+		},
+	}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:           1,
+		VMIDRange:         config.VMIDRange{Min: 10000, Max: 10002},
+		VMIDReuseCooldown: 30 * time.Second,
+	})
+	_, err := mgr.allocateVMID(context.Background())
+	require.Error(t, err)
+}
+
+// TestDestroy_OnRunnerOrphanedErrorDoesNotBlockDestroy: when the
+// OnRunnerOrphaned callback (which deregisters the GitHub runner)
+// returns an error — common during a GitHub rate-limit or 5xx burst —
+// the destroy MUST still complete. Otherwise a single GH outage
+// halts VM destruction across the fleet, the pool fills with
+// undestroyable runners, and the scaleset wedges. The callback's
+// error is logged and discarded.
+func TestDestroy_OnRunnerOrphanedErrorDoesNotBlockDestroy(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{}
+
+	var callbackInvocations int32
+	cb := func(_ context.Context, runnerID int64) error {
+		atomic.AddInt32(&callbackInvocations, 1)
+		return errors.New("github rate-limited")
+	}
+
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          1,
+		OnRunnerOrphaned: cb,
+		DrainTimeout:     time.Second,
+	})
+
+	// Seed a Hot row with a runner ID so destroy will invoke the callback.
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 10042, Node: "pve1", Name: "x",
+		PoolKind: store.PoolKindHot, State: store.StateHot,
+		RunnerID: 12345,
+	}))
+	// Move it to Destroying so destroy() acts on it.
+	_, err := st.UpdateState(10042, store.StateHot, store.StateDestroying, nil)
+	require.NoError(t, err)
+
+	mgr.destroy(context.Background(), 10042, "pve1")
+
+	// Callback fired exactly once.
+	require.Equal(t, int32(1), atomic.LoadInt32(&callbackInvocations))
+	// PVE destroy still happened.
+	fp.mu.Lock()
+	require.Contains(t, fp.destroys, 10042, "Destroy must proceed even when OnRunnerOrphaned errors")
+	fp.mu.Unlock()
+	// Row removed from the store.
+	_, err = st.Get(10042)
+	require.Error(t, err, "row must be deleted after destroy regardless of callback outcome")
+}
+
+// TestReconcileOnce_DoesNotOverProvisionWhenClonesInFlight covers the
+// inter-tick race: two consecutive reconcile ticks each saw an empty
+// store and each dispatched HotSize clones — the pool worker hadn't
+// yet inserted the rows from the first tick when the second tick
+// snapshotted. The headroom calc must count
+// Provisioner.InFlightCloneCount() so a tick sees the previous
+// tick's work even before the store rows have caught up.
+//
+// Setup: empty store + hot_size=3, but the Provisioner reports 3
+// clones already in-flight (the previous tick's work). reconcileOnce
+// must NOT dispatch any new clones — the in-flight set will become
+// Hot soon.
+func TestReconcileOnce_DoesNotOverProvisionWhenClonesInFlight(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{
+		inFlightClones: 3, // previous tick's work, store rows haven't landed yet
+	}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:              3,
+		MaxConcurrentRunners: 10,
+		VMIDRange:            config.VMIDRange{Min: 10000, Max: 10099},
+	})
+
+	mgr.reconcileOnce(context.Background())
+
+	// kickClone spawns goroutines; wait for the manager's wg to drain
+	// so we observe the final state. NewManager doesn't expose the
+	// wg directly, so we just give the (immediate-return) fake Clone
+	// calls time to land — 100ms is generous, the fake returns the
+	// instant the goroutine schedules.
+	time.Sleep(100 * time.Millisecond)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.clones,
+		"reconcileOnce must NOT dispatch new clones when prov.InFlightCloneCount() == HotSize — that's the previous tick's work coming through; got %d", len(fp.clones))
 }

@@ -1,9 +1,11 @@
 package provisioner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -506,4 +508,275 @@ func TestNewProxmoxClient_ReachesTestServer(t *testing.T) {
 	_, err := p.cli.Nodes(context.Background())
 	require.NoError(t, err)
 	require.True(t, strings.HasPrefix(got.Path, "/nodes"))
+}
+
+// listOwnedVMsServer returns an httptest server that answers the three
+// GET endpoints ListOwnedVMs needs: cluster node list, per-node status
+// (go-proxmox's Client.Node helper hits /nodes/{node}/status to enrich
+// the Node object), and per-node VM list. vmsJSON is the raw JSON for
+// the qemu list.
+func listOwnedVMsServer(t *testing.T, nodeName, vmsJSON string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nodes", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"data":[{"node":%q,"status":"online"}]}`, nodeName)
+	})
+	mux.HandleFunc("/nodes/"+nodeName+"/status", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{}}`)
+	})
+	mux.HandleFunc("/nodes/"+nodeName+"/qemu", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, vmsJSON)
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestListOwnedVMs_SuppressesUntaggedWarningForInFlightClones locks
+// in the behaviour around the qmclone→qmconfig tag-apply window.
+// During that window the VM exists in PVE with our name prefix but
+// without the owner tag; ListOwnedVMs must NOT log "untagged orphan
+// detected" for VMIDs we are actively cloning — the orchestrator
+// already owns the VM, the tag just hasn't landed yet. The VM is
+// still included in the returned slice so callers see a complete
+// owned set.
+func TestListOwnedVMs_SuppressesUntaggedWarningForInFlightClones(t *testing.T) {
+	t.Parallel()
+
+	// VM with our name prefix, in our VMID range, but NO tags — the
+	// exact window between qmclone returning and qmconfig applying
+	// tags.
+	srv := listOwnedVMsServer(t, "pve1",
+		`{"data":[{"vmid":10004,"name":"gh-runner-test-scaleset-10004","status":"running","tags":""}]}`)
+	defer srv.Close()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	p := newTestProvisioner(t, srv, "pve1")
+	p.log = logger
+	p.vmNamePrefix = "gh-runner-test-scaleset-"
+	p.cfg.VMIDRange = config.VMIDRange{Min: 10000, Max: 19999}
+
+	// Mark VMID 10004 as currently being cloned — Clone has returned
+	// from PVE's clone task but hasn't yet applied the ownership tag.
+	p.inFlightClones.Store(10004, time.Now())
+
+	vms, err := p.ListOwnedVMs(context.Background())
+	require.NoError(t, err)
+	require.Len(t, vms, 1,
+		"in-flight VM must still be reported as owned (the row in the store points at this VMID)")
+	require.Equal(t, 10004, vms[0].VMID)
+
+	require.NotContains(t, logBuf.String(), "untagged orphan detected",
+		"the WARN must be suppressed while the clone is in-flight; got log: %s", logBuf.String())
+}
+
+// TestPruneStaleTrackers prunes inflight + recentlyDestroyed entries
+// past their TTL. Without this sweep, a hung Clone() leaks an inflight
+// entry forever (suppressing future warnings for that VMID) and the
+// recentlyDestroyed map grows unbounded under destroy churn —
+// problems that only surface at enterprise scale and over long
+// uptimes.
+func TestPruneStaleTrackers_RemovesEntriesPastTTL(t *testing.T) {
+	t.Parallel()
+
+	p := &pmox{
+		log:                  quietLogger(),
+		inFlightCloneTTL:     time.Minute,
+		recentlyDestroyedTTL: time.Minute,
+	}
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	// Within TTL.
+	p.inFlightClones.Store(100, t0)
+	p.recentlyDestroyed.Store(200, t0)
+	// Past TTL.
+	p.inFlightClones.Store(101, t0.Add(-2*time.Minute))
+	p.recentlyDestroyed.Store(201, t0.Add(-2*time.Minute))
+
+	p.pruneStaleTrackers(t0)
+
+	_, fresh1 := p.inFlightClones.Load(100)
+	_, stale1 := p.inFlightClones.Load(101)
+	_, fresh2 := p.recentlyDestroyed.Load(200)
+	_, stale2 := p.recentlyDestroyed.Load(201)
+	require.True(t, fresh1, "in-flight entry within TTL must survive")
+	require.False(t, stale1, "in-flight entry past TTL must be pruned")
+	require.True(t, fresh2, "recentlyDestroyed entry within TTL must survive")
+	require.False(t, stale2, "recentlyDestroyed entry past TTL must be pruned")
+}
+
+// TestPruneStaleTrackers_HandlesCorruptedEntries: a sync.Map.Store
+// allows any type for the value, so a defensive prune must drop
+// entries whose type doesn't match the time.Time invariant rather
+// than crash. Mirrors the type-assertion path in IsRecentlyDestroyed.
+func TestPruneStaleTrackers_HandlesCorruptedEntries(t *testing.T) {
+	t.Parallel()
+	p := &pmox{
+		log:                  quietLogger(),
+		inFlightCloneTTL:     time.Minute,
+		recentlyDestroyedTTL: time.Minute,
+	}
+	p.inFlightClones.Store(100, "not a time")    // wrong type
+	p.recentlyDestroyed.Store(200, 12345)        // wrong type
+
+	require.NotPanics(t, func() {
+		p.pruneStaleTrackers(time.Now())
+	})
+
+	_, ok1 := p.inFlightClones.Load(100)
+	_, ok2 := p.recentlyDestroyed.Load(200)
+	require.False(t, ok1, "corrupted in-flight entry must be deleted")
+	require.False(t, ok2, "corrupted recentlyDestroyed entry must be deleted")
+}
+
+// TestIsRecentlyDestroyed_SelfHealsCorruptedEntry: the hot path that
+// the allocator hits on every VMID lookup must not trust a malformed
+// value. Otherwise a single corrupted entry blocks the allocator
+// from ever reissuing the VMID. Defensive code already in place;
+// this test pins it.
+func TestIsRecentlyDestroyed_SelfHealsCorruptedEntry(t *testing.T) {
+	t.Parallel()
+	p := &pmox{log: quietLogger()}
+	p.recentlyDestroyed.Store(10042, "not a time")
+	require.False(t, p.IsRecentlyDestroyed(10042, time.Minute),
+		"malformed value must not block the allocator forever")
+	_, ok := p.recentlyDestroyed.Load(10042)
+	require.False(t, ok, "the bad entry must be dropped on read")
+}
+
+// TestDestroy_DoesNotMarkRecentlyDestroyedOnError: if Destroy fails
+// after stopping the VM (or fails early), the VMID must NOT enter the
+// recently-destroyed cooldown set. Otherwise the pool's allocator
+// would refuse to reissue a VMID that PVE never actually released —
+// blocking the orchestrator until the cooldown expires, even though
+// the VM is still up and using the ID.
+func TestDestroy_DoesNotMarkRecentlyDestroyedOnError(t *testing.T) {
+	t.Parallel()
+	// Mock that 500s on every Proxmox call so the getVM step inside
+	// Destroy returns a non-404 error and Destroy bails before any
+	// destroy actually happens.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"data":null,"errors":{"vm":"transient PVE failure"}}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvisioner(t, srv, "pve1")
+	err := p.Destroy(context.Background(), &VM{VMID: 10042, Node: "pve1"})
+	require.Error(t, err, "Destroy must surface the PVE failure, not swallow it")
+
+	require.False(t, p.IsRecentlyDestroyed(10042, time.Hour),
+		"Destroy failure must NOT mark the VMID as recently-destroyed — otherwise the allocator will refuse to reuse it even though PVE never released it")
+}
+
+// TestDestroy_TreatsMissingVMAsIdempotent: a Destroy targeting a VM
+// that has already been deleted (concurrent admin action, prior
+// crash, etc.) must return nil. The recentlyDestroyed map is NOT
+// updated because there was nothing for us to destroy; the cooldown
+// only protects against PVE still settling our own teardown.
+func TestDestroy_TreatsMissingVMAsIdempotent(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errors":{"vm":"VM does not exist"}}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvisioner(t, srv, "pve1")
+	err := p.Destroy(context.Background(), &VM{VMID: 10042, Node: "pve1"})
+	require.NoError(t, err, "a missing VM is idempotent success")
+	require.False(t, p.IsRecentlyDestroyed(10042, time.Hour),
+		"a no-op Destroy must NOT enter the cooldown set")
+}
+
+// TestListOwnedVMs_PartialNodeFailureReturnsRest: if one node in the
+// cluster is unreachable (returns 500), ListOwnedVMs must log a
+// warning, skip that node, and return VMs from the reachable nodes.
+// A whole-cluster failure was the original symptom captured in
+// production ("provisioner: list nodes: not authorized" when a node
+// was down) — degrading gracefully here is critical.
+func TestListOwnedVMs_PartialNodeFailureReturnsRest(t *testing.T) {
+	t.Parallel()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nodes", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[
+			{"node":"pve-good","status":"online"},
+			{"node":"pve-bad","status":"unknown"}
+		]}`)
+	})
+	// Healthy node: VM that's clearly ours (correct owner tag).
+	mux.HandleFunc("/nodes/pve-good/status", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{}}`)
+	})
+	mux.HandleFunc("/nodes/pve-good/qemu", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w,
+			`{"data":[{"vmid":10005,"name":"gh-runner-test-scaleset-10005","status":"running","tags":"gh-scaleset;gh-scaleset-owner-test-scaleset"}]}`)
+	})
+	// Failed node: 500 to anything.
+	mux.HandleFunc("/nodes/pve-bad/status", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/nodes/pve-bad/qemu", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	p := newTestProvisioner(t, srv, "pve-good")
+	p.vmNamePrefix = "gh-runner-test-scaleset-"
+	p.cfg.VMIDRange = config.VMIDRange{Min: 10000, Max: 19999}
+
+	vms, err := p.ListOwnedVMs(context.Background())
+	require.NoError(t, err, "a partial failure must NOT cause the whole call to error")
+	require.Len(t, vms, 1, "the reachable node's VMs must still be returned")
+	require.Equal(t, 10005, vms[0].VMID)
+}
+
+// TestClone_ClearsInFlightOnError: if Clone() returns an error after
+// reaching the Proxmox call (so the in-flight entry was already
+// recorded), the defer must still remove it. Without this guarantee,
+// a recurring clone failure suppresses untagged-orphan warnings
+// indefinitely for that VMID — the operator never learns the VM is
+// actually stuck.
+func TestClone_ClearsInFlightOnError(t *testing.T) {
+	t.Parallel()
+	// All PVE calls 500 — Clone's get-template-node call fails fast.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"data":null}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvisioner(t, srv, "pve1")
+	_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10042, Node: "pve1", Name: "x"})
+	require.Error(t, err, "the fake PVE returns 500 so Clone must fail")
+
+	_, stillInFlight := p.inFlightClones.Load(10042)
+	require.False(t, stillInFlight,
+		"Clone error must still clear the in-flight entry — otherwise repeated failures permanently mute the warning for that VMID")
+}
+
+// TestListOwnedVMs_StillWarnsOnRealUntaggedOrphan is the corollary:
+// a VM matching the name prefix + VMID range but NOT in the in-flight
+// set is a genuine "crashed mid-clone" orphan from a previous
+// orchestrator process. Those still need the WARN so operators
+// notice them.
+func TestListOwnedVMs_StillWarnsOnRealUntaggedOrphan(t *testing.T) {
+	t.Parallel()
+	srv := listOwnedVMsServer(t, "pve1",
+		`{"data":[{"vmid":10004,"name":"gh-runner-test-scaleset-10004","status":"running","tags":""}]}`)
+	defer srv.Close()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	p := newTestProvisioner(t, srv, "pve1")
+	p.log = logger
+	p.vmNamePrefix = "gh-runner-test-scaleset-"
+	p.cfg.VMIDRange = config.VMIDRange{Min: 10000, Max: 19999}
+	// NOT marking 10004 as in-flight.
+
+	_, err := p.ListOwnedVMs(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, logBuf.String(), "untagged orphan detected",
+		"genuine crash-mid-clone orphans must still warn")
 }

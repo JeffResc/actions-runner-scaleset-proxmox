@@ -1,0 +1,28 @@
+{{ include "scaleset.fullname" . }} installed in namespace {{ .Release.Namespace }}.
+
+Replicas: {{ .Values.replicaCount }} (leader-elected via coordination.k8s.io/v1 Lease).
+
+Inspect the current leader:
+
+  kubectl -n {{ .Release.Namespace }} get lease scaleset-{{ .Values.scalesetConfig.scaleset.name }} -o yaml
+
+Watch leader transitions:
+
+  kubectl -n {{ .Release.Namespace }} logs -f deployment/{{ include "scaleset.fullname" . }} -l app.kubernetes.io/instance={{ .Release.Name }} \
+    | grep -E "became leader|lost leadership|observed new leader"
+
+Hit the admin API (the Service routes to any replica; non-leaders
+reverse-proxy to the leader transparently):
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "scaleset.fullname" . }} 9101:9101
+  curl -H "Authorization: Bearer <SCALESET_ADMIN_SECRET>" http://127.0.0.1:9101/admin/state
+
+Prometheus metrics:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "scaleset.fullname" . }} 9100:9100
+  curl http://127.0.0.1:9100/metrics
+{{ if not .Values.secrets.existingSecret }}
+NOTE: A convenience Secret was created by this release. For
+production, set .Values.secrets.existingSecret to a Secret you manage
+via SealedSecrets / external-secrets / equivalent.
+{{ end -}}

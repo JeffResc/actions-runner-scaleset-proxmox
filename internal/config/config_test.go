@@ -205,6 +205,84 @@ pool: {}
 
 	// Power-state poller default.
 	require.Equal(t, 3*time.Second, cfg.Pool.PowerPollIntervalD)
+
+	// Race-fix grace/cooldown defaults (pre-existing race bug fixes).
+	require.Equal(t, 30*time.Second, cfg.Pool.VMIDReuseCooldownD)
+	require.Equal(t, 60*time.Second, cfg.Pool.OrphanGraceD)
+	require.Equal(t, 5*time.Minute, cfg.Pool.CloneInflightGraceD)
+}
+
+// TestPool_RaceGraceKnobs_AcceptOverrides confirms the three pool grace
+// knobs introduced for the over-provision / VMID-reuse / orphan-sweep
+// races round-trip through ApplyDefaults + Resolve.
+func TestPool_RaceGraceKnobs_AcceptOverrides(t *testing.T) {
+	yaml := `
+github:
+  auth_mode: pat
+  pat: { token_env: TEST_GH_TOKEN }
+  scope: { org: o }
+scaleset: { name: x, max_concurrent_runners: 5 }
+proxmox:
+  endpoint: https://h:8006/api2/json
+  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage: { disk: d, snippets: s }
+  network: { bridge: br0 }
+nodes: { strategy: single, single_node: n1 }
+pool:
+  vmid_reuse_cooldown: 45s
+  orphan_grace: 90s
+  clone_inflight_grace: 10m
+`
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	cfg, err := config.Parse([]byte(yaml))
+	require.NoError(t, err)
+	require.Equal(t, 45*time.Second, cfg.Pool.VMIDReuseCooldownD)
+	require.Equal(t, 90*time.Second, cfg.Pool.OrphanGraceD)
+	require.Equal(t, 10*time.Minute, cfg.Pool.CloneInflightGraceD)
+}
+
+// TestPool_RaceGraceKnobs_RejectZeroOrNegative locks down the
+// validation: each of the three knobs must be > 0 or Parse fails. The
+// race fixes assume strictly positive durations.
+func TestPool_RaceGraceKnobs_RejectZeroOrNegative(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		val   string
+	}{
+		{"vmid_reuse_cooldown zero", "vmid_reuse_cooldown", "0s"},
+		{"orphan_grace zero", "orphan_grace", "0s"},
+		{"clone_inflight_grace zero", "clone_inflight_grace", "0s"},
+		{"vmid_reuse_cooldown negative", "vmid_reuse_cooldown", "-1s"},
+		{"orphan_grace negative", "orphan_grace", "-1s"},
+		{"clone_inflight_grace negative", "clone_inflight_grace", "-1s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := `
+github:
+  auth_mode: pat
+  pat: { token_env: TEST_GH_TOKEN }
+  scope: { org: o }
+scaleset: { name: x, max_concurrent_runners: 5 }
+proxmox:
+  endpoint: https://h:8006/api2/json
+  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage: { disk: d, snippets: s }
+  network: { bridge: br0 }
+nodes: { strategy: single, single_node: n1 }
+pool:
+  ` + tc.field + `: ` + tc.val + `
+`
+			setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+			_, err := config.Parse([]byte(yaml))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.field)
+		})
+	}
 }
 
 // TestParse_GitHubReconcilerOverrides confirms the YAML keys map to the
@@ -380,4 +458,95 @@ func TestLoad_ReadsFromDisk(t *testing.T) {
 	cfg, err := config.Load(path)
 	require.NoError(t, err)
 	require.Equal(t, "proxmox-ubuntu-x64", cfg.ScaleSet.Name)
+}
+
+// Cluster defaults: omitted cluster block falls back to standalone with
+// sane Lease timings; the lease name is derived from the scale set.
+func TestCluster_DefaultsToStandalone(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.Equal(t, "standalone", cfg.Cluster.Mode)
+	require.Equal(t, "scaleset-proxmox-ubuntu-x64", cfg.Cluster.Kubernetes.LeaseName)
+	require.Equal(t, 15*time.Second, cfg.Cluster.Kubernetes.LeaseDurationD)
+	require.Equal(t, 10*time.Second, cfg.Cluster.Kubernetes.RenewDeadlineD)
+	require.Equal(t, 2*time.Second, cfg.Cluster.Kubernetes.RetryPeriodD)
+	require.Equal(t, "scaleset.jeffresc.dev/leader-endpoint",
+		cfg.Cluster.Kubernetes.LeaderEndpointAnnotation)
+}
+
+// Kubernetes mode resolves Identity/Namespace/PodIP from the Downward
+// API env vars when the YAML leaves them empty.
+func TestCluster_KubernetesUsesDownwardAPIEnvs(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"POD_NAME":       "scaleset-0",
+		"POD_NAMESPACE":  "gh-runners",
+		"POD_IP":         "10.42.0.5",
+	})
+	cfg, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: kubernetes\n"))
+	require.NoError(t, err)
+	require.Equal(t, "kubernetes", cfg.Cluster.Mode)
+	require.Equal(t, "scaleset-0", cfg.Cluster.Kubernetes.Identity)
+	require.Equal(t, "gh-runners", cfg.Cluster.Kubernetes.LeaseNamespace)
+	require.Equal(t, "10.42.0.5", cfg.Cluster.Kubernetes.PodIP)
+}
+
+// Kubernetes mode without POD_IP refuses to start — the leader-endpoint
+// annotation cannot be published.
+func TestCluster_KubernetesRequiresPodIP(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"POD_NAME":       "scaleset-0",
+		"POD_NAMESPACE":  "gh-runners",
+	})
+	t.Setenv("POD_IP", "")
+	_, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: kubernetes\n"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "pod_ip")
+}
+
+// Kubernetes mode without POD_NAMESPACE refuses to start.
+func TestCluster_KubernetesRequiresNamespace(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"POD_NAME":       "scaleset-0",
+		"POD_IP":         "10.42.0.5",
+	})
+	t.Setenv("POD_NAMESPACE", "")
+	_, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: kubernetes\n"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "lease_namespace")
+}
+
+// Bad timing relationships are rejected before the leader-election
+// library would panic on them.
+func TestCluster_KubernetesRejectsBadTimings(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"POD_NAME":       "p",
+		"POD_NAMESPACE":  "n",
+		"POD_IP":         "10.0.0.1",
+	})
+	yaml := validPATYAML + `cluster:
+  mode: kubernetes
+  kubernetes:
+    lease_duration: 5s
+    renew_deadline: 10s
+    retry_period: 1s
+`
+	_, err := config.Parse([]byte(yaml))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "renew_deadline")
+}
+
+// An unknown mode is rejected by the validator tags.
+func TestCluster_RejectsUnknownMode(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	_, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: bogus\n"))
+	require.Error(t, err)
 }

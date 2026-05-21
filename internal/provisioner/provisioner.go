@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -113,6 +114,21 @@ type Provisioner interface {
 	// (e.g. the least-loaded NodeSelector). Callers must not retain the
 	// pointer past the Provisioner's lifetime.
 	Client() *proxmox.Client
+
+	// IsRecentlyDestroyed reports whether the VMID's qmdestroy task
+	// completed within the given cooldown window. The pool's VMID
+	// allocator consults this so a freshly freed VMID isn't reissued
+	// while PVE-side lock-file cleanup is still settling — which
+	// otherwise produces "VM N is running - destroy failed" errors
+	// and 60s lock-file timeouts.
+	IsRecentlyDestroyed(vmid int, cooldown time.Duration) bool
+
+	// InFlightCloneCount returns the number of clones currently inside
+	// Clone() between the PVE qmclone task returning and the follow-up
+	// qmconfig that applies our owner tags. The pool's headroom
+	// calculation adds this to stats.Provisioning so reconcile ticks
+	// can't double-dispatch clones that the previous tick has in flight.
+	InFlightCloneCount() int
 }
 
 // pmox is the production Provisioner backed by github.com/luthermonson/go-proxmox.
@@ -123,6 +139,49 @@ type pmox struct {
 	vmNamePrefix string // e.g. "gh-runner-<scaleset>-" — used to detect untagged orphans
 	templateNode string
 	log          *slog.Logger
+
+	// inFlightClones tracks VMIDs currently inside Clone() between the
+	// PVE qmclone task returning and the follow-up qmconfig that applies
+	// our owner tags. ListOwnedVMs consults this so the brief untagged
+	// window doesn't flap a "list-owned: untagged orphan detected"
+	// warning under sustained load. Keys are int VMIDs; values are the
+	// timestamp the entry was inserted (used by the TTL safety net).
+	//
+	// inFlightCloneTTL bounds how long an entry survives in case Clone
+	// hangs and never returns to clear it. Set via the constructor from
+	// pool.clone_inflight_grace; zero falls back to a 5m default.
+	inFlightClones   sync.Map // map[int]time.Time
+	inFlightCloneTTL time.Duration
+
+	// recentlyDestroyed tracks VMIDs whose Proxmox qmdestroy task has
+	// recently completed. The pool's allocateVMID consults this via
+	// IsRecentlyDestroyed to avoid reissuing a VMID while PVE-side
+	// lock-file cleanup is still settling — which would otherwise
+	// produce "VM N is running - destroy failed" errors.
+	//
+	// recentlyDestroyedTTL bounds entry lifetime; entries older than
+	// this are pruned by the background sweep. Set via the constructor
+	// from pool.vmid_reuse_cooldown; zero falls back to a 30s default.
+	recentlyDestroyed    sync.Map // map[int]time.Time
+	recentlyDestroyedTTL time.Duration
+}
+
+// Options configures Provisioner trackers separate from the static
+// Proxmox connection settings. Zero values fall back to safe defaults.
+type Options struct {
+	// CloneInflightTTL bounds how long an in-flight clone entry may
+	// live before the background sweep prunes it. Protects against
+	// a Clone() that hangs and never reaches its defer-Delete.
+	// Defaults to 5 minutes.
+	CloneInflightTTL time.Duration
+
+	// RecentlyDestroyedTTL bounds how long a destroyed-VMID entry
+	// stays in the cooldown map. The pool's allocateVMID consults
+	// IsRecentlyDestroyed with its own (shorter) cooldown, so this
+	// TTL is purely a memory ceiling for the map — pick something
+	// comfortably above the longest plausible vmid_reuse_cooldown.
+	// Defaults to 10 minutes.
+	RecentlyDestroyedTTL time.Duration
 }
 
 // New constructs a Proxmox-backed Provisioner. It performs a one-time
@@ -134,17 +193,85 @@ type pmox struct {
 // applying our owner tag" failure mode). The go-proxmox library v0.5.1
 // doesn't support tags-at-clone-time, so we can't make clone+tag fully
 // atomic — name-prefix + VMID-range matching plugs the gap.
-func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePrefix string, log *slog.Logger) (Provisioner, error) {
+//
+// The provided ctx governs the background sweep goroutine that prunes
+// stale in-flight clone and recently-destroyed entries. Cancel the
+// context to stop the sweep at shutdown.
+func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePrefix string, opts Options, log *slog.Logger) (Provisioner, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	if opts.CloneInflightTTL <= 0 {
+		opts.CloneInflightTTL = 5 * time.Minute
+	}
+	if opts.RecentlyDestroyedTTL <= 0 {
+		opts.RecentlyDestroyedTTL = 10 * time.Minute
+	}
 	cli := newProxmoxClient(cfg)
-	p := &pmox{cfg: cfg, cli: cli, scaleSetName: scaleSetName, vmNamePrefix: vmNamePrefix, log: log}
+	p := &pmox{
+		cfg:                  cfg,
+		cli:                  cli,
+		scaleSetName:         scaleSetName,
+		vmNamePrefix:         vmNamePrefix,
+		log:                  log,
+		inFlightCloneTTL:     opts.CloneInflightTTL,
+		recentlyDestroyedTTL: opts.RecentlyDestroyedTTL,
+	}
 	if err := p.discoverTemplateNode(ctx); err != nil {
 		return nil, err
 	}
+	go p.sweepStaleTrackers(ctx)
 	log.Info("provisioner ready", "template_vmid", cfg.TemplateVMID, "template_node", p.templateNode)
 	return p, nil
+}
+
+// sweepStaleTrackers prunes inFlightClones entries older than
+// inFlightCloneTTL and recentlyDestroyed entries older than
+// recentlyDestroyedTTL. Without this loop, a hung Clone() leaks an
+// inflight entry forever (suppressing future warnings for that VMID),
+// and the recentlyDestroyed map grows unbounded under sustained
+// destroy churn — at enterprise scale, both bite eventually.
+//
+// The loop wakes every min(ttl)/4 so prune latency is bounded by the
+// shorter of the two TTLs. Returns when ctx is done.
+func (p *pmox) sweepStaleTrackers(ctx context.Context) {
+	interval := p.inFlightCloneTTL
+	if p.recentlyDestroyedTTL < interval {
+		interval = p.recentlyDestroyedTTL
+	}
+	interval /= 4
+	if interval < time.Second {
+		interval = time.Second
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			p.pruneStaleTrackers(time.Now())
+		}
+	}
+}
+
+// pruneStaleTrackers is the sweep body — extracted for direct test
+// invocation without driving the ticker.
+func (p *pmox) pruneStaleTrackers(now time.Time) {
+	p.inFlightClones.Range(func(k, v any) bool {
+		ts, ok := v.(time.Time)
+		if !ok || now.Sub(ts) >= p.inFlightCloneTTL {
+			p.inFlightClones.Delete(k)
+		}
+		return true
+	})
+	p.recentlyDestroyed.Range(func(k, v any) bool {
+		ts, ok := v.(time.Time)
+		if !ok || now.Sub(ts) >= p.recentlyDestroyedTTL {
+			p.recentlyDestroyed.Delete(k)
+		}
+		return true
+	})
 }
 
 // newProxmoxClient builds the underlying HTTP+API-token client.
@@ -197,6 +324,41 @@ func newProxmoxClient(cfg config.ProxmoxConfig) *proxmox.Client {
 
 func (p *pmox) TemplateNode() string    { return p.templateNode }
 func (p *pmox) Client() *proxmox.Client { return p.cli }
+
+// IsRecentlyDestroyed returns true iff a qmdestroy for vmid completed
+// within the cooldown window. Entries older than the cooldown are
+// purged on the way out so the map can't grow unbounded.
+func (p *pmox) IsRecentlyDestroyed(vmid int, cooldown time.Duration) bool {
+	v, ok := p.recentlyDestroyed.Load(vmid)
+	if !ok {
+		return false
+	}
+	ts, ok := v.(time.Time)
+	if !ok {
+		// Defensive: a malformed entry can't be trusted to gate
+		// allocation. Drop it and report "not recent" so the
+		// allocator proceeds rather than refusing forever.
+		p.recentlyDestroyed.Delete(vmid)
+		return false
+	}
+	if time.Since(ts) >= cooldown {
+		p.recentlyDestroyed.Delete(vmid)
+		return false
+	}
+	return true
+}
+
+// InFlightCloneCount returns the number of Clone() calls currently in
+// flight. Used by the pool's headroom calculation; see the interface
+// doc for the rationale.
+func (p *pmox) InFlightCloneCount() int {
+	count := 0
+	p.inFlightClones.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
+}
 
 // Ping issues a GET /version against the Proxmox API. This is the
 // canonical cheapest call and is the basis for readiness signalling.
@@ -263,10 +425,18 @@ func isTemplate(vm *proxmox.VirtualMachine) bool {
 
 // Clone clones the template VM into NewVMID on opts.Node, applies our owner
 // tags, and optionally starts it.
+//
+// While this method is executing, NewVMID is registered in the in-flight
+// clone tracker so [pmox.ListOwnedVMs] suppresses the "untagged orphan"
+// warning that would otherwise fire in the narrow window between PVE's
+// qmclone task returning and the follow-up qmconfig that applies our
+// owner tags. The entry is removed on any return path (success or error).
 func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if opts.Linked && opts.Node != p.templateNode {
 		return nil, fmt.Errorf("%w: requested node=%s template_node=%s", ErrLinkedCloneCrossNode, opts.Node, p.templateNode)
 	}
+	p.inFlightClones.Store(opts.NewVMID, time.Now())
+	defer p.inFlightClones.Delete(opts.NewVMID)
 
 	templateNode, err := p.cli.Node(ctx, p.templateNode)
 	if err != nil {
@@ -424,10 +594,17 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		// were tearing it down — common with another orchestrator).
 		classified := classifyProxmoxError(err)
 		if errors.Is(classified, ErrVMNotFound) {
+			p.recentlyDestroyed.Store(vm.VMID, time.Now())
 			return nil
 		}
 		return fmt.Errorf("await delete: %w", classified)
 	}
+	// PVE has finished the qmdestroy task. Record the timestamp so the
+	// pool's allocateVMID skips this VMID until the configured cooldown
+	// elapses — without this, a fresh clone targeting the same VMID
+	// would race PVE-side lock-file cleanup and produce
+	// "VM N is running - destroy failed" errors.
+	p.recentlyDestroyed.Store(vm.VMID, time.Now())
 	return nil
 }
 
@@ -510,8 +687,18 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 				continue
 			}
 			if untaggedOrphan {
-				p.log.Warn("list-owned: untagged orphan detected (likely crash mid-clone)",
-					"vmid", vmid, "node", ns.Node, "name", v.Name)
+				// Suppress the warning when this VMID is currently
+				// inside a Clone() call between qmclone returning and
+				// the follow-up qmconfig tag-apply: the orchestrator
+				// already knows it owns this VM, so the "missing tag"
+				// observation is expected, not anomalous.
+				if _, inflight := p.inFlightClones.Load(vmid); inflight {
+					p.log.Debug("list-owned: vm seen mid-clone; tag-apply pending",
+						"vmid", vmid, "node", ns.Node, "name", v.Name)
+				} else {
+					p.log.Warn("list-owned: untagged orphan detected (likely crash mid-clone)",
+						"vmid", vmid, "node", ns.Node, "name", v.Name)
+				}
 			}
 			out = append(out, &VM{VMID: vmid, Node: ns.Node, Name: v.Name})
 		}

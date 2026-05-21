@@ -1,0 +1,83 @@
+{{- /*
+helm test pod that exercises the leader-or-forward path on the admin
+API. The Service load-balances across all replicas, so over several
+requests at least one is likely to hit a standby — verifying that the
+admin reverse-proxy returns valid leader-served responses.
+
+Skipped when the admin API is disabled (no http_addr) or no admin
+shared secret was configured.
+*/ -}}
+{{- if and .Values.scalesetConfig.admin_api.http_addr (or .Values.secrets.adminApi.sharedSecretValue .Values.secrets.existingSecret) -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "scaleset.fullname" . }}-test-admin-forward
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scaleset.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    # Run after the connection check so failures here aren't masked by
+    # an upstream pod-not-ready problem.
+    helm.sh/hook-weight: "1"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: curl
+      image: curlimages/curl:8.10.1
+      command: ["sh", "-eu", "-c"]
+      env:
+        - name: ADMIN_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "scaleset.secretName" . }}
+              key: SCALESET_ADMIN_SECRET
+      args:
+        - |
+          host={{ include "scaleset.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+          admin_url="http://${host}:{{ .Values.service.adminPort }}/admin/state"
+
+          # 12 requests spread across replicas — with replicas={{ .Values.replicaCount }} the
+          # K8s Service round-robins, so at least one should land on a
+          # standby and exercise the reverse-proxy path. We accept
+          # transient 503s for up to ~30s while the leader stands up.
+          fail=0
+          ok=0
+          for i in $(seq 1 12); do
+            code=$(curl -sS -o /tmp/body -w "%{http_code}" --max-time 10 \
+              -H "Authorization: Bearer ${ADMIN_SECRET}" "${admin_url}" || echo "000")
+            if [ "${code}" = "200" ]; then
+              ok=$((ok+1))
+              # Sanity check: response is JSON-ish (starts with '{').
+              first=$(head -c 1 /tmp/body || echo "")
+              if [ "${first}" != "{" ]; then
+                echo "FAIL: 200 but body doesn't look like JSON: $(head -c 80 /tmp/body)"
+                exit 1
+              fi
+            elif [ "${code}" = "503" ]; then
+              echo "  attempt ${i}: 503 (election in flight)"
+            else
+              echo "  attempt ${i}: ${code} (unexpected)"
+              fail=$((fail+1))
+            fi
+            sleep 2
+          done
+
+          echo "ok=${ok} fail=${fail}"
+          if [ "${ok}" -lt 1 ]; then
+            echo "FAIL: /admin/state never returned 200 — admin forwarding or leader plane is broken"
+            exit 1
+          fi
+          if [ "${fail}" -gt 2 ]; then
+            echo "FAIL: ${fail} unexpected non-200/503 responses"
+            exit 1
+          fi
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+{{- end }}

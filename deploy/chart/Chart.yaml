@@ -1,0 +1,19 @@
+apiVersion: v2
+name: scaleset
+description: |
+  GitHub Actions self-hosted runner orchestrator backed by ephemeral
+  Proxmox VMs. Runs as N replicas with Kubernetes Lease-based leader
+  election; the leader holds the GitHub WebSocket session and drives
+  the pool, standbys are warm spares that take over on Lease expiry.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - github-actions
+  - proxmox
+  - self-hosted-runners
+  - scaleset
+sources:
+  - https://github.com/jeffresc/github-actions-proxmox-scaleset
+maintainers:
+  - name: Jeff Rescignano

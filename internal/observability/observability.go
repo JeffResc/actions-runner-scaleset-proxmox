@@ -182,9 +182,17 @@ func (m *Metrics) ObserveCall(endpoint, statusClass string) {
 
 // Health tracks readiness state observed across the orchestrator. All
 // methods are safe for concurrent use.
+//
+// In single-process / standalone deployments Leader is set true at
+// startup and never changes. In Kubernetes multi-replica deployments
+// the cluster.Coordinator drives [Health.MarkLeader] as leadership
+// transitions, which in turn shifts /readyz's gate set: standbys are
+// ready as long as Proxmox is reachable (so they can take over);
+// leaders also need listenerConnected and recoveryDone.
 type Health struct {
 	listenerConnected atomic.Bool
 	recoveryDone      atomic.Bool
+	leader            atomic.Bool
 	proxmoxLastSeen   atomic.Pointer[time.Time]
 	proxmoxMaxStale   time.Duration
 }
@@ -213,17 +221,42 @@ func (h *Health) MarkListenerConnected() { h.listenerConnected.Store(true) }
 // MarkRecoveryDone records that the initial crash-recovery pass completed.
 func (h *Health) MarkRecoveryDone() { h.recoveryDone.Store(true) }
 
-// Ready returns true iff all readiness gates have flipped on AND Proxmox
-// was reachable within the staleness window.
+// ClearListenerConnected resets the listener-connected gate. Called by
+// the cluster.Coordinator's OnDeposed so a freshly demoted replica
+// stops claiming a working scaleset-listener session.
+func (h *Health) ClearListenerConnected() { h.listenerConnected.Store(false) }
+
+// ClearRecoveryDone resets the recovery gate. Called on deposal so the
+// next-elected replica's /readyz only flips green after IT has finished
+// its own Recover() pass.
+func (h *Health) ClearRecoveryDone() { h.recoveryDone.Store(false) }
+
+// MarkLeader records the current leadership state for this replica.
+// Pass true when leadership is acquired, false when it is lost.
+func (h *Health) MarkLeader(leader bool) { h.leader.Store(leader) }
+
+// Ready reports readiness with leader-aware gates:
+//
+//   - All replicas require Proxmox reachable within the staleness window
+//     (so a standby that has lost Proxmox cannot safely take over).
+//   - Leaders additionally require listenerConnected and recoveryDone.
+//
+// Standbys whose Proxmox is reachable are ready even though they have
+// never connected the scaleset listener — that work is leader-only.
 func (h *Health) Ready() bool {
-	if !h.listenerConnected.Load() || !h.recoveryDone.Load() {
-		return false
-	}
 	last := h.proxmoxLastSeen.Load()
 	if last == nil {
 		return false
 	}
-	return time.Since(*last) <= h.proxmoxMaxStale
+	if time.Since(*last) > h.proxmoxMaxStale {
+		return false
+	}
+	if h.leader.Load() {
+		if !h.listenerConnected.Load() || !h.recoveryDone.Load() {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------

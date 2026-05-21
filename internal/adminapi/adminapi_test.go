@@ -62,7 +62,14 @@ func (f *fakePool) ListRows(_ context.Context) ([]pool.RowSnapshot, error) {
 func newTestServer(t *testing.T, secret string) (*Server, *fakePool) {
 	t.Helper()
 	fp := &fakePool{stats: pool.Stats{Hot: 3, Warm: 2}}
-	s := New(Config{HTTPAddr: "ignored", SharedSecret: secret}, fp, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(
+		Config{HTTPAddr: "ignored", SharedSecret: secret},
+		func() pool.Manager { return fp },
+		nil, // provisioner unused in these tests
+		AlwaysLeader{},
+		nil, // drain callback unused
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
 	return s, fp
 }
 
@@ -109,7 +116,7 @@ func (s *Server) testDestroy(ctx context.Context, w http.ResponseWriter, vmidStr
 		http.Error(w, "invalid vmid", http.StatusBadRequest)
 		return
 	}
-	if err := s.pool.MarkCompleted(ctx, vmid); err != nil {
+	if err := s.pool().MarkCompleted(ctx, vmid); err != nil {
 		http.Error(w, "internal", http.StatusInternalServerError)
 		return
 	}
@@ -215,11 +222,125 @@ func TestState_ReturnsPoolStats(t *testing.T) {
 // uses in production.
 func chiHandler(s *Server) http.Handler {
 	r := chi.NewRouter()
+	r.Use(s.leaderOrForward)
 	r.Use(s.requireBearerToken)
 	r.Get("/admin/state", s.handleState)
 	r.Post("/admin/drain", s.handleDrain)
 	r.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
 	return r
+}
+
+// fakeGate is a LeaderGate whose responses tests control directly.
+// When isLeader is false, every request is captured and the recorded
+// response is whatever forward writes — tests can inspect both.
+type fakeGate struct {
+	isLeader bool
+	forward  http.HandlerFunc
+}
+
+func (g *fakeGate) IsLeader() bool { return g.isLeader }
+func (g *fakeGate) Forward(w http.ResponseWriter, r *http.Request) {
+	if g.forward != nil {
+		g.forward(w, r)
+		return
+	}
+	http.Error(w, "no forward configured", http.StatusInternalServerError)
+}
+
+// TestLeaderGate_NonLeaderForwardsBeforeAuth verifies the two critical
+// properties of the leader-or-forward middleware:
+//
+//   1. A standby forwards the request before requireBearerToken runs,
+//      so the standby never needs the shared secret.
+//   2. The forward handler observes the original request — including
+//      headers — so a reverse-proxy implementation can preserve
+//      X-Forwarded-For and other proxy chain headers.
+func TestLeaderGate_NonLeaderForwardsBeforeAuth(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{stats: pool.Stats{Hot: 1}}
+	var forwardedAuth, forwardedXFF string
+	gate := &fakeGate{
+		isLeader: false,
+		forward: func(w http.ResponseWriter, r *http.Request) {
+			forwardedAuth = r.Header.Get("Authorization")
+			forwardedXFF = r.Header.Get("X-Forwarded-For")
+			w.WriteHeader(http.StatusTeapot) // distinctive marker
+		},
+	}
+	s := New(
+		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
+		func() pool.Manager { return fp },
+		nil,
+		gate,
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	h := chiHandler(s)
+
+	// No Authorization header — a leader would 401, but the standby
+	// forwards before the token check runs.
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r.Header.Set("X-Forwarded-For", "203.0.113.42")
+	h.ServeHTTP(w, r)
+	require.Equal(t, http.StatusTeapot, w.Code,
+		"non-leader must forward instead of authenticating locally")
+	require.Empty(t, forwardedAuth, "no auth header was sent")
+	require.Equal(t, "203.0.113.42", forwardedXFF,
+		"forward must observe the original X-Forwarded-For so the leader can rate-limit on the real client IP")
+}
+
+// TestLeaderGate_LeaderServesLocally locks down the inverse: when this
+// replica is leader, requests are served locally and the gate's Forward
+// is never invoked.
+func TestLeaderGate_LeaderServesLocally(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{stats: pool.Stats{Hot: 5}}
+	gate := &fakeGate{
+		isLeader: true,
+		forward: func(http.ResponseWriter, *http.Request) {
+			t.Fatal("Forward must not be called when IsLeader returns true")
+		},
+	}
+	s := New(
+		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
+		func() pool.Manager { return fp },
+		nil,
+		gate,
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	h := chiHandler(s)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	h.ServeHTTP(w, r)
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+// TestLeaderGate_LeaderWithoutPoolReturns503 covers the race where this
+// replica passed the leader gate but OnElected hasn't yet wired the
+// pool manager into the accessor. /admin/state must return 503 with
+// Retry-After rather than crash with a nil-deref.
+func TestLeaderGate_LeaderWithoutPoolReturns503(t *testing.T) {
+	t.Parallel()
+	s := New(
+		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
+		func() pool.Manager { return nil },
+		nil,
+		AlwaysLeader{},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	h := chiHandler(s)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	h.ServeHTTP(w, r)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.NotEmpty(t, w.Header().Get("Retry-After"))
 }
 
 // TestAuth_RateLimitsBadTokens: rapid bad-bearer attacks against the
@@ -320,8 +441,9 @@ func TestDrain_TriggersCallback(t *testing.T) {
 	drained := make(chan struct{}, 1)
 	s := New(
 		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
-		fp,
+		func() pool.Manager { return fp },
 		nil,
+		AlwaysLeader{},
 		func() { drained <- struct{}{} },
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
@@ -350,7 +472,8 @@ func TestDrain_NoCallbackReturns501(t *testing.T) {
 
 func TestServe_NoAddrIsNoOp(t *testing.T) {
 	t.Parallel()
-	s := New(Config{HTTPAddr: ""}, &fakePool{}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	fp := &fakePool{}
+	s := New(Config{HTTPAddr: ""}, func() pool.Manager { return fp }, nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	err := s.Serve(ctx)

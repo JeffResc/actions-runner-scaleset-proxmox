@@ -78,3 +78,14 @@ func (d *dryRun) PowerState(ctx context.Context, vm *VM) (string, error) {
 func (d *dryRun) Ping(ctx context.Context) error { return d.inner.Ping(ctx) }
 func (d *dryRun) TemplateNode() string           { return d.inner.TemplateNode() }
 func (d *dryRun) Client() *proxmox.Client        { return d.inner.Client() }
+
+// IsRecentlyDestroyed and InFlightCloneCount pass through to the inner
+// provisioner. In dry-run mode we never actually destroy or clone, so
+// the inner trackers stay empty and both accessors return zero — but
+// the methods exist so the interface is satisfied and the read-side
+// stays consistent if a future code path populates the inner trackers
+// out-of-band.
+func (d *dryRun) IsRecentlyDestroyed(vmid int, cooldown time.Duration) bool {
+	return d.inner.IsRecentlyDestroyed(vmid, cooldown)
+}
+func (d *dryRun) InFlightCloneCount() int { return d.inner.InFlightCloneCount() }

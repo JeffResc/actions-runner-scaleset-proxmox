@@ -1,0 +1,181 @@
+# Default values for the scaleset chart. Override per release in your
+# own values.yaml; the only fields that DO have to be set are
+# `secrets.github.patValue` (or an existingSecret) and
+# `secrets.proxmox.tokenSecretValue`, plus the orchestrator config
+# under `scalesetConfig`.
+
+image:
+  repository: ghcr.io/jeffresc/github-actions-proxmox-scaleset
+  tag: ""                 # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# 2 replicas is the minimum that gives you HA. Scale higher only if
+# you have a strong reason — the in-memory go-memdb state is
+# leader-local and rebuilt on failover via pool.Manager.Recover, so
+# extra standbys add cost without serving more traffic.
+replicaCount: 2
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""                # defaults to the chart fullname
+  annotations: {}
+
+# RBAC for leader election. The orchestrator's ONLY Kubernetes
+# mutation is on the Lease object it creates — no pods, services,
+# endpoints, configmaps, or secrets are touched by the controller.
+# This is what makes the deployment GitOps-safe (Flux / Argo CD own
+# every other resource; the controller doesn't fight them).
+rbac:
+  create: true
+
+service:
+  type: ClusterIP
+  metricsPort: 9100
+  adminPort: 9101
+  annotations: {}
+
+# Liveness and readiness target the always-on observability port.
+# /readyz applies leader-aware semantics: standbys are ready as long
+# as Proxmox is reachable; leaders additionally need a connected
+# listener and a completed crash-recovery pass.
+probes:
+  readiness:
+    initialDelaySeconds: 3
+    periodSeconds: 5
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+
+# Must outlast pool.drain_timeout so a SIGTERM'd leader can drain
+# cleanly. Keep this in sync with scalesetConfig.pool.drain_timeout.
+terminationGracePeriodSeconds: 1800
+
+# Rolling update with surge=1 / maxUnavailable=0 means the new pod is
+# created and becomes ready BEFORE the old one is torn down, but the
+# Lease keeps work serialized on a single leader at any moment, so
+# there's no double-control-plane risk.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+
+containerSecurityContext:
+  runAsNonRoot: true
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# topologySpreadConstraints is the most common reason to override the
+# defaults — if your control-plane nodes are spread across AZs, you
+# want the leader and standby on different ones.
+topologySpreadConstraints: []
+
+# Secrets for GitHub auth and Proxmox API. Either set `existingSecret`
+# to use a pre-provisioned Opaque secret (recommended for production /
+# SealedSecrets / external-secrets), or provide raw values here and
+# the chart will create a Secret for you (dev / quick start).
+secrets:
+  # When set, the chart skips creating a Secret and consumes this one.
+  # The referenced Secret must expose keys GITHUB_PAT,
+  # PROXMOX_TOKEN_SECRET, and (when adminApi enabled)
+  # SCALESET_ADMIN_SECRET.
+  existingSecret: ""
+
+  github:
+    # Used only when existingSecret is empty.
+    patValue: ""
+  proxmox:
+    # Used only when existingSecret is empty.
+    tokenSecretValue: ""
+  adminApi:
+    # Used only when existingSecret is empty. Optional — the admin
+    # API is disabled when scalesetConfig.admin_api.http_addr is "".
+    sharedSecretValue: ""
+
+# scalesetConfig is the FULL config.yaml content the orchestrator
+# reads. See ../../config.example.yaml for the schema. The chart
+# automatically sets cluster.mode = kubernetes; everything else is
+# yours to define.
+scalesetConfig:
+  github:
+    auth_mode: pat
+    pat:
+      token_env: GITHUB_PAT
+    scope:
+      org: my-org
+
+  scaleset:
+    name: proxmox-ubuntu-x64
+    labels: [self-hosted, linux, x64, proxmox]
+    runner_group: default
+    max_concurrent_runners: 50
+
+  proxmox:
+    endpoint: https://pve.example.com:8006/api2/json
+    auth:
+      token_id: scaleset@pve!automation
+      token_secret_env: PROXMOX_TOKEN_SECRET
+    template_vmid: 9000
+    vmid_range:
+      min: 10000
+      max: 19999
+    storage:
+      disk: local-lvm
+      snippets: local
+    network:
+      bridge: vmbr0
+
+  nodes:
+    strategy: single
+    single_node: pve1
+
+  pool:
+    hot_size: 2
+    warm_size: 3
+    reconcile_interval: 10s
+    vm_max_age: 24h
+    drain_timeout: 30m
+    boot_max_attempts: 3
+    power_poll_interval: 3s
+
+  observability:
+    http_addr: ":9100"
+    log_level: info
+    log_format: json
+
+  admin_api:
+    http_addr: ":9101"
+    shared_secret_env: SCALESET_ADMIN_SECRET
+
+# ServiceMonitor for Prometheus-Operator users. Disabled by default
+# so the chart doesn't require the CRD; enable when the CRD is
+# installed in your cluster.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}

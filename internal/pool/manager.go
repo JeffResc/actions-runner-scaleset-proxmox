@@ -67,6 +67,15 @@ type Config struct {
 	TemplateNode string // returned by Provisioner.TemplateNode()
 	GuestAgentTO time.Duration
 
+	// VMIDReuseCooldown gates how soon after a destroy completes the
+	// allocator may reissue the same VMID. allocateVMID consults
+	// Provisioner.IsRecentlyDestroyed with this duration to skip
+	// VMIDs whose PVE-side qmdestroy task is still settling — without
+	// it, a fresh clone targets a VMID Proxmox is still tearing down
+	// and produces "VM N is running - destroy failed" + lock-file
+	// contention. Zero falls back to 30s.
+	VMIDReuseCooldown time.Duration
+
 	// OnRunnerOrphaned is invoked when the manager destroys a VM whose
 	// row had a runner_id set, i.e. a runner that was registered with
 	// GitHub. The callback is expected to deregister the runner. Best
@@ -141,6 +150,9 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 	}
 	if cfg.BootMaxAttempts <= 0 {
 		cfg.BootMaxAttempts = 3
+	}
+	if cfg.VMIDReuseCooldown <= 0 {
+		cfg.VMIDReuseCooldown = 30 * time.Second
 	}
 	if log == nil {
 		log = slog.Default()
@@ -595,7 +607,16 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 	//   (b) Burst response: when GitHub's desiredCount exceeds the
 	//       current in-flight runner count, scale up immediately.
 	// Effective need is the larger of the two.
-	available := stats.Available() + hotProv
+	//
+	// We add Provisioner.InFlightCloneCount() so a tick sees in-flight
+	// clones from PREVIOUS ticks whose store rows haven't landed yet
+	// (the gap between PVE qmclone returning and the manager's
+	// store.Insert call). Without this, two consecutive ticks each
+	// see an empty store and each spawn HotSize clones — producing
+	// the "current_hot=4 target=3" over-provision the production
+	// reproducer captured.
+	inflight := m.prov.InFlightCloneCount()
+	available := stats.Available() + hotProv + inflight
 	busy := stats.Busy()
 	desired := int(m.desiredCount.Load())
 
@@ -653,8 +674,20 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 	if burstTarget := desired - busy; burstTarget > hotTarget {
 		hotTarget = burstTarget
 	}
-	if stats.Hot > hotTarget {
-		excess := stats.Hot - hotTarget
+	// Re-snapshot Stats before evaluating shrink. The original `stats`
+	// read at the top of reconcileOnce may be milliseconds-to-seconds
+	// stale: Booting rows can have promoted to Hot while we were
+	// dispatching clones. Using the stale count to decide whether to
+	// shrink can both miss legitimate shrinks AND fire spurious ones.
+	// A fresh read here costs one extra store transaction per tick and
+	// makes the shrink decision based on the current truth. On error
+	// we just skip the shrink path for this tick — the stuck-state
+	// sweep below is independent and still worth running.
+	freshStats, statsErr := m.Stats(ctx)
+	if statsErr != nil {
+		m.log.Warn("reconcile: re-stats failed; skipping shrink this tick", "err", statsErr)
+	} else if freshStats.Hot > hotTarget {
+		excess := freshStats.Hot - hotTarget
 		hotRows, err := m.store.ListByState(store.StateHot)
 		if err == nil {
 			// Oldest first.
@@ -673,7 +706,7 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 					continue
 				}
 				m.log.Info("shrink: hot pool over target; destroying excess",
-					"vmid", row.VMID, "hot_size", m.cfg.HotSize, "target", hotTarget, "current_hot", stats.Hot)
+					"vmid", row.VMID, "hot_size", m.cfg.HotSize, "target", hotTarget, "current_hot", freshStats.Hot)
 				m.destroyAsync(row.VMID, row.Node)
 				killed++
 			}
@@ -1046,17 +1079,25 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	}
 }
 
-// allocateVMID returns the lowest VMID in the configured range that is not
-// already claimed by an existing row.
+// allocateVMID returns the lowest VMID in the configured range that is
+// not already claimed by an existing row AND has not been destroyed
+// within VMIDReuseCooldown. The cooldown check protects against a
+// fresh clone colliding with PVE's still-settling qmdestroy task on
+// the same ID (manifests as "VM N is running - destroy failed" and
+// lock-file timeouts).
 func (m *manager) allocateVMID(_ context.Context) (int, error) {
 	used, err := m.store.UsedVMIDs(m.cfg.VMIDRange.Min, m.cfg.VMIDRange.Max)
 	if err != nil {
 		return 0, err
 	}
 	for id := m.cfg.VMIDRange.Min; id <= m.cfg.VMIDRange.Max; id++ {
-		if _, taken := used[id]; !taken {
-			return id, nil
+		if _, taken := used[id]; taken {
+			continue
 		}
+		if m.prov.IsRecentlyDestroyed(id, m.cfg.VMIDReuseCooldown) {
+			continue
+		}
+		return id, nil
 	}
 	return 0, errors.New("vmid range exhausted")
 }

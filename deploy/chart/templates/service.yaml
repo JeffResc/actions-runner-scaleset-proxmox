@@ -1,0 +1,31 @@
+{{- /*
+Single Service selecting ALL orchestrator pods. The admin API
+reverse-proxies non-leader traffic to the leader (whose endpoint is
+published in a Lease annotation), so the Service doesn't filter on
+leadership. Prometheus scrapes /metrics on every replica; only the
+leader's scrape returns non-zero scaleset_pool_size etc.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "scaleset.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scaleset.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "scaleset.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
+      protocol: TCP

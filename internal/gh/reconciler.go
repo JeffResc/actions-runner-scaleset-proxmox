@@ -62,6 +62,13 @@ type Config struct {
 	// failure than an idle one.
 	AssignedOfflineGrace time.Duration
 
+	// OrphanGrace is how long a Proxmox VM may exist without a matching
+	// store row before sweepProxmoxOrphans destroys it. Must exceed the
+	// typical Clone → guest-agent-ready → JIT-inject worst case;
+	// otherwise the reconciler will destroy VMs the pool worker is
+	// still booting. Wired from config's pool.orphan_grace.
+	OrphanGrace time.Duration
+
 	// RunnerNamePrefix is the prefix our scaleset stamps on every
 	// runner name (e.g. "gh-runner-proxmox-ubuntu-x64-"). Runners NOT
 	// matching this prefix are ignored.
@@ -81,6 +88,9 @@ func (c Config) Validate() error {
 	}
 	if c.RunningIdleGrace <= 0 {
 		return errors.New("gh: running_idle_grace must be > 0")
+	}
+	if c.OrphanGrace <= 0 {
+		return errors.New("gh: orphan_grace must be > 0")
 	}
 	if c.RunnerNamePrefix == "" {
 		return errors.New("gh: runner_name_prefix must be set")
@@ -106,7 +116,17 @@ type Reconciler struct {
 	//
 	// Tick is single-threaded (called from Run), so no mutex needed.
 	orphanFirstSeen map[string]time.Time
-	now             func() time.Time // injected for tests
+
+	// orphanProxmoxFirstSeen mirrors orphanFirstSeen but for Proxmox
+	// VMs that the orchestrator sees in PVE without a matching store
+	// row. Without this grace, sweepProxmoxOrphans destroys VMs the
+	// pool worker has just cloned but hasn't yet booted+inserted —
+	// producing the "Configuration file does not exist" JIT-inject
+	// errors. Keys are VMIDs; entries are pruned when the VM
+	// reappears in the store rows snapshot.
+	orphanProxmoxFirstSeen map[int]time.Time
+
+	now func() time.Time // injected for tests
 }
 
 // New builds a Reconciler. The github.Client must already be authenticated
@@ -134,14 +154,15 @@ func New(cfg Config, gh *github.Client, p pool.Manager, prov provisioner.Provisi
 		cfg.AssignedOfflineGrace = 2 * time.Minute
 	}
 	return &Reconciler{
-		cfg:             cfg,
-		gh:              gh,
-		pool:            p,
-		prov:            prov,
-		log:             log,
-		metrics:         metrics,
-		orphanFirstSeen: make(map[string]time.Time),
-		now:             time.Now,
+		cfg:                    cfg,
+		gh:                     gh,
+		pool:                   p,
+		prov:                   prov,
+		log:                    log,
+		metrics:                metrics,
+		orphanFirstSeen:        make(map[string]time.Time),
+		orphanProxmoxFirstSeen: make(map[int]time.Time),
+		now:                    time.Now,
 	}, nil
 }
 
@@ -413,6 +434,16 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 // to drive it. The recovery flow at startup handles this once; the
 // reconciler does it every tick so out-of-band VMs (e.g., manual `qm
 // clone` of our template) get cleaned up too.
+//
+// The grace mirror of [cleanupOrphanRunners]: a Proxmox VM missing from
+// the store on its FIRST sight is recorded in orphanProxmoxFirstSeen
+// and left alone. Only after OrphanGrace elapses does the destroy
+// fire. Without the grace, the reconciler races the pool worker's
+// boot+inject pipeline and destroys VMs it just cloned (the captured
+// production failure: VM 10006 cloned at T=0, destroyed by this sweep
+// at T+70s, JIT inject at T+115s then failed with "Configuration file
+// does not exist"). Entries are pruned when the VM reappears in
+// `known` on a later tick.
 func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSnapshot) {
 	pmoxVMs, err := r.prov.ListOwnedVMs(ctx)
 	if err != nil {
@@ -423,14 +454,37 @@ func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSna
 	for _, row := range rows {
 		known[row.VMID] = struct{}{}
 	}
+
+	// Drop tracking for any VMID that has reappeared in the store so a
+	// future re-disappearance doesn't reuse the stale first-seen clock.
+	for vmid := range r.orphanProxmoxFirstSeen {
+		if _, ok := known[vmid]; ok {
+			delete(r.orphanProxmoxFirstSeen, vmid)
+		}
+	}
+
+	now := r.now()
 	for _, pv := range pmoxVMs {
 		if _, ok := known[pv.VMID]; ok {
 			continue
 		}
-		r.log.Warn("reconcile: orphan proxmox vm; destroying", "vmid", pv.VMID, "node", pv.Node)
+		first, seen := r.orphanProxmoxFirstSeen[pv.VMID]
+		if !seen {
+			r.orphanProxmoxFirstSeen[pv.VMID] = now
+			r.log.Debug("reconcile: tracking new proxmox orphan candidate",
+				"vmid", pv.VMID, "node", pv.Node, "grace", r.cfg.OrphanGrace)
+			continue
+		}
+		if now.Sub(first) < r.cfg.OrphanGrace {
+			continue
+		}
+		r.log.Warn("reconcile: orphan proxmox vm; destroying",
+			"vmid", pv.VMID, "node", pv.Node, "orphan_age", now.Sub(first))
 		if err := r.prov.Destroy(ctx, pv); err != nil {
 			r.log.Warn("reconcile: destroy orphan failed", "vmid", pv.VMID, "err", err)
+			continue
 		}
+		delete(r.orphanProxmoxFirstSeen, pv.VMID)
 	}
 }
 

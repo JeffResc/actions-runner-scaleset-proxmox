@@ -51,6 +51,12 @@ type Scaler struct {
 	prov    provisioner.Provisioner
 	log     *slog.Logger
 	metrics *observability.Metrics
+
+	// provisionOneFn is the per-VM mint+inject worker invoked from
+	// HandleDesiredRunnerCount. Defaults to the production
+	// provisionOne; tests override it to isolate the acquire/clamp
+	// logic from the GitHub + Proxmox call paths.
+	provisionOneFn func(ctx context.Context, vmObj *pool.VM) bool
 }
 
 // New constructs a Scaler.
@@ -61,7 +67,9 @@ func New(cfg Config, gh *scaleset.Client, p pool.Manager, prov provisioner.Provi
 	if cfg.WorkFolder == "" {
 		cfg.WorkFolder = "_work"
 	}
-	return &Scaler{cfg: cfg, gh: gh, pool: p, prov: prov, log: log, metrics: metrics}
+	s := &Scaler{cfg: cfg, gh: gh, pool: p, prov: prov, log: log, metrics: metrics}
+	s.provisionOneFn = s.provisionOne
+	return s
 }
 
 // HandleJobStarted is called when GitHub assigns a queued job to one of our
@@ -127,11 +135,29 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		return 0, nil
 	}
 
+	// Clamp to (count - already-busy). The actions/scaleset listener
+	// re-sends the absolute desired count on session refresh; without
+	// this clamp a repeated `desired=N` message acquires N MORE Hot
+	// VMs every time, which produces dead runners that wait the full
+	// assigned_grace before the GH reconciler force-destroys them. The
+	// contract is "I want N runners total active right now," not "give
+	// me N more."
+	busy := 0
+	if stats, err := s.pool.Stats(ctx); err == nil {
+		busy = stats.Busy()
+	} else {
+		s.log.Warn("acquire: stats lookup failed; proceeding without clamp", "err", err)
+	}
+	need := count - busy
+	if need <= 0 {
+		return 0, nil
+	}
+
 	// Pre-acquire serially: Acquire is cheap (single store write
 	// transaction), and serialising it surfaces pool exhaustion fast so
 	// we don't spin up worker goroutines for VMs we'll never get.
-	vms := make([]*pool.VM, 0, count)
-	for range count {
+	vms := make([]*pool.VM, 0, need)
+	for range need {
 		const jobID int64 = 0 // not yet known; JobStarted callback updates
 		vmObj, err := s.pool.Acquire(ctx, jobID)
 		if err != nil {
@@ -169,7 +195,7 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		go func() {
 			defer wg.Done()
 			defer sem.Release(1)
-			if s.provisionOne(ctx, vmObj) {
+			if s.provisionOneFn(ctx, vmObj) {
 				delivered.Add(1)
 			}
 		}()

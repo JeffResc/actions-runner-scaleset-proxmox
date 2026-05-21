@@ -3,6 +3,7 @@ package gh
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -135,6 +136,10 @@ type stubProv struct {
 	mu       sync.Mutex
 	owned    []*provisioner.VM
 	destroys []int
+
+	// destroyErr, when non-nil, is returned from every Destroy call —
+	// used to exercise the retry-on-failure branch of sweepProxmoxOrphans.
+	destroyErr error
 }
 
 func (s *stubProv) ListOwnedVMs(context.Context) ([]*provisioner.VM, error) {
@@ -146,7 +151,7 @@ func (s *stubProv) Destroy(_ context.Context, v *provisioner.VM) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.destroys = append(s.destroys, v.VMID)
-	return nil
+	return s.destroyErr
 }
 func (s *stubProv) Clone(context.Context, provisioner.CloneOptions) (*provisioner.VM, error) {
 	return nil, nil
@@ -163,9 +168,11 @@ func (s *stubProv) ReadAgentFile(context.Context, *provisioner.VM, string) ([]by
 func (s *stubProv) PowerState(context.Context, *provisioner.VM) (string, error) {
 	return "running", nil
 }
-func (s *stubProv) Ping(context.Context) error { return nil }
-func (s *stubProv) TemplateNode() string       { return "pve1" }
-func (s *stubProv) Client() *proxmox.Client    { return nil }
+func (s *stubProv) Ping(context.Context) error                  { return nil }
+func (s *stubProv) TemplateNode() string                        { return "pve1" }
+func (s *stubProv) Client() *proxmox.Client                     { return nil }
+func (s *stubProv) IsRecentlyDestroyed(int, time.Duration) bool { return false }
+func (s *stubProv) InFlightCloneCount() int                     { return 0 }
 
 func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -178,6 +185,7 @@ func baseCfg() Config {
 		AssignedGrace:        5 * time.Minute,
 		RunningIdleGrace:     30 * time.Second,
 		AssignedOfflineGrace: 2 * time.Minute,
+		OrphanGrace:          60 * time.Second,
 		RunnerNamePrefix:     "gh-runner-test-",
 	}
 }
@@ -522,7 +530,13 @@ func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T
 }
 
 // 13. Proxmox VM exists but no DB row → reconciler destroys it.
-func TestReconcile_ProxmoxOrphan_Destroys(t *testing.T) {
+// TestSweepProxmoxOrphans_RespectsOrphanGrace locks in the grace
+// behaviour: a Proxmox VM missing from the store on its first sight
+// must be RECORDED, not destroyed. Without the grace, the sweep
+// destroys VMs the pool worker has cloned but not yet booted+inserted
+// — producing "Configuration file <vmid>.conf does not exist"
+// JIT-inject errors when the boot pipeline catches up to a deleted VM.
+func TestSweepProxmoxOrphans_RespectsOrphanGrace(t *testing.T) {
 	t.Parallel()
 	srv := runnersServer(t, []fakeRunner{})
 	defer srv.Close()
@@ -533,9 +547,113 @@ func TestReconcile_ProxmoxOrphan_Destroys(t *testing.T) {
 	mgr := &fakeManager{rows: nil}
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), nil)
 	require.NoError(t, err)
-	require.NoError(t, r.Tick(context.Background()))
 
-	require.Equal(t, []int{4001}, prov.destroys)
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return t0 }
+
+	// Leg 1: first sight. The VM exists in PVE but not in the store;
+	// without the grace fix today's code would destroy immediately —
+	// the new behaviour is to record the first-seen timestamp and
+	// leave the VM alone for at least OrphanGrace.
+	require.NoError(t, r.Tick(context.Background()))
+	require.Empty(t, prov.destroys,
+		"first sight must NOT destroy — the VM may be a fresh clone whose store row hasn't landed yet")
+	require.Contains(t, r.orphanProxmoxFirstSeen, 4001,
+		"first sight must record the orphan candidate")
+
+	// Leg 2: still within grace. Advance partway through; no destroy.
+	r.now = func() time.Time { return t0.Add(30 * time.Second) }
+	require.NoError(t, r.Tick(context.Background()))
+	require.Empty(t, prov.destroys, "still within grace; must not destroy")
+
+	// Leg 3: past grace. Destroy fires.
+	r.now = func() time.Time { return t0.Add(baseCfg().OrphanGrace + time.Second) }
+	require.NoError(t, r.Tick(context.Background()))
+	require.Equal(t, []int{4001}, prov.destroys,
+		"past grace, the genuine orphan must be destroyed")
+}
+
+// TestSweepProxmoxOrphans_PreservesEntryWhenDestroyFails: if the
+// destroy call to PVE fails (transient PVE error, locked .conf, etc.),
+// the orphan-first-seen entry must remain so the NEXT tick retries.
+// Deleting the entry on failure would reset the grace clock and turn a
+// transient PVE outage into "we'll re-record this orphan every tick
+// for OrphanGrace seconds, then maybe try once more" — exactly the
+// kind of subtle data-loss bug that bites at scale.
+func TestSweepProxmoxOrphans_PreservesEntryWhenDestroyFails(t *testing.T) {
+	t.Parallel()
+	srv := runnersServer(t, []fakeRunner{})
+	defer srv.Close()
+
+	prov := &stubProv{
+		owned:      []*provisioner.VM{{VMID: 4003, Node: "pve1", Name: "gh-runner-test-4003"}},
+		destroyErr: errors.New("transient PVE failure"),
+	}
+	mgr := &fakeManager{rows: nil}
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), nil)
+	require.NoError(t, err)
+
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return t0 }
+
+	// First tick records the orphan.
+	require.NoError(t, r.Tick(context.Background()))
+	require.Contains(t, r.orphanProxmoxFirstSeen, 4003)
+
+	// Advance past grace and tick — destroy is attempted but fails.
+	r.now = func() time.Time { return t0.Add(baseCfg().OrphanGrace + time.Second) }
+	require.NoError(t, r.Tick(context.Background()))
+	require.Equal(t, []int{4003}, prov.destroys, "destroy must have been attempted")
+	require.Contains(t, r.orphanProxmoxFirstSeen, 4003,
+		"a failed destroy must NOT delete the first-seen entry — the next tick should retry")
+
+	// Tick again with the failure cleared — destroy succeeds and the
+	// entry is finally cleared.
+	prov.mu.Lock()
+	prov.destroyErr = nil
+	prov.mu.Unlock()
+	require.NoError(t, r.Tick(context.Background()))
+	require.Equal(t, []int{4003, 4003}, prov.destroys, "the next tick must retry the destroy")
+	require.NotContains(t, r.orphanProxmoxFirstSeen, 4003,
+		"after a successful destroy the first-seen entry is cleared")
+}
+
+// TestSweepProxmoxOrphans_ClearsEntryWhenVMReappearsInStore: when the
+// store row catches up before grace expires, the orphan-first-seen
+// entry must be cleared so the same VMID doesn't carry a stale grace
+// clock that fires later if the VM disappears again.
+func TestSweepProxmoxOrphans_ClearsEntryWhenVMReappearsInStore(t *testing.T) {
+	t.Parallel()
+	srv := runnersServer(t, []fakeRunner{})
+	defer srv.Close()
+
+	prov := &stubProv{
+		owned: []*provisioner.VM{{VMID: 4002, Node: "pve1", Name: "gh-runner-test-4002"}},
+	}
+	mgr := &fakeManager{rows: nil}
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), nil)
+	require.NoError(t, err)
+
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return t0 }
+
+	// First tick: orphan recorded.
+	require.NoError(t, r.Tick(context.Background()))
+	require.Contains(t, r.orphanProxmoxFirstSeen, 4002)
+
+	// Pool worker finishes its clone and the row appears in the store
+	// snapshot before grace expires. Subsequent tick MUST drop the
+	// stale orphan entry so a future absence doesn't reuse the old
+	// grace clock.
+	mgr.rows = []pool.RowSnapshot{{
+		VMID: 4002, Node: "pve1", Name: "gh-runner-test-4002",
+		State: "provisioning", CreatedAt: t0, StateSince: t0,
+	}}
+	r.now = func() time.Time { return t0.Add(10 * time.Second) }
+	require.NoError(t, r.Tick(context.Background()))
+	require.NotContains(t, r.orphanProxmoxFirstSeen, 4002,
+		"once the VM reappears in the store, its orphan-first-seen entry must be cleared")
+	require.Empty(t, prov.destroys, "no destroy should happen once the row catches up")
 }
 
 // 14. Runners whose name does NOT match our prefix are ignored

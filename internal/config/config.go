@@ -29,6 +29,7 @@ type Config struct {
 	Pool          PoolConfig          `yaml:"pool" validate:"required"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	AdminAPI      AdminAPIConfig      `yaml:"admin_api"`
+	Cluster       ClusterConfig       `yaml:"cluster"`
 }
 
 // GitHubConfig configures GitHub authentication, scope, and the
@@ -201,11 +202,35 @@ type PoolConfig struct {
 	// Default "3s"; must be > 0.
 	PowerPollInterval string `yaml:"power_poll_interval"`
 
+	// VMIDReuseCooldown is the minimum time after a destroy completes
+	// before the allocator may reissue the same VMID. Protects against
+	// PVE-side qmdestroy task settle / lock-file contention when a fresh
+	// clone targets a VMID that Proxmox is still tearing down. Default
+	// "30s"; must be > 0.
+	VMIDReuseCooldown string `yaml:"vmid_reuse_cooldown"`
+
+	// OrphanGrace is how long a Proxmox VM may exist without a matching
+	// store row before the GitHub reconciler's sweepProxmoxOrphans
+	// destroys it. Must exceed the typical Clone → guest-agent-ready →
+	// JIT-inject worst case; otherwise the reconciler will destroy
+	// VMs the pool worker is still booting. Default "60s"; must be > 0.
+	OrphanGrace string `yaml:"orphan_grace"`
+
+	// CloneInflightGrace is the TTL safety net for the Provisioner's
+	// in-flight clone tracker. Entries older than this are pruned in
+	// case Clone hangs and never returns to clear them. Should be
+	// comfortably longer than the worst-case Clone latency; default
+	// "5m"; must be > 0.
+	CloneInflightGrace string `yaml:"clone_inflight_grace"`
+
 	// Resolved durations (populated by Resolve).
-	ReconcileIntervalD time.Duration `yaml:"-"`
-	VMMaxAgeD          time.Duration `yaml:"-"`
-	DrainTimeoutD      time.Duration `yaml:"-"`
-	PowerPollIntervalD time.Duration `yaml:"-"`
+	ReconcileIntervalD  time.Duration `yaml:"-"`
+	VMMaxAgeD           time.Duration `yaml:"-"`
+	DrainTimeoutD       time.Duration `yaml:"-"`
+	PowerPollIntervalD  time.Duration `yaml:"-"`
+	VMIDReuseCooldownD  time.Duration `yaml:"-"`
+	OrphanGraceD        time.Duration `yaml:"-"`
+	CloneInflightGraceD time.Duration `yaml:"-"`
 }
 
 // ObservabilityConfig configures logging, metrics, and tracing endpoints.
@@ -240,6 +265,57 @@ type AdminAPIConfig struct {
 	HTTPAddr        string `yaml:"http_addr"`
 	SharedSecretEnv string `yaml:"shared_secret_env"`
 	SharedSecret    string `yaml:"-"`
+}
+
+// ClusterConfig selects the leader-election backend. In "standalone"
+// mode (the default) the process is always leader; multi-replica
+// deployment is unsupported. In "kubernetes" mode the process
+// participates in a coordination.k8s.io/v1 Lease via
+// k8s.io/client-go/tools/leaderelection and only runs the control
+// plane while it holds the Lease.
+type ClusterConfig struct {
+	// Mode is "standalone" (default) or "kubernetes".
+	Mode string `yaml:"mode" validate:"oneof=standalone kubernetes"`
+
+	// Kubernetes is only consulted when Mode == "kubernetes".
+	Kubernetes ClusterKubernetesConfig `yaml:"kubernetes"`
+}
+
+// ClusterKubernetesConfig configures the Lease-backed leader election.
+// All fields default to sensible values resolved from the Downward API
+// env vars POD_NAME / POD_NAMESPACE / POD_IP when present.
+type ClusterKubernetesConfig struct {
+	// LeaseName is the metadata.name of the Lease object. Defaults to
+	// "scaleset-<scaleset.name>" when empty.
+	LeaseName string `yaml:"lease_name"`
+
+	// LeaseNamespace is the metadata.namespace of the Lease. Defaults
+	// to $POD_NAMESPACE when empty.
+	LeaseNamespace string `yaml:"lease_namespace"`
+
+	// Identity uniquely identifies this replica in election logs and
+	// as the Lease holderIdentity. Defaults to $POD_NAME, then
+	// os.Hostname.
+	Identity string `yaml:"identity"`
+
+	// PodIP is this pod's IP, published alongside the admin port in
+	// the Lease annotation so standbys can reverse-proxy admin traffic
+	// to the leader. Defaults to $POD_IP.
+	PodIP string `yaml:"pod_ip"`
+
+	LeaseDuration string `yaml:"lease_duration"` // default 15s
+	RenewDeadline string `yaml:"renew_deadline"` // default 10s
+	RetryPeriod   string `yaml:"retry_period"`   // default  2s
+
+	// LeaderEndpointAnnotation is the Lease metadata.annotations key
+	// used to publish the leader's endpoint. Defaults to
+	// "scaleset.jeffresc.dev/leader-endpoint".
+	LeaderEndpointAnnotation string `yaml:"leader_endpoint_annotation"`
+
+	// Resolved durations (populated by Resolve).
+	LeaseDurationD time.Duration `yaml:"-"`
+	RenewDeadlineD time.Duration `yaml:"-"`
+	RetryPeriodD   time.Duration `yaml:"-"`
 }
 
 // Load reads, parses, defaults, env-resolves, and validates a YAML config
@@ -289,6 +365,15 @@ func (c *Config) ApplyDefaults() {
 	if c.Pool.PowerPollInterval == "" {
 		c.Pool.PowerPollInterval = "3s"
 	}
+	if c.Pool.VMIDReuseCooldown == "" {
+		c.Pool.VMIDReuseCooldown = "30s"
+	}
+	if c.Pool.OrphanGrace == "" {
+		c.Pool.OrphanGrace = "60s"
+	}
+	if c.Pool.CloneInflightGrace == "" {
+		c.Pool.CloneInflightGrace = "5m"
+	}
 	// Observability
 	if c.Observability.HTTPAddr == "" {
 		c.Observability.HTTPAddr = ":9100"
@@ -314,6 +399,22 @@ func (c *Config) ApplyDefaults() {
 		c.GitHub.AssignedOfflineGrace = "2m"
 	}
 	// Proxmox.Clone default is captured in CloneConfig.LinkedOrDefault.
+	// Cluster
+	if c.Cluster.Mode == "" {
+		c.Cluster.Mode = "standalone"
+	}
+	if c.Cluster.Kubernetes.LeaseDuration == "" {
+		c.Cluster.Kubernetes.LeaseDuration = "15s"
+	}
+	if c.Cluster.Kubernetes.RenewDeadline == "" {
+		c.Cluster.Kubernetes.RenewDeadline = "10s"
+	}
+	if c.Cluster.Kubernetes.RetryPeriod == "" {
+		c.Cluster.Kubernetes.RetryPeriod = "2s"
+	}
+	if c.Cluster.Kubernetes.LeaderEndpointAnnotation == "" {
+		c.Cluster.Kubernetes.LeaderEndpointAnnotation = "scaleset.jeffresc.dev/leader-endpoint"
+	}
 }
 
 // Resolve performs env-var expansion of secret-bearing fields and parses
@@ -393,6 +494,27 @@ func (c *Config) Resolve() error {
 	if c.Pool.PowerPollIntervalD <= 0 {
 		return errors.New("pool.power_poll_interval must be positive")
 	}
+	c.Pool.VMIDReuseCooldownD, err = time.ParseDuration(c.Pool.VMIDReuseCooldown)
+	if err != nil {
+		return fmt.Errorf("pool.vmid_reuse_cooldown: %w", err)
+	}
+	if c.Pool.VMIDReuseCooldownD <= 0 {
+		return errors.New("pool.vmid_reuse_cooldown must be positive")
+	}
+	c.Pool.OrphanGraceD, err = time.ParseDuration(c.Pool.OrphanGrace)
+	if err != nil {
+		return fmt.Errorf("pool.orphan_grace: %w", err)
+	}
+	if c.Pool.OrphanGraceD <= 0 {
+		return errors.New("pool.orphan_grace must be positive")
+	}
+	c.Pool.CloneInflightGraceD, err = time.ParseDuration(c.Pool.CloneInflightGrace)
+	if err != nil {
+		return fmt.Errorf("pool.clone_inflight_grace: %w", err)
+	}
+	if c.Pool.CloneInflightGraceD <= 0 {
+		return errors.New("pool.clone_inflight_grace must be positive")
+	}
 	c.GitHub.PollIntervalD, err = time.ParseDuration(c.GitHub.PollInterval)
 	if err != nil {
 		return fmt.Errorf("github.poll_interval: %w", err)
@@ -408,6 +530,65 @@ func (c *Config) Resolve() error {
 	c.GitHub.AssignedOfflineGraceD, err = time.ParseDuration(c.GitHub.AssignedOfflineGrace)
 	if err != nil {
 		return fmt.Errorf("github.assigned_offline_grace: %w", err)
+	}
+	// Cluster.
+	if err := c.resolveCluster(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolveCluster fills in defaults from the Downward API env vars when
+// the corresponding YAML fields are empty, parses durations, and
+// validates that "kubernetes" mode has the inputs it needs.
+func (c *Config) resolveCluster() error {
+	k := &c.Cluster.Kubernetes
+	if k.LeaseName == "" {
+		k.LeaseName = "scaleset-" + c.ScaleSet.Name
+	}
+	if k.LeaseNamespace == "" {
+		k.LeaseNamespace = os.Getenv("POD_NAMESPACE")
+	}
+	if k.Identity == "" {
+		if id := os.Getenv("POD_NAME"); id != "" {
+			k.Identity = id
+		} else if host, err := os.Hostname(); err == nil {
+			k.Identity = host
+		}
+	}
+	if k.PodIP == "" {
+		k.PodIP = os.Getenv("POD_IP")
+	}
+	var err error
+	k.LeaseDurationD, err = time.ParseDuration(k.LeaseDuration)
+	if err != nil {
+		return fmt.Errorf("cluster.kubernetes.lease_duration: %w", err)
+	}
+	k.RenewDeadlineD, err = time.ParseDuration(k.RenewDeadline)
+	if err != nil {
+		return fmt.Errorf("cluster.kubernetes.renew_deadline: %w", err)
+	}
+	k.RetryPeriodD, err = time.ParseDuration(k.RetryPeriod)
+	if err != nil {
+		return fmt.Errorf("cluster.kubernetes.retry_period: %w", err)
+	}
+	if c.Cluster.Mode == "kubernetes" {
+		switch {
+		case k.LeaseNamespace == "":
+			return errors.New("cluster.kubernetes.lease_namespace is required (set the field or $POD_NAMESPACE) when cluster.mode=kubernetes")
+		case k.Identity == "":
+			return errors.New("cluster.kubernetes.identity is required (set the field, $POD_NAME, or have a usable hostname) when cluster.mode=kubernetes")
+		case k.PodIP == "":
+			return errors.New("cluster.kubernetes.pod_ip is required (set the field or $POD_IP) when cluster.mode=kubernetes")
+		}
+		if k.RenewDeadlineD >= k.LeaseDurationD {
+			return fmt.Errorf("cluster.kubernetes.renew_deadline (%s) must be < lease_duration (%s)",
+				k.RenewDeadlineD, k.LeaseDurationD)
+		}
+		if k.RetryPeriodD >= k.RenewDeadlineD {
+			return fmt.Errorf("cluster.kubernetes.retry_period (%s) must be < renew_deadline (%s)",
+				k.RetryPeriodD, k.RenewDeadlineD)
+		}
 	}
 	return nil
 }

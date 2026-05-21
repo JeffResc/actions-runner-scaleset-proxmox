@@ -84,6 +84,24 @@ pool:
   # snappier end-of-job tail; higher = lighter Proxmox load.
   power_poll_interval: 3s
 
+  # Minimum time after a destroy completes before the VMID allocator
+  # may reissue the same ID. Protects against PVE-side qmdestroy task
+  # settle / lock-file contention: without it, a fresh clone targets
+  # a VMID Proxmox is still tearing down and produces
+  # "VM N is running - destroy failed" + lock-file timeouts.
+  vmid_reuse_cooldown: 30s
+
+  # Time a Proxmox VM may exist without a matching store row before
+  # the GitHub reconciler's orphan sweep destroys it. Must exceed the
+  # typical Clone -> guest-agent-ready -> JIT-inject worst case so the
+  # sweep doesn't kill VMs the pool worker is still booting.
+  orphan_grace: 60s
+
+  # TTL safety net for the Provisioner's in-flight clone tracker.
+  # Entries older than this are pruned by a background sweep in case
+  # Clone hangs and never returns to clear them.
+  clone_inflight_grace: 5m
+
 observability:
   http_addr: ":9100"              # exposes /metrics /healthz /readyz
   log_level: info                 # debug | info | warn | error
@@ -98,3 +116,25 @@ observability:
 admin_api:                        # optional escape hatch HTTP API
   # http_addr: "127.0.0.1:9101"
   # shared_secret_env: SCALESET_ADMIN_SECRET
+
+# Multi-replica deployment via Kubernetes leader election. Leave at the
+# default "standalone" for single-process / Docker / systemd. The
+# binary is identical in both modes — only this block changes.
+cluster:
+  mode: standalone                # standalone | kubernetes
+  # kubernetes:
+  #   # Defaults to "scaleset-<scaleset.name>". Two scale sets in the
+  #   # same namespace must use distinct lease_names.
+  #   lease_name: ""
+  #   # Defaults to $POD_NAMESPACE (Downward API).
+  #   lease_namespace: ""
+  #   # Defaults to $POD_NAME (Downward API), then os.Hostname.
+  #   identity: ""
+  #   # Defaults to $POD_IP (Downward API). Published in the Lease
+  #   # annotation so standbys can reverse-proxy admin requests to the
+  #   # leader without any other Kubernetes mutations.
+  #   pod_ip: ""
+  #   lease_duration: 15s
+  #   renew_deadline: 10s
+  #   retry_period: 2s
+  #   leader_endpoint_annotation: scaleset.jeffresc.dev/leader-endpoint

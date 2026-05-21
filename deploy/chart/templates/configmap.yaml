@@ -1,0 +1,23 @@
+{{- /*
+The chart force-overrides cluster.mode to "kubernetes" so a values
+file copied from the standalone example still ends up doing leader
+election. Everything else from .Values.scalesetConfig is passed
+through verbatim — see ../../config.example.yaml for the schema.
+*/ -}}
+{{- $cfg := deepCopy .Values.scalesetConfig -}}
+{{- $cluster := dict "mode" "kubernetes" -}}
+{{- if hasKey $cfg "cluster" -}}
+{{-   $cluster = merge $cluster (index $cfg "cluster") -}}
+{{- end -}}
+{{- $cluster := merge (dict "mode" "kubernetes") $cluster -}}
+{{- $_ := set $cfg "cluster" $cluster -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scaleset.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scaleset.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+{{ toYaml $cfg | indent 4 }}

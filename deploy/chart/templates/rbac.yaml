@@ -1,0 +1,39 @@
+{{- if .Values.rbac.create -}}
+# Leader-election RBAC. The orchestrator only touches the Lease it
+# creates — no pods, services, endpoints, configmaps, or secrets are
+# mutated by the controller, so the rest of your GitOps stack stays
+# in charge of those resources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "scaleset.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scaleset.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "scaleset.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "scaleset.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "scaleset.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "scaleset.fullname" . }}-leader-election
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

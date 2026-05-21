@@ -142,9 +142,10 @@ func TestMetrics_RateLimitObserver(t *testing.T) {
 	require.InDelta(t, 1.0, got["scaleset_gh_api_calls_total:endpoint=jobs:status=2xx"], 0.001)
 }
 
-func TestHealth_TransitionsToReady(t *testing.T) {
+func TestHealth_LeaderTransitionsToReady(t *testing.T) {
 	t.Parallel()
 	h := observability.NewHealth(time.Minute)
+	h.MarkLeader(true)
 	require.False(t, h.Ready())
 
 	h.MarkListenerConnected()
@@ -160,12 +161,52 @@ func TestHealth_TransitionsToReady(t *testing.T) {
 func TestHealth_StaleProxmox(t *testing.T) {
 	t.Parallel()
 	h := observability.NewHealth(10 * time.Millisecond)
+	h.MarkLeader(true)
 	h.MarkListenerConnected()
 	h.MarkRecoveryDone()
 	h.MarkProxmoxOK()
 	require.True(t, h.Ready())
 
 	time.Sleep(20 * time.Millisecond)
+	require.False(t, h.Ready())
+}
+
+// Standby readiness: a non-leader doesn't need listener/recovery — it
+// just needs Proxmox reachable so it can take over cleanly. Without
+// this, /readyz on a standby pod would flap and the K8s Service would
+// drop it from its endpoint pool, defeating the purpose of warm
+// standbys.
+func TestHealth_StandbyReadyOnProxmoxAlone(t *testing.T) {
+	t.Parallel()
+	h := observability.NewHealth(time.Minute)
+	require.False(t, h.Ready(), "no Proxmox observed yet → not ready")
+
+	h.MarkProxmoxOK()
+	require.True(t, h.Ready(), "standby with Proxmox reachable should be ready")
+}
+
+// On deposal the listener-connected and recovery-done gates are
+// cleared so a freshly demoted replica doesn't carry stale leader-only
+// gates into its standby life.
+func TestHealth_ClearGatesOnDeposal(t *testing.T) {
+	t.Parallel()
+	h := observability.NewHealth(time.Minute)
+	h.MarkLeader(true)
+	h.MarkListenerConnected()
+	h.MarkRecoveryDone()
+	h.MarkProxmoxOK()
+	require.True(t, h.Ready())
+
+	// Simulate cluster.Coordinator's OnDeposed work.
+	h.MarkLeader(false)
+	h.ClearListenerConnected()
+	h.ClearRecoveryDone()
+	// Standby readiness only requires Proxmox, which is still fresh.
+	require.True(t, h.Ready())
+
+	// Re-elect: leader-only gates must be re-asserted before /readyz
+	// flips green again under leader semantics.
+	h.MarkLeader(true)
 	require.False(t, h.Ready())
 }
 
@@ -214,6 +255,7 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 
+	h.MarkLeader(true)
 	h.MarkListenerConnected()
 	h.MarkRecoveryDone()
 	h.MarkProxmoxOK()

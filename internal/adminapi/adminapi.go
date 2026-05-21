@@ -38,11 +38,30 @@ type Config struct {
 	SharedSecret string
 }
 
+// LeaderGate decouples the admin API from internal/cluster. The admin
+// HTTP server runs on every replica in multi-replica deployments; when
+// this replica is not the leader IsLeader returns false and the
+// middleware dispatches the request to Forward, which is expected to
+// be a reverse-proxy to the leader's pod. Both methods may be called
+// concurrently. The standalone Coordinator returns IsLeader()==true
+// and Forward is never invoked.
+type LeaderGate interface {
+	IsLeader() bool
+	Forward(w http.ResponseWriter, r *http.Request)
+}
+
+// PoolAccessor returns the current pool.Manager or nil when this
+// replica is not leader. The admin API uses it instead of holding a
+// direct *pool.Manager because the manager is constructed lazily inside
+// the cluster.Coordinator's OnElected callback.
+type PoolAccessor func() pool.Manager
+
 // Server is the admin API.
 type Server struct {
 	cfg  Config
-	pool pool.Manager
+	pool PoolAccessor
 	prov provisioner.Provisioner
+	gate LeaderGate
 	log  *slog.Logger
 
 	// drain is invoked from POST /admin/drain. Typically wired by main()
@@ -126,14 +145,35 @@ func remoteIP(remoteAddr string) string {
 // New builds a Server. Caller invokes Serve to start listening. The
 // optional `drain` callback is invoked when an operator POSTs
 // /admin/drain; pass a closure over your root context's cancel function.
-func New(cfg Config, p pool.Manager, prov provisioner.Provisioner, drain func(), log *slog.Logger) *Server {
+//
+// gate must report leadership and reverse-proxy non-leader requests; in
+// standalone deployments use [AlwaysLeader] (or any LeaderGate whose
+// IsLeader always returns true). poolFn returns the current
+// pool.Manager — nil when not leader.
+func New(cfg Config, poolFn PoolAccessor, prov provisioner.Provisioner, gate LeaderGate, drain func(), log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
+	if gate == nil {
+		gate = AlwaysLeader{}
+	}
 	return &Server{
-		cfg: cfg, pool: p, prov: prov, drain: drain, log: log,
+		cfg: cfg, pool: poolFn, prov: prov, gate: gate, drain: drain, log: log,
 		authFailLimiter: newPerIPLimiter(rate.Limit(authFailRPS), authFailBurst, authFailIdle),
 	}
+}
+
+// AlwaysLeader is a LeaderGate that always reports leadership. Used by
+// standalone deployments. Forward is never called and panics if it is;
+// any caller using AlwaysLeader has misconfigured the gate.
+type AlwaysLeader struct{}
+
+// IsLeader always returns true.
+func (AlwaysLeader) IsLeader() bool { return true }
+
+// Forward must never be called when IsLeader returns true.
+func (AlwaysLeader) Forward(_ http.ResponseWriter, _ *http.Request) {
+	panic("adminapi: AlwaysLeader.Forward called — middleware should never forward when always-leader")
 }
 
 // Serve runs the admin HTTP server until ctx is cancelled or it errors.
@@ -152,6 +192,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	r.Use(middleware.RealIP)
 	r.Use(s.accessLog)
 	r.Use(s.maxBody(64 * 1024)) // 64 KiB cap on any admin request body
+	// Forward-to-leader runs BEFORE bearer-token auth: when a standby
+	// proxies a request, the leader does its own auth. Authenticating
+	// twice (once on the standby, once on the leader) would force the
+	// standby to know the shared secret, which is unnecessary and
+	// expands the secret blast radius across replicas.
+	r.Use(s.leaderOrForward)
 	r.Use(s.requireBearerToken)
 	r.Get("/admin/state", s.handleState)
 	r.Post("/admin/drain", s.handleDrain)
@@ -217,6 +263,21 @@ func (s *Server) maxBody(limit int64) func(http.Handler) http.Handler {
 	}
 }
 
+// leaderOrForward gates every admin request on leadership: leaders
+// serve locally, non-leaders hand off to the gate's Forward method
+// (typically a reverse-proxy to the leader's pod published in the
+// Lease annotation). Runs before requireBearerToken so a standby never
+// needs the shared secret.
+func (s *Server) leaderOrForward(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.gate.IsLeader() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		s.gate.Forward(w, r)
+	})
+}
+
 // requireBearerToken enforces a shared-secret bearer token on every admin
 // request. Both presented token and configured secret are hashed with
 // SHA-256 before constant-time comparison — comparing the raw bytes
@@ -271,7 +332,15 @@ type stateResponse struct {
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.pool.Stats(r.Context())
+	p := s.pool()
+	if p == nil {
+		// We passed the leader gate yet the pool is nil — race during
+		// election handover. Tell the caller to retry rather than 500.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+		return
+	}
+	stats, err := p.Stats(r.Context())
 	if err != nil {
 		s.log.Error("admin state: pool stats failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -304,12 +373,18 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
 		return
 	}
+	p := s.pool()
+	if p == nil {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+		return
+	}
 	// ForceDestroy (not MarkCompleted): MarkCompleted only acts on
 	// Assigned/Running rows and silently no-ops elsewhere, which means
 	// an operator targeting a Hot/Warm/Booting VM would get 202 with no
 	// effect. ForceDestroy is the unconditional drop the endpoint
 	// promises.
-	if err := s.pool.ForceDestroy(r.Context(), vmid, "admin destroy endpoint"); err != nil {
+	if err := p.ForceDestroy(r.Context(), vmid, "admin destroy endpoint"); err != nil {
 		s.log.Error("admin destroy: force destroy failed", "vmid", vmid, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
