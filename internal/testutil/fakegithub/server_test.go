@@ -8,7 +8,7 @@ import (
 	"github.com/google/go-github/v84/github"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/testutil/fakegithub"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakegithub"
 )
 
 // newGitHubClient builds a github.Client pointed at the fake by
