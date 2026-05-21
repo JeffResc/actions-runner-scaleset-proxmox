@@ -211,12 +211,12 @@ func (s *standalone) LeaderEndpoint(_ context.Context) (string, error) {
 // ---------------------------------------------------------------------------
 
 type kubeCoord struct {
-	cfg     Config
-	cb      Callbacks
-	client  kubernetes.Interface
-	log     *slog.Logger
-	leader  atomic.Bool
-	cache   leaderEndpointCache
+	cfg    Config
+	cb     Callbacks
+	client kubernetes.Interface
+	log    *slog.Logger
+	leader atomic.Bool
+	cache  leaderEndpointCache
 }
 
 // NewKubernetes returns a Coordinator backed by a coordination.k8s.io/v1

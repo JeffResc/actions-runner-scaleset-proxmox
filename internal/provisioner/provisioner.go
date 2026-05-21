@@ -740,8 +740,7 @@ func classifyProxmoxError(err error) error {
 	if errors.Is(err, proxmox.ErrNotFound) {
 		return fmt.Errorf("%w: %w", ErrVMNotFound, err)
 	}
-	switch httpStatusFromError(err) {
-	case http.StatusNotFound:
+	if httpStatusFromError(err) == http.StatusNotFound {
 		return fmt.Errorf("%w: %w", ErrVMNotFound, err)
 	}
 	s := err.Error()

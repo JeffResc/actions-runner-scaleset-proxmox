@@ -235,10 +235,10 @@ type PoolConfig struct {
 
 // ObservabilityConfig configures logging, metrics, and tracing endpoints.
 type ObservabilityConfig struct {
-	HTTPAddr  string         `yaml:"http_addr"`
-	LogLevel  string         `yaml:"log_level" validate:"oneof=debug info warn error"`
-	LogFormat string         `yaml:"log_format" validate:"oneof=json text"`
-	Tracing   TracingConfig  `yaml:"tracing"`
+	HTTPAddr  string        `yaml:"http_addr"`
+	LogLevel  string        `yaml:"log_level" validate:"oneof=debug info warn error"`
+	LogFormat string        `yaml:"log_format" validate:"oneof=json text"`
+	Tracing   TracingConfig `yaml:"tracing"`
 }
 
 // TracingConfig enables OTLP/HTTP trace export. Disabled when Endpoint

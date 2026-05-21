@@ -30,8 +30,8 @@ type fakePool struct {
 func (f *fakePool) Acquire(_ context.Context, _ int64) (*pool.VM, error) {
 	return nil, pool.ErrNoneAvailable
 }
-func (f *fakePool) MarkRunning(_ context.Context, _ int, _ int64) error  { return nil }
-func (f *fakePool) SetRunnerID(_ context.Context, _ int, _ int64) error  { return nil }
+func (f *fakePool) MarkRunning(_ context.Context, _ int, _ int64) error { return nil }
+func (f *fakePool) SetRunnerID(_ context.Context, _ int, _ int64) error { return nil }
 func (f *fakePool) MarkCompleted(_ context.Context, vmid int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -250,11 +250,11 @@ func (g *fakeGate) Forward(w http.ResponseWriter, r *http.Request) {
 // TestLeaderGate_NonLeaderForwardsBeforeAuth verifies the two critical
 // properties of the leader-or-forward middleware:
 //
-//   1. A standby forwards the request before requireBearerToken runs,
-//      so the standby never needs the shared secret.
-//   2. The forward handler observes the original request — including
-//      headers — so a reverse-proxy implementation can preserve
-//      X-Forwarded-For and other proxy chain headers.
+//  1. A standby forwards the request before requireBearerToken runs,
+//     so the standby never needs the shared secret.
+//  2. The forward handler observes the original request — including
+//     headers — so a reverse-proxy implementation can preserve
+//     X-Forwarded-For and other proxy chain headers.
 func TestLeaderGate_NonLeaderForwardsBeforeAuth(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{stats: pool.Stats{Hot: 1}}

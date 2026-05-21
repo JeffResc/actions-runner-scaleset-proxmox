@@ -19,8 +19,13 @@ func discardLogger() *slog.Logger {
 // TestInitTracer_DisabledNoEndpoint: when no endpoint is configured, the
 // shutdown function is a no-op and the global tracer stays as the no-op
 // implementation. Instrumented code paths therefore stay cheap.
+// All three tracer tests share otel's global TracerProvider via
+// observability.InitTracer → otel.SetTracerProvider. Running them in
+// parallel lets one test's SetTracerProvider win after another's, so the
+// span the second test reads back doesn't reflect the sampler that test
+// installed. Keep them sequential.
+
 func TestInitTracer_DisabledNoEndpoint(t *testing.T) {
-	t.Parallel()
 	shutdown, err := observability.InitTracer(context.Background(),
 		observability.TracingOptions{}, discardLogger())
 	require.NoError(t, err)
@@ -41,7 +46,6 @@ func TestInitTracer_DisabledNoEndpoint(t *testing.T) {
 // branch logic fell through to AlwaysSample for any value not strictly
 // between 0 and 1, which silently turned 0 into 100%.
 func TestInitTracer_ZeroRatioMeansNeverSample(t *testing.T) {
-	t.Parallel()
 	shutdown, err := observability.InitTracer(context.Background(),
 		observability.TracingOptions{
 			Endpoint:       "127.0.0.1:1",
@@ -70,7 +74,6 @@ func TestInitTracer_ZeroRatioMeansNeverSample(t *testing.T) {
 // a real OTLP collector — the exporter just buffers and the BatchSpan
 // processor's flush during shutdown is what we exercise.
 func TestInitTracer_EnabledBuildsProvider(t *testing.T) {
-	t.Parallel()
 	// Point at a guaranteed-unused localhost port; the exporter doesn't
 	// fail-fast on connectivity so we still get a working provider.
 	shutdown, err := observability.InitTracer(context.Background(),

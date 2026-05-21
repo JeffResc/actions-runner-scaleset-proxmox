@@ -412,10 +412,13 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 		// announced yet.
 		m.SignalRefill()
 		return nil
-	default:
-		// Hot / Warm / Booting / Provisioning / Poison: a runner-hook
-		// "completed" event for a row in these states is either a
-		// spoof or a wildly stale retry. Refuse.
+	case store.StateProvisioning,
+		store.StateWarm,
+		store.StateBooting,
+		store.StateHot,
+		store.StatePoison:
+		// A runner-hook "completed" event for a row in any of these
+		// states is either a spoof or a wildly stale retry. Refuse.
 		m.log.Warn("mark completed: refused for non-busy row",
 			"vmid", vmid, "state", target.State)
 		return nil

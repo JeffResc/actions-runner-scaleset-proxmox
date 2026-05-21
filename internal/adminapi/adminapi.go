@@ -221,6 +221,20 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		errCh <- nil
 	}()
+	// Sweep idle per-IP rate-limit entries so the limiters map can't
+	// grow unboundedly under sustained attack from many unique IPs.
+	go func() {
+		t := time.NewTicker(authFailIdle)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				s.authFailLimiter.sweep(now)
+			}
+		}
+	}()
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
