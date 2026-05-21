@@ -220,7 +220,7 @@ func NewAppFromFile(clientID string, installationID int64, pemPath string) (Auth
 		return nil, fmt.Errorf("githubauth: private key %s has insecure mode %#o; expected 0600 (chmod 600 the file)",
 			pemPath, mode)
 	}
-	pem, err := os.ReadFile(pemPath)
+	pem, err := os.ReadFile(pemPath) // #nosec G304 -- pemPath is operator-supplied and perm-checked above.
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: read private key %s: %w", pemPath, err)
 	}
