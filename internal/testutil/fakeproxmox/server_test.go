@@ -235,6 +235,26 @@ func TestServer_GuestAgentDelay(t *testing.T) {
 	}, 1*time.Second, 10*time.Millisecond)
 }
 
+// TestServer_FaultRegistrationSmoke exercises the fault-injection
+// scaffolding so it compiles, can be registered, and clears cleanly.
+// The per-handler matching that consumes these faults lands with P4
+// (failure-injection scenarios); this smoke test keeps the public
+// surface tested in the interim.
+func TestServer_FaultRegistrationSmoke(t *testing.T) {
+	t.Parallel()
+	srv := fakeproxmox.New(t, fakeproxmox.Options{})
+
+	srv.InjectFault(fakeproxmox.Fault{
+		Kind:     fakeproxmox.FaultGuestAgentNotReady,
+		VMID:     10042,
+		Duration: 50 * time.Millisecond,
+	})
+	srv.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultVMNotFoundOnDestroy, VMID: 10042})
+	srv.ClearFaults()
+	// No panic == pass. Until P4 wires faults into handlers, that's
+	// the only invariant available at this layer.
+}
+
 func TestServer_ListVMsByNode(t *testing.T) {
 	t.Parallel()
 	srv := fakeproxmox.New(t, fakeproxmox.Options{
