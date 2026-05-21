@@ -45,7 +45,10 @@ jobs:
       - name: Run deadcode
         run: |
           go install golang.org/x/tools/cmd/deadcode@v0.30.0
-          out=$(deadcode ./...)
+          # -test treats test files as call sites, which is required
+          # for internal/testutil/ packages whose only consumers are
+          # _test.go files.
+          out=$(deadcode -test ./...)
           if [ -n "$out" ]; then
             echo "deadcode found unreachable functions:"
             echo "$out"
