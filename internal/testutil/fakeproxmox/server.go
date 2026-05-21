@@ -20,6 +20,7 @@ package fakeproxmox
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -171,11 +172,18 @@ func writeData(w http.ResponseWriter, payload any) {
 
 // writeError replies with the given HTTP status and body. Proxmox 5xx
 // responses use a plain-text body; the orchestrator's error
-// classification matches on substrings (see provisioner.go).
+// classification matches on substrings (see provisioner.go). Body
+// strings are always constructed by handlers in this package — never
+// reflected from request input — so the gosec G705 XSS rule does not
+// apply here.
 func writeError(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
-	_, _ = w.Write([]byte(body))
+	// #nosec G705 -- body is hard-coded or constructed from typed
+	// path parameters (node names, vmids); never echoed from
+	// untrusted request input. The Content-Type is text/plain so
+	// browsers won't execute it even if it were tainted.
+	_, _ = io.WriteString(w, body)
 }
 
 // vmidParam parses {vmid} from the URL.
@@ -430,7 +438,7 @@ func (s *Server) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 		exit = "OK"
 	}
 	writeData(w, map[string]any{
-		"upid":       string(t.UPID),
+		"upid":       t.UPID,
 		"type":       t.Type,
 		"id":         t.ID,
 		"status":     status,
