@@ -1,8 +1,8 @@
 # Compiled binaries
 /bin/
 /dist/
-scaleset
-scaleset.exe
+/scaleset
+/scaleset.exe
 
 # Go test/coverage artifacts
 *.test
