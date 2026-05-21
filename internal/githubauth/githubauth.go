@@ -127,8 +127,8 @@ type appAuth struct {
 
 // NewApp constructs an App-based Auth from a Client ID string. The scaleset
 // library accepts either a Client ID (e.g. "Iv23..." style) or the numeric
-// App ID as a string; if you have only the numeric App ID use
-// [NewAppFromAppID].
+// App ID as a string — callers with only the numeric ID should
+// strconv.FormatInt it before calling.
 func NewApp(clientID string, installationID int64, privateKeyPEM []byte) (Auth, error) {
 	if clientID == "" {
 		return nil, errors.New("githubauth: app client_id is required")
