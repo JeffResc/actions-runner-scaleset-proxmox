@@ -28,9 +28,9 @@ import (
 	"github.com/actions/scaleset/listener"
 	"golang.org/x/sync/semaphore"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
 )
 
 // Compile-time assertion that *Scaler satisfies the listener.Scaler contract.

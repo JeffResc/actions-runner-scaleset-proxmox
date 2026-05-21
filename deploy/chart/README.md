@@ -1,6 +1,6 @@
 # scaleset Helm chart
 
-Deploys [github-actions-proxmox-scaleset](https://github.com/jeffresc/github-actions-proxmox-scaleset) as N replicas in Kubernetes with `coordination.k8s.io/v1` Lease-based leader election. One replica drives the GitHub WebSocket session, the Proxmox VM pool, and the REST reconciler at any time; the rest are warm standbys that take over on Lease expiry, rebuilding their in-memory state from Proxmox via the same `pool.Manager.Recover` path used for crash recovery.
+Deploys [actions-runner-scaleset-proxmox](https://github.com/jeffresc/actions-runner-scaleset-proxmox) as N replicas in Kubernetes with `coordination.k8s.io/v1` Lease-based leader election. One replica drives the GitHub WebSocket session, the Proxmox VM pool, and the REST reconciler at any time; the rest are warm standbys that take over on Lease expiry, rebuilding their in-memory state from Proxmox via the same `pool.Manager.Recover` path used for crash recovery.
 
 The chart is **GitOps-safe**: the only Kubernetes object the controller writes is the Lease it creates for itself, and the in-process forwarder routes admin traffic to the leader without label, endpoint, or pod mutations. Flux and Argo CD won't fight you.
 

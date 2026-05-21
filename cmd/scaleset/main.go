@@ -27,17 +27,17 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/adminapi"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/cluster"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/config"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/gh"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/githubauth"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/nodeselector"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/pool"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/provisioner"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/scaler"
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/store"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/adminapi"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/cluster"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/gh"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/scaler"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
 )
 
 // version is overridden via -ldflags at build time.
@@ -115,7 +115,7 @@ func runOrchestrator(configPath string, dryRun, allowPartialRecovery bool) error
 		Endpoint:       cfg.Observability.Tracing.Endpoint,
 		Insecure:       cfg.Observability.Tracing.Insecure,
 		SampleRatio:    cfg.Observability.Tracing.SampleRatio,
-		ServiceName:    "github-actions-proxmox-scaleset",
+		ServiceName:    "actions-runner-scaleset-proxmox",
 		ServiceVersion: version,
 	}, log)
 	if err != nil {
@@ -175,7 +175,7 @@ func runOrchestrator(configPath string, dryRun, allowPartialRecovery bool) error
 	}
 	scope := githubauth.Scope{Org: cfg.GitHub.Scope.Org, Repo: cfg.GitHub.Scope.Repo}
 	sysInfo := scaleset.SystemInfo{
-		System:    "github-actions-proxmox-scaleset",
+		System:    "actions-runner-scaleset-proxmox",
 		Version:   version,
 		CommitSHA: "",
 	}

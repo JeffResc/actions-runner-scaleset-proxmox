@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/tags"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
 func TestOwnerTag_Sanitizes(t *testing.T) {

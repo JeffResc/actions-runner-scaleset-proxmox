@@ -33,7 +33,7 @@ func redactEndpoint(endpoint string) string {
 // TracerName is the canonical instrumentation-scope name. Use this when
 // fetching a tracer (e.g. otel.Tracer(observability.TracerName)) so all
 // spans land under one consistent name in the backend.
-const TracerName = "github.com/jeffresc/github-actions-proxmox-scaleset"
+const TracerName = "github.com/jeffresc/actions-runner-scaleset-proxmox"
 
 // TracingOptions configure the OTLP/HTTP exporter. An empty Endpoint
 // disables tracing (the global tracer becomes the no-op tracer, so

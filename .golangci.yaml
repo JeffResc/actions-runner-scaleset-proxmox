@@ -73,4 +73,4 @@ formatters:
       simplify: true
     goimports:
       local-prefixes:
-        - github.com/jeffresc/github-actions-proxmox-scaleset
+        - github.com/jeffresc/actions-runner-scaleset-proxmox

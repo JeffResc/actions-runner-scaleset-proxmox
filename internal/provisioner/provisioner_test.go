@@ -18,7 +18,7 @@ import (
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 )
 
 // quietLogger discards all log output.

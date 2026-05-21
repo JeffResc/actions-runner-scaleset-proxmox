@@ -1,6 +1,6 @@
 [Unit]
 Description=Watch for the GitHub Actions JIT runner config file
-Documentation=https://github.com/jeffresc/github-actions-proxmox-scaleset
+Documentation=https://github.com/jeffresc/actions-runner-scaleset-proxmox
 
 [Path]
 # The orchestrator writes a systemd env file at this path via the

@@ -14,7 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jeffresc/github-actions-proxmox-scaleset/internal/observability"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 )
 
 func TestNewLogger_JSONAndText(t *testing.T) {
