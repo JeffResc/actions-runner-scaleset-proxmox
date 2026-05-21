@@ -673,7 +673,7 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 			continue
 		}
 		for _, v := range vms {
-			vmid := int(v.VMID)
+			vmid := int(v.VMID) // #nosec G115 -- VMIDs are bounded by VMIDRange (typically 10000..19999); overflow unreachable.
 			owned := tags.IsOwnedBy(v.Tags, p.scaleSetName)
 			// Untagged orphan detection — both predicates must hold so
 			// we never reap a human-created VM that just happens to
