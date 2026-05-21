@@ -1,0 +1,34 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List available tasks.
+    cmds:
+      - task --list
+    silent: true
+
+  test:
+    desc: Run unit tests with the race detector (no build tags).
+    cmds:
+      - go test -race ./...
+
+  e2e:
+    desc: Run the in-process e2e suite against fake Proxmox and fake GitHub.
+    cmds:
+      - go test -tags=e2e -race -timeout=10m ./test/e2e/... ./internal/provisioner/...
+
+  e2e-packer:
+    desc: Shell out to the Packer CLI to syntax-check the HCL. Skips when `packer` is not installed.
+    cmds:
+      - go test -tags=packer ./packer/...
+
+  build:
+    desc: Compile the orchestrator binary into ./bin/scaleset.
+    cmds:
+      - mkdir -p bin
+      - go build -o bin/scaleset ./cmd/scaleset
+
+  lint:
+    desc: Run golangci-lint over the module.
+    cmds:
+      - golangci-lint run ./...
