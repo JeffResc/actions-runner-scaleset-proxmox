@@ -78,6 +78,7 @@ func TestNewMetrics_RegistersAll(t *testing.T) {
 	m.GHRateLimitRemaining.Set(4999)
 	m.GHStateMismatch.WithLabelValues("assigned", "missing", "destroy").Inc()
 	m.RunnerHookEvents.WithLabelValues("started", "ok").Inc()
+	m.Leader.Set(1)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -101,9 +102,37 @@ func TestNewMetrics_RegistersAll(t *testing.T) {
 		"scaleset_gh_rate_limit_remaining",
 		"scaleset_gh_runner_state_mismatch_total",
 		"scaleset_runner_hook_events_total",
+		"scaleset_leader",
 	} {
 		require.Truef(t, names[want], "missing metric %s", want)
 	}
+}
+
+// TestLeaderGauge_Transitions confirms the gauge flips 0 → 1 → 0 as
+// the app's leader callbacks fire. The gauge is the assertable signal
+// e2e tests use to identify which replica currently holds the lease.
+func TestLeaderGauge_Transitions(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := observability.NewMetrics(reg)
+
+	read := func() float64 {
+		families, err := reg.Gather()
+		require.NoError(t, err)
+		for _, f := range families {
+			if *f.Name == "scaleset_leader" {
+				return *f.Metric[0].Gauge.Value
+			}
+		}
+		t.Fatal("scaleset_leader metric not found")
+		return 0
+	}
+
+	require.Equal(t, 0.0, read(), "initial value must be zero (standby)")
+	m.Leader.Set(1)
+	require.Equal(t, 1.0, read(), "after acquiring leadership")
+	m.Leader.Set(0)
+	require.Equal(t, 0.0, read(), "after losing leadership")
 }
 
 // TestMetrics_RateLimitObserver verifies *Metrics satisfies the

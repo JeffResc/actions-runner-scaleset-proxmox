@@ -282,6 +282,7 @@ func Run(ctx context.Context, opts Options) error {
 	cbCallbacks := cluster.Callbacks{
 		OnElected: func(leaderCtx context.Context) {
 			health.MarkLeader(true)
+			metrics.Leader.Set(1)
 			if err := runLeaderPlane(leaderCtx); err != nil {
 				log.Error("leader plane failed; shutting down", "err", err)
 				cancel()
@@ -289,6 +290,7 @@ func Run(ctx context.Context, opts Options) error {
 		},
 		OnDeposed: func() {
 			health.MarkLeader(false)
+			metrics.Leader.Set(0)
 			health.ClearListenerConnected()
 			health.ClearRecoveryDone()
 		},
