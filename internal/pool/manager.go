@@ -627,9 +627,18 @@ func (m *manager) runPowerPoll(ctx context.Context) {
 	}
 }
 
+// powerPollTimeoutPerVM caps how long a single per-VM PowerState call
+// may block. Without it, one stuck Proxmox node would pin the entire
+// poll pass for up to the underlying HTTP client's 60s timeout per VM,
+// stalling job-completion detection across the rest of the fleet.
+// Mirrors templateDiscoveryTimeoutPerNode in the provisioner package.
+// Tests may override this.
+var powerPollTimeoutPerVM = 5 * time.Second
+
 // powerPollOnce does a single pass over Assigned/Running rows. Exposed
 // (lower-case) so tests can drive it deterministically without spinning
-// the time-based Run loop.
+// the time-based Run loop. Each per-VM PowerState call is bounded by
+// powerPollTimeoutPerVM so a single hung node can't freeze the poller.
 func (m *manager) powerPollOnce(ctx context.Context) {
 	rows, err := m.store.ListByState(store.StateAssigned, store.StateRunning)
 	if err != nil {
@@ -637,9 +646,11 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 		return
 	}
 	for _, row := range rows {
-		state, err := m.prov.PowerState(ctx, &provisioner.VM{
+		vmCtx, cancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
+		state, err := m.prov.PowerState(vmCtx, &provisioner.VM{
 			VMID: row.VMID, Node: row.Node, Name: row.Name,
 		})
+		cancel()
 		if err != nil {
 			m.log.Debug("power-poll: query failed; will retry", "vmid", row.VMID, "err", err)
 			continue

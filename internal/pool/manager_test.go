@@ -65,6 +65,11 @@ type fakeProv struct {
 	// adopt tests can exercise the "power query failed" fallback path.
 	powerStateErrBy map[int]error
 
+	// powerStateHangBy, when true for a VMID, makes PowerState block
+	// until the caller's ctx is cancelled — modelling a stuck Proxmox
+	// node. The fake then returns ctx.Err so the poller can move on.
+	powerStateHangBy map[int]bool
+
 	// recentlyDestroyedSet drives IsRecentlyDestroyed. Tests set
 	// membership directly; the fake ignores the cooldown arg and just
 	// consults the set, so toggling membership models "time advanced
@@ -159,7 +164,14 @@ func (f *fakeProv) ListOwnedVMs(_ context.Context) ([]*provisioner.VM, error) {
 	return f.listOwnedRet, f.listErr
 }
 
-func (f *fakeProv) PowerState(_ context.Context, v *provisioner.VM) (string, error) {
+func (f *fakeProv) PowerState(ctx context.Context, v *provisioner.VM) (string, error) {
+	f.mu.Lock()
+	hang := f.powerStateHangBy[v.VMID]
+	f.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err, ok := f.powerStateErrBy[v.VMID]; ok {
@@ -1573,6 +1585,59 @@ func TestPowerPoller_IgnoresHotAndWarmRows(t *testing.T) {
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
 	require.Empty(t, fp.destroys, "poller must not act on Hot/Warm rows")
+}
+
+// TestPowerPoller_PerVMTimeout_HangingVMDoesNotStallLoop: a single stuck
+// Proxmox node previously froze the entire pass for up to the underlying
+// HTTP client's 60s timeout. With per-VM bounded context, the hung VM
+// returns ctx.Err quickly and the loop proceeds to the next row.
+//
+// Not run with t.Parallel(): this test mutates the package-level
+// powerPollTimeoutPerVM var, and the other power-poll tests read it
+// concurrently. Sequential execution avoids the data race.
+func TestPowerPoller_PerVMTimeout_HangingVMDoesNotStallLoop(t *testing.T) {
+	prev := powerPollTimeoutPerVM
+	powerPollTimeoutPerVM = 50 * time.Millisecond
+	t.Cleanup(func() { powerPollTimeoutPerVM = prev })
+
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 71030, Node: "pve1", Name: "hung-vm",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 71031, Node: "pve1", Name: "completed-vm",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	fp := &fakeProv{
+		powerStateHangBy: map[int]bool{71030: true},
+		powerStateBy:     map[int]string{71031: "stopped"},
+	}
+	mgr := newTestManager(t, st, fp, Config{})
+
+	done := make(chan struct{})
+	go func() {
+		mgr.powerPollOnce(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("powerPollOnce did not complete within 2s — per-VM timeout did not unblock the loop")
+	}
+
+	// The non-hanging completed VM must still be reaped despite the
+	// hung sibling row above it in the iteration.
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		for _, v := range fp.destroys {
+			if v == 71031 {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond, "completed VM must be queued for destruction even when a sibling hangs")
 }
 
 // TestSetRunnerID_StampsRowField: the scaler stamps runner_id on the row
