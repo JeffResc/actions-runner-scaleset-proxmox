@@ -1749,6 +1749,55 @@ func TestDestroy_OnRunnerOrphanedErrorDoesNotBlockDestroy(t *testing.T) {
 	require.Error(t, err, "row must be deleted after destroy regardless of callback outcome")
 }
 
+// TestDestroy_OnRunnerOrphanedRunsEvenWhenParentCtxCancelled: a
+// force-drain cancels the worker ctx after prov.Destroy returns but
+// before OnRunnerOrphaned completes its GitHub round-trip. The fix
+// detaches the cleanup ctx from the drain ctx so the idempotent
+// deregister still runs and the runner registration isn't leaked.
+func TestDestroy_OnRunnerOrphanedRunsEvenWhenParentCtxCancelled(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{}
+
+	var (
+		invocations int32
+		ctxLive     atomic.Bool // true ⇔ callback saw ctx.Err() == nil
+	)
+	cb := func(ctx context.Context, runnerID int64) error {
+		atomic.AddInt32(&invocations, 1)
+		// Record whether the ctx given to the callback is still live.
+		// With the fix in place, the cleanup ctx must be independent
+		// of the (cancelled) parent.
+		ctxLive.Store(ctx.Err() == nil)
+		return nil
+	}
+
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          1,
+		OnRunnerOrphaned: cb,
+		DrainTimeout:     time.Second,
+	})
+
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 10050, Node: "pve1", Name: "drain-victim",
+		PoolKind: store.PoolKindHot, State: store.StateHot,
+		RunnerID: 54321,
+	}))
+	_, err := st.UpdateState(10050, store.StateHot, store.StateDestroying, nil)
+	require.NoError(t, err)
+
+	// Pre-cancelled parent: models worker/drain ctx that was killed
+	// mid-destroy after Proxmox already finished.
+	parentCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	mgr.destroy(parentCtx, 10050, "pve1")
+
+	require.Equal(t, int32(1), atomic.LoadInt32(&invocations),
+		"OnRunnerOrphaned must fire exactly once even with a cancelled parent ctx")
+	require.True(t, ctxLive.Load(),
+		"OnRunnerOrphaned must receive a fresh, non-cancelled cleanup ctx")
+}
+
 // TestReconcileOnce_DoesNotOverProvisionWhenClonesInFlight covers the
 // inter-tick race: two consecutive reconcile ticks each saw an empty
 // store and each dispatched HotSize clones — the pool worker hadn't

@@ -1193,13 +1193,26 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	}
 
 	if runnerID != 0 && m.cfg.OnRunnerOrphaned != nil {
-		if err := m.cfg.OnRunnerOrphaned(dctx, runnerID); err != nil {
+		// Detach from dctx (which is derived from the worker/drain ctx)
+		// so a force-drain cancellation that arrives after Proxmox
+		// destroy succeeded doesn't abort the idempotent GitHub
+		// deregister already in flight and leak the registration.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), orphanCleanupTimeout)
+		err := m.cfg.OnRunnerOrphaned(cleanupCtx, runnerID)
+		cleanupCancel()
+		if err != nil {
 			m.log.Warn("destroy: orphan-runner cleanup failed", "vmid", vmid, "runner_id", runnerID, "err", err)
 		} else {
 			m.log.Debug("destroy: deregistered github runner", "vmid", vmid, "runner_id", runnerID)
 		}
 	}
 }
+
+// orphanCleanupTimeout bounds the detached GitHub-deregister call made
+// from destroy(). It must outlive a typical GH API round-trip while
+// still being short enough to not pin process shutdown. Tests may
+// override this.
+var orphanCleanupTimeout = 15 * time.Second
 
 // allocateVMID returns the lowest VMID in the configured range that is
 // not already claimed by an existing row AND has not been destroyed
