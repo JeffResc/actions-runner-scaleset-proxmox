@@ -5,8 +5,22 @@ Thanks for your interest in contributing to actions-runner-scaleset-proxmox!
 ## Dev Setup
 
 **Requirements:** Go 1.26+, Docker (for building container images),
-[golangci-lint](https://golangci-lint.run/) v2.12+, and Helm 3.14+ if you
-touch the chart.
+[golangci-lint](https://golangci-lint.run/) v2.12+, [Task](https://taskfile.dev)
+(`brew install go-task/tap/go-task`), and Helm 3.14+ if you touch the chart.
+[Packer](https://www.packer.io/) is optional and only needed for
+`task e2e-packer`.
+
+Common workflows ship as Taskfile targets (`task --list` to discover them):
+
+```bash
+task test         # go test -race ./... — unit tests, no build tags
+task e2e          # in-process e2e suite against fake Proxmox + fake GitHub
+task e2e-packer   # packer validate -syntax-only on the HCL (skips if packer missing)
+task build        # compile bin/scaleset
+task lint         # golangci-lint over the module
+```
+
+For raw equivalents:
 
 ```bash
 # Build
@@ -24,6 +38,19 @@ docker build -f deploy/docker/Dockerfile -t scaleset:dev .
 # Lint the Helm chart
 helm lint deploy/chart
 ```
+
+## End-to-end tests
+
+`task e2e` drives the real orchestrator binary in-process against fake
+Proxmox and fake GitHub HTTP servers — no external dependencies needed.
+The fakes implement the subsets of the Proxmox VE API and GitHub /
+scaleset library protocols the orchestrator actually depends on; tests
+boot the full binary, drive scenarios via the admin API, and assert on
+live `/metrics` output. Run-time is ~30s.
+
+Scenarios live under [test/e2e/](test/e2e/) and are gated by the
+`e2e` build tag so `task test` skips them. CI runs both suites
+([.github/workflows/ci.yaml](.github/workflows/ci.yaml)).
 
 ## Branch & PR Conventions
 
@@ -87,5 +114,8 @@ internal/
 
 - Unit tests live alongside the code they test (`*_test.go` in the same
   package), not in a separate `tests/` directory
-- Run with `-race` to catch data races
+- Run with `-race` to catch data races (`task test` does this by default)
 - New code should ship with tests
+- Cross-cutting behaviour that needs the full binary (boot sequence,
+  cluster failover, admin forwarding, etc.) goes under
+  [test/e2e/](test/e2e/) with the `e2e` build tag — see the section above
