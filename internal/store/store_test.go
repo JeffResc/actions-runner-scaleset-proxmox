@@ -319,6 +319,41 @@ func TestDelete_RemovesRow(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
+func TestDeleteAndReturn_ReturnsClonedRow(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	v := newVM(90100, store.StateRunning)
+	v.RunnerID = 7777
+	require.NoError(t, s.Insert(v))
+
+	got, err := s.DeleteAndReturn(90100)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, 90100, got.VMID)
+	require.Equal(t, int64(7777), got.RunnerID,
+		"DeleteAndReturn must surface the row's final RunnerID for orphan cleanup")
+
+	// Row really is gone.
+	_, err = s.Get(90100)
+	require.ErrorIs(t, err, store.ErrNotFound)
+
+	// Returned value must be a clone — mutating it doesn't bring the
+	// row back or otherwise affect the store.
+	got.RunnerID = 0
+	_, err = s.Get(90100)
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func TestDeleteAndReturn_MissingReturnsNilNoError(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	got, err := s.DeleteAndReturn(99999)
+	require.NoError(t, err, "missing row must be a no-op, not an error")
+	require.Nil(t, got)
+}
+
 func TestUpdate_MissingReturnsErrNotFound(t *testing.T) {
 	t.Parallel()
 	s, err := store.New()

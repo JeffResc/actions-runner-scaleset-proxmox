@@ -1183,21 +1183,24 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	))
 	defer span.End()
 
-	// Capture the runner_id BEFORE destruction so we can ask the
-	// orphan-cleanup hook to deregister it even after the row is gone.
-	var runnerID int64
-	if row, err := m.store.Get(vmid); err == nil {
-		runnerID = row.RunnerID
-	}
-
 	if err := m.prov.Destroy(dctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "destroy failed")
 		m.log.Warn("destroy: provisioner failed", "vmid", vmid, "err", err)
 		return
 	}
-	if err := m.store.Delete(vmid); err != nil {
+	// Delete the row and capture its runner_id in the same write txn.
+	// A separate Get-then-Delete would race with concurrent
+	// SetRunnerID writes that land during prov.Destroy: a stale read
+	// here would call OnRunnerOrphaned with the wrong (or zero) id
+	// and the registration would leak.
+	deleted, err := m.store.DeleteAndReturn(vmid)
+	if err != nil {
 		m.log.Warn("destroy: delete row failed", "vmid", vmid, "err", err)
+	}
+	var runnerID int64
+	if deleted != nil {
+		runnerID = deleted.RunnerID
 	}
 	if m.metrics != nil {
 		m.metrics.VMsTotal.WithLabelValues("destroyed").Inc()
