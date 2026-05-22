@@ -278,12 +278,22 @@ func Run(ctx context.Context, opts Options) error {
 		return g.Wait()
 	}
 
+	// leaderPlaneErr surfaces a runLeaderPlane failure to the
+	// post-g1.Wait() handling below. OnElected cancels the root ctx
+	// on error, which causes coord.Run(ctx1) to return nil (clean
+	// ctx-cancel is not an error from its perspective). Without this
+	// hand-off, Run would return nil and the process would exit 0,
+	// defeating systemd Restart=on-failure / k8s restartPolicy:
+	// OnFailure on a class of bugs the code itself deemed fatal.
+	var leaderPlaneErr atomic.Pointer[error]
+
 	cbCallbacks := cluster.Callbacks{
 		OnElected: func(leaderCtx context.Context) {
 			health.MarkLeader(true)
 			metrics.Leader.Set(1)
 			if err := runLeaderPlane(leaderCtx); err != nil {
 				log.Error("leader plane failed; shutting down", "err", err)
+				leaderPlaneErr.Store(&err)
 				cancel()
 			}
 		},
@@ -335,7 +345,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	log.Info("scaleset running", "cluster_mode", cfg.Cluster.Mode)
 
-	phase1Err := g1.Wait()
+	phase1Err := mergeLeaderPlaneErr(g1.Wait(), &leaderPlaneErr)
 	log.Info("scaleset: phase 1 complete; stopping HTTP servers")
 	cancel2()
 	phase2Err := g2.Wait()
@@ -431,6 +441,22 @@ func splitHostPort(addr string) (host, port string) {
 		return "", ""
 	}
 	return h, p
+}
+
+// mergeLeaderPlaneErr promotes a stashed runLeaderPlane error into the
+// errgroup result when g1.Wait() returns nil (which happens whenever
+// OnElected cancelled the root ctx — coord.Run treats clean ctx-cancel
+// as success). Without this promotion, Run() would return nil on a
+// leader-plane crash and supervisors (systemd Restart=on-failure,
+// k8s restartPolicy: OnFailure) would not restart.
+func mergeLeaderPlaneErr(phase1Err error, leaderPlaneErr *atomic.Pointer[error]) error {
+	if phase1Err != nil {
+		return phase1Err
+	}
+	if errPtr := leaderPlaneErr.Load(); errPtr != nil && *errPtr != nil {
+		return fmt.Errorf("leader plane failed: %w", *errPtr)
+	}
+	return nil
 }
 
 // portFromAddr parses ":9101" / "0.0.0.0:9101" / "127.0.0.1:9101" /
