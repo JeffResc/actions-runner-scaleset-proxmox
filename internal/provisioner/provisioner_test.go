@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
 
@@ -43,11 +44,13 @@ func newTestProvisioner(t *testing.T, srv *httptest.Server, templateNode string)
 	cli := newProxmoxClient(cfg)
 
 	return &pmox{
-		cfg:          cfg,
-		cli:          cli,
-		scaleSetName: "test-scaleset",
-		templateNode: templateNode,
-		log:          quietLogger(),
+		cfg:               cfg,
+		cli:               cli,
+		scaleSetName:      "test-scaleset",
+		templateNode:      templateNode,
+		log:               quietLogger(),
+		inFlightClones:    newTracker(5 * time.Minute),
+		recentlyDestroyed: newTracker(10 * time.Minute),
 	}
 }
 
@@ -587,7 +590,7 @@ func TestListOwnedVMs_SuppressesUntaggedWarningForInFlightClones(t *testing.T) {
 
 	// Mark VMID 10004 as currently being cloned — Clone has returned
 	// from PVE's clone task but hasn't yet applied the ownership tag.
-	p.inFlightClones.Store(10004, time.Now())
+	p.inFlightClones.Set(10004, time.Now(), ttlcache.DefaultTTL)
 
 	vms, err := p.ListOwnedVMs(context.Background())
 	require.NoError(t, err)
@@ -599,77 +602,47 @@ func TestListOwnedVMs_SuppressesUntaggedWarningForInFlightClones(t *testing.T) {
 		"the WARN must be suppressed while the clone is in-flight; got log: %s", logBuf.String())
 }
 
-// TestPruneStaleTrackers prunes inflight + recentlyDestroyed entries
-// past their TTL. Without this sweep, a hung Clone() leaks an inflight
-// entry forever (suppressing future warnings for that VMID) and the
-// recentlyDestroyed map grows unbounded under destroy churn —
-// problems that only surface at enterprise scale and over long
-// uptimes.
-func TestPruneStaleTrackers_RemovesEntriesPastTTL(t *testing.T) {
-	t.Parallel()
-
-	p := &pmox{
-		log:                  quietLogger(),
-		inFlightCloneTTL:     time.Minute,
-		recentlyDestroyedTTL: time.Minute,
-	}
-	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	// Within TTL.
-	p.inFlightClones.Store(100, t0)
-	p.recentlyDestroyed.Store(200, t0)
-	// Past TTL.
-	p.inFlightClones.Store(101, t0.Add(-2*time.Minute))
-	p.recentlyDestroyed.Store(201, t0.Add(-2*time.Minute))
-
-	p.pruneStaleTrackers(t0)
-
-	_, fresh1 := p.inFlightClones.Load(100)
-	_, stale1 := p.inFlightClones.Load(101)
-	_, fresh2 := p.recentlyDestroyed.Load(200)
-	_, stale2 := p.recentlyDestroyed.Load(201)
-	require.True(t, fresh1, "in-flight entry within TTL must survive")
-	require.False(t, stale1, "in-flight entry past TTL must be pruned")
-	require.True(t, fresh2, "recentlyDestroyed entry within TTL must survive")
-	require.False(t, stale2, "recentlyDestroyed entry past TTL must be pruned")
-}
-
-// TestPruneStaleTrackers_HandlesCorruptedEntries: a sync.Map.Store
-// allows any type for the value, so a defensive prune must drop
-// entries whose type doesn't match the time.Time invariant rather
-// than crash. Mirrors the type-assertion path in IsRecentlyDestroyed.
-func TestPruneStaleTrackers_HandlesCorruptedEntries(t *testing.T) {
+// TestTrackers_LibraryEvictsEntriesPastTTL exercises the ttlcache
+// background-eviction path our trackers rely on. Without it a hung
+// Clone() would leak an inflight entry forever (suppressing future
+// warnings for that VMID) and the recentlyDestroyed map would grow
+// unbounded under destroy churn.
+func TestTrackers_LibraryEvictsEntriesPastTTL(t *testing.T) {
 	t.Parallel()
 	p := &pmox{
-		log:                  quietLogger(),
-		inFlightCloneTTL:     time.Minute,
-		recentlyDestroyedTTL: time.Minute,
+		log:               quietLogger(),
+		inFlightClones:    newTracker(10 * time.Millisecond),
+		recentlyDestroyed: newTracker(10 * time.Millisecond),
 	}
-	p.inFlightClones.Store(100, "not a time") // wrong type
-	p.recentlyDestroyed.Store(200, 12345)     // wrong type
+	p.inFlightClones.Set(101, time.Now(), ttlcache.DefaultTTL)
+	p.recentlyDestroyed.Set(201, time.Now(), ttlcache.DefaultTTL)
 
-	require.NotPanics(t, func() {
-		p.pruneStaleTrackers(time.Now())
-	})
-
-	_, ok1 := p.inFlightClones.Load(100)
-	_, ok2 := p.recentlyDestroyed.Load(200)
-	require.False(t, ok1, "corrupted in-flight entry must be deleted")
-	require.False(t, ok2, "corrupted recentlyDestroyed entry must be deleted")
+	require.Eventually(t, func() bool {
+		// DeleteExpired is the deterministic eviction trigger; the
+		// library's Start() loop wakes on the same path on a timer.
+		p.inFlightClones.DeleteExpired()
+		p.recentlyDestroyed.DeleteExpired()
+		return p.inFlightClones.Get(101) == nil && p.recentlyDestroyed.Get(201) == nil
+	}, time.Second, 5*time.Millisecond, "TTL eviction must drop entries past the cache TTL")
 }
 
-// TestIsRecentlyDestroyed_SelfHealsCorruptedEntry: the hot path that
-// the allocator hits on every VMID lookup must not trust a malformed
-// value. Otherwise a single corrupted entry blocks the allocator
-// from ever reissuing the VMID. Defensive code already in place;
-// this test pins it.
-func TestIsRecentlyDestroyed_SelfHealsCorruptedEntry(t *testing.T) {
+// TestIsRecentlyDestroyed_EvictsOnceCooldownElapses pins the
+// caller-supplied cooldown semantics: an entry within the cache's
+// (longer) TTL must still report "not recent" once the caller's
+// cooldown has elapsed, and the entry should be dropped eagerly so
+// the cache reflects ground truth.
+func TestIsRecentlyDestroyed_EvictsOnceCooldownElapses(t *testing.T) {
 	t.Parallel()
-	p := &pmox{log: quietLogger()}
-	p.recentlyDestroyed.Store(10042, "not a time")
+	p := &pmox{
+		log:               quietLogger(),
+		recentlyDestroyed: newTracker(time.Hour),
+	}
+	// Insert with a timestamp that is already past the caller's cooldown.
+	p.recentlyDestroyed.Set(10042, time.Now().Add(-2*time.Minute), ttlcache.DefaultTTL)
 	require.False(t, p.IsRecentlyDestroyed(10042, time.Minute),
-		"malformed value must not block the allocator forever")
-	_, ok := p.recentlyDestroyed.Load(10042)
-	require.False(t, ok, "the bad entry must be dropped on read")
+		"cooldown elapsed → must return false even while inside the cache TTL")
+	require.Nil(t, p.recentlyDestroyed.Get(10042),
+		"the stale entry must be evicted on read")
 }
 
 // TestDestroy_DoesNotMarkRecentlyDestroyedOnError: if Destroy fails
@@ -779,8 +752,7 @@ func TestClone_ClearsInFlightOnError(t *testing.T) {
 	_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10042, Node: "pve1", Name: "x"})
 	require.Error(t, err, "the fake PVE returns 500 so Clone must fail")
 
-	_, stillInFlight := p.inFlightClones.Load(10042)
-	require.False(t, stillInFlight,
+	require.False(t, p.inFlightClones.Has(10042),
 		"Clone error must still clear the in-flight entry — otherwise repeated failures permanently mute the warning for that VMID")
 }
 
