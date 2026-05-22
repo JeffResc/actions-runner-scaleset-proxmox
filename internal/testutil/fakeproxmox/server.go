@@ -94,7 +94,12 @@ func New(t testing.TB, opts Options) *Server {
 	}
 
 	s := &Server{store: st, opts: opts}
-	s.Server = httptest.NewServer(s.routes())
+	// TLS-backed: the production config now refuses non-https Proxmox
+	// endpoints (the API token traverses every request as a header).
+	// Callers point their orchestrator config at this URL with
+	// insecure_skip_verify: true so the self-signed test cert is
+	// accepted.
+	s.Server = httptest.NewTLSServer(s.routes())
 
 	// Seed the template VM unless the caller asked for no template
 	// (TemplateVMID < 0). The template is marked with template:1 so
