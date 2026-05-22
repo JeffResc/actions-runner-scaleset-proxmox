@@ -35,6 +35,15 @@ func (s *Server) handleAgentGetOSInfo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "guest agent is not responding")
 		return
 	}
+	if f, ok := s.store.matchFaultLocked(FaultGuestAgentNotReady, vmid); ok {
+		// Stay "not ready" until Duration elapses since the VM started.
+		// Mirrors the real-world startup window where qemu-guest-agent
+		// is installed but the systemd unit hasn't come up yet.
+		if time.Since(v.StartedAt) < f.Duration {
+			writeError(w, http.StatusInternalServerError, "QEMU guest agent is not running")
+			return
+		}
+	}
 	writeData(w, map[string]any{
 		"result": map[string]any{
 			"id":             "ubuntu",

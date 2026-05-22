@@ -76,3 +76,20 @@ func (s *Server) ClearFaults() {
 	defer s.store.mu.Unlock()
 	s.store.faults = nil
 }
+
+// matchFaultLocked returns the first registered fault that matches kind
+// and vmid. VMID 0 on the fault matches any vmid. Caller must hold
+// s.mu. The fault is NOT removed — each handler decides whether the
+// behaviour is one-shot or sticky.
+func (s *store) matchFaultLocked(kind FaultKind, vmid int) (Fault, bool) {
+	for _, f := range s.faults {
+		if f.Kind != kind {
+			continue
+		}
+		if f.VMID != 0 && f.VMID != vmid {
+			continue
+		}
+		return f, true
+	}
+	return Fault{}, false
+}
