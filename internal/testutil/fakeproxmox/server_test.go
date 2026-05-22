@@ -30,7 +30,7 @@ func do(t *testing.T, srv *fakeproxmox.Server, method, path string, body any) (i
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)

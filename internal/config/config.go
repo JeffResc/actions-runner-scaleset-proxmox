@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -647,6 +648,12 @@ func (c *Config) Validate() error {
 	if c.Proxmox.TemplateVMID >= c.Proxmox.VMIDRange.Min && c.Proxmox.TemplateVMID <= c.Proxmox.VMIDRange.Max {
 		return fmt.Errorf("proxmox.template_vmid (%d) must be outside vmid_range [%d, %d]",
 			c.Proxmox.TemplateVMID, c.Proxmox.VMIDRange.Min, c.Proxmox.VMIDRange.Max)
+	}
+	// The Proxmox API token is sent in a header on every request; require
+	// https:// so the credential never traverses the wire in cleartext.
+	u, err := url.Parse(c.Proxmox.Endpoint)
+	if err != nil || u.Scheme != "https" {
+		return errors.New("proxmox.endpoint must use https:// (the API token is sent on every request and would leak in cleartext over http)")
 	}
 	for _, cidr := range c.AdminAPI.TrustedProxies {
 		if _, err := netip.ParsePrefix(cidr); err != nil {
