@@ -326,16 +326,20 @@ func TestMarkCompleted_DestroysAndSignals(t *testing.T) {
 
 	require.NoError(t, mgr.MarkCompleted(context.Background(), 20000))
 
-	// Wait for the async destroy.
+	// Wait for the async destroy AND the follow-up row delete.
+	// fp.destroys is appended before st.Delete runs, so polling only
+	// on the destroy count produced a flaky race in CI where Get(20000)
+	// hit the store before the deletion landed.
 	require.Eventually(t, func() bool {
 		fp.mu.Lock()
-		defer fp.mu.Unlock()
-		return len(fp.destroys) == 1
+		destroys := len(fp.destroys)
+		fp.mu.Unlock()
+		if destroys != 1 {
+			return false
+		}
+		_, err := st.Get(20000)
+		return errors.Is(err, store.ErrNotFound)
 	}, time.Second, 10*time.Millisecond)
-
-	// Row should be gone.
-	_, err = st.Get(20000)
-	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
 // TestReconcile_ShrinksHotPoolToTarget verifies that when the hot pool
