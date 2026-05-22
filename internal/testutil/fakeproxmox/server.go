@@ -453,6 +453,15 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.mu.Lock()
 	defer s.store.mu.Unlock()
+	if _, ok := s.store.matchFaultLocked(FaultVMNotFoundOnDestroy, vmid); ok {
+		// Simulate "operator already deleted the VM out-of-band": the
+		// orchestrator's destroy path must classify this as
+		// ErrVMNotFound and treat it as idempotent success.
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
 	v, ok := s.store.findVMLocked(vmid)
 	if !ok {
 		writeError(w, http.StatusInternalServerError,
