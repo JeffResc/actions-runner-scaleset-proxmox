@@ -41,7 +41,7 @@ func (f *fakePool) MarkCompleted(_ context.Context, vmid int) error {
 func (f *fakePool) Stats(_ context.Context) (pool.Stats, error) {
 	return f.stats, f.statsErr
 }
-func (f *fakePool) Recover(_ context.Context) error { return nil }
+func (f *fakePool) Adopt(_ context.Context) error { return nil }
 func (f *fakePool) Run(_ context.Context) error     { return nil }
 func (f *fakePool) SignalRefill()                   {}
 func (f *fakePool) SetDesiredCount(_ int)           {}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -16,10 +17,10 @@ import (
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
+	"github.com/hashicorp/raft"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"golang.org/x/sync/errgroup"
-	"k8s.io/client-go/kubernetes"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/adminapi"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/cluster"
@@ -45,20 +46,19 @@ type Options struct {
 	// short-circuits destructive operations. Mirrors `--dry-run`.
 	DryRun bool
 
-	// AllowPartialRecovery permits startup even when crash recovery
-	// cannot destroy every orphaned VM. Dangerous; mirrors
-	// `--allow-partial-recovery`.
-	AllowPartialRecovery bool
-
 	// Version is the build version (passed through to log lines and
 	// tracer service.version). Empty string is acceptable.
 	Version string
 
-	// KubeClient lets callers (notably e2e tests) inject a
-	// kubernetes.Interface for cluster mode. If nil and
-	// cfg.Cluster.Mode == "kubernetes", the in-cluster client is built
-	// from rest.InClusterConfig.
-	KubeClient kubernetes.Interface
+	// RaftTransport lets callers (notably e2e tests) inject an
+	// in-process raft.Transport — typically a raft.NewInmemTransport
+	// shared between all replicas in a test — in place of the
+	// production TCP transport. Nil in production.
+	RaftTransport raft.Transport
+
+	// RaftLocalAddr is the address the test transport advertises;
+	// only consulted when RaftTransport is non-nil. Nil in production.
+	RaftLocalAddr raft.ServerAddress
 
 	// AuthOverride bypasses cfg.GitHub.AuthMode and the on-disk PEM /
 	// PAT resolution. When non-nil it is used verbatim, letting tests
@@ -200,16 +200,14 @@ func Run(ctx context.Context, opts Options) error {
 			TemplateNode:         prov.TemplateNode(),
 			VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldownD,
 			OnRunnerOrphaned:     ghClient.RemoveRunner,
+			RunnerLister:         gh.NewRunnerLister(restCli, scope, prefix, log),
 		}, st, prov, sel, log, metrics)
 		if err != nil {
 			return fmt.Errorf("init pool: %w", err)
 		}
 
-		if err := mgr.Recover(leaderCtx); err != nil {
-			if !opts.AllowPartialRecovery {
-				return fmt.Errorf("crash recovery failed (start with --allow-partial-recovery to override at your own risk): %w", err)
-			}
-			log.Error("crash recovery failed; --allow-partial-recovery in effect, continuing with orphaned VMs in Proxmox", "err", err)
+		if err := mgr.Adopt(leaderCtx); err != nil {
+			log.Error("adopt: list-owned-vms failed; starting with empty pool", "err", err)
 		}
 		health.MarkRecoveryDone()
 		health.MarkProxmoxOK()
@@ -296,7 +294,7 @@ func Run(ctx context.Context, opts Options) error {
 		},
 	}
 
-	coord, err := buildCoordinator(cfg, cbCallbacks, log, opts.KubeClient)
+	coord, err := buildCoordinator(cfg, cbCallbacks, log, opts)
 	if err != nil {
 		return fmt.Errorf("init cluster coordinator: %w", err)
 	}
@@ -379,33 +377,59 @@ func runHealthRefresher(ctx context.Context, prov provisioner.Provisioner, healt
 }
 
 // buildCoordinator selects the cluster.Coordinator implementation based on
-// cfg.Cluster.Mode. Standalone is the default (and only option when not
-// running in Kubernetes). When kubeClient is non-nil and mode is
-// kubernetes, the supplied client is used in place of an in-cluster
-// config — this is the path e2e tests take with client-go's fake client.
-func buildCoordinator(cfg *config.Config, cb cluster.Callbacks, log *slog.Logger, kubeClient kubernetes.Interface) (cluster.Coordinator, error) {
-	if cfg.Cluster.Mode != "kubernetes" {
+// cfg.Cluster.Mode. Standalone is the default (single-replica deployments).
+// raft mode builds an embedded hashicorp/raft cluster across the configured
+// static peer list — no external infrastructure required.
+//
+// The opts.RaftTransport / opts.RaftLocalAddr pair is the e2e-test hook:
+// when supplied, the coordinator wires raft to an InmemTransport in place
+// of a real TCP listener, letting tests stand up N in-process replicas
+// without binding ports.
+func buildCoordinator(cfg *config.Config, cb cluster.Callbacks, log *slog.Logger, opts Options) (cluster.Coordinator, error) {
+	if cfg.Cluster.Mode != "raft" {
 		return cluster.NewStandalone(cfg.AdminAPI.HTTPAddr, cb), nil
 	}
 	port, err := portFromAddr(cfg.AdminAPI.HTTPAddr)
 	if err != nil {
-		return nil, fmt.Errorf("cluster: extract admin port for Lease annotation: %w", err)
+		return nil, fmt.Errorf("cluster: extract admin port: %w", err)
 	}
-	clusterCfg := cluster.Config{
-		LeaseName:          cfg.Cluster.Kubernetes.LeaseName,
-		LeaseNamespace:     cfg.Cluster.Kubernetes.LeaseNamespace,
-		Identity:           cfg.Cluster.Kubernetes.Identity,
-		PodIP:              cfg.Cluster.Kubernetes.PodIP,
-		AdminPort:          port,
-		LeaseDuration:      cfg.Cluster.Kubernetes.LeaseDurationD,
-		RenewDeadline:      cfg.Cluster.Kubernetes.RenewDeadlineD,
-		RetryPeriod:        cfg.Cluster.Kubernetes.RetryPeriodD,
-		EndpointAnnotation: cfg.Cluster.Kubernetes.LeaderEndpointAnnotation,
+	host, _ := splitHostPort(cfg.AdminAPI.HTTPAddr)
+	peers := make([]cluster.RaftPeer, 0, len(cfg.Cluster.Raft.Peers))
+	for _, p := range cfg.Cluster.Raft.Peers {
+		peers = append(peers, cluster.RaftPeer{
+			NodeID:   p.NodeID,
+			RaftAddr: p.RaftAddr,
+			HTTPAddr: p.HTTPAddr,
+		})
 	}
-	if kubeClient != nil {
-		return cluster.NewKubernetesWithClient(clusterCfg, cb, log, kubeClient), nil
+	rcfg := cluster.RaftConfig{
+		NodeID:           cfg.Cluster.Raft.NodeID,
+		BindAddr:         cfg.Cluster.Raft.BindAddr,
+		AdvertiseAddr:    cfg.Cluster.Raft.AdvertiseAddr,
+		AdminPort:        port,
+		AdminHost:        host,
+		Peers:            peers,
+		Bootstrap:        cfg.Cluster.Raft.Bootstrap,
+		HeartbeatTimeout: cfg.Cluster.Raft.HeartbeatTimeoutD,
+		ElectionTimeout:  cfg.Cluster.Raft.ElectionTimeoutD,
+		CommitTimeout:    cfg.Cluster.Raft.CommitTimeoutD,
+		TestTransport:    opts.RaftTransport,
+		TestLocalAddr:    opts.RaftLocalAddr,
 	}
-	return cluster.NewKubernetes(clusterCfg, cb, log)
+	return cluster.NewRaft(rcfg, cb, log)
+}
+
+// splitHostPort returns just the host part of a "host:port" string;
+// "" is returned for both halves when addr is empty.
+func splitHostPort(addr string) (host, port string) {
+	if addr == "" {
+		return "", ""
+	}
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", ""
+	}
+	return h, p
 }
 
 // portFromAddr parses ":9101" / "0.0.0.0:9101" / "127.0.0.1:9101" into
@@ -446,10 +470,11 @@ func (g *coordAdminGate) Forward(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildAdminGate picks the LeaderGate that matches the cluster mode.
-// Standalone deployments always serve admin locally; K8s deployments
-// either serve locally (when leader) or proxy to the leader.
+// Standalone deployments always serve admin locally; multi-replica
+// deployments either serve locally (when leader) or proxy to the
+// leader.
 func buildAdminGate(cfg *config.Config, coord cluster.Coordinator) adminapi.LeaderGate {
-	if cfg.Cluster.Mode != "kubernetes" {
+	if cfg.Cluster.Mode == "standalone" {
 		return adminapi.AlwaysLeader{}
 	}
 	return &coordAdminGate{coord: coord, fwd: cluster.NewForwarder(coord)}

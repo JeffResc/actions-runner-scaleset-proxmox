@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -59,6 +60,10 @@ type fakeProv struct {
 	// power-state poller. Default (nil) returns "running" for any VMID,
 	// matching the steady-state expectation of an Assigned/Running VM.
 	powerStateBy map[int]string
+
+	// powerStateErrBy lets tests inject per-VMID PowerState errors so
+	// adopt tests can exercise the "power query failed" fallback path.
+	powerStateErrBy map[int]error
 
 	// recentlyDestroyedSet drives IsRecentlyDestroyed. Tests set
 	// membership directly; the fake ignores the cooldown arg and just
@@ -157,6 +162,9 @@ func (f *fakeProv) ListOwnedVMs(_ context.Context) ([]*provisioner.VM, error) {
 func (f *fakeProv) PowerState(_ context.Context, v *provisioner.VM) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err, ok := f.powerStateErrBy[v.VMID]; ok {
+		return "", err
+	}
 	if s, ok := f.powerStateBy[v.VMID]; ok {
 		return s, nil
 	}
@@ -644,128 +652,270 @@ func TestReconcile_PoisonAfterMaxBootAttempts(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
-// TestRecover_DestroysOrphanProxmoxVMs: at startup the (empty) in-memory
-// store has no rows, so every Proxmox VM tagged as ours is an orphan from
-// a previous process and must be destroyed.
-func TestRecover_DestroysOrphanProxmoxVMs(t *testing.T) {
+// TestAdopt_PoweredOff_BecomesWarm: a stopped owner-tagged VM is adopted
+// into the warm pool. Adopting (not destroying) is the load-bearing
+// invariant of the leader-takeover scenario: an in-progress job on a
+// warm slot must survive the handover.
+func TestAdopt_PoweredOff_BecomesWarm(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	fp := &fakeProv{
-		listOwnedRet: []*provisioner.VM{{VMID: 12345, Node: "pve1", Name: "orphan"}},
+		listOwnedRet: []*provisioner.VM{{VMID: 12345, Node: "pve1", Name: "gh-runner-test-12345"}},
+		powerStateBy: map[int]string{12345: "stopped"},
 	}
 	mgr := newTestManager(t, st, fp, Config{})
 
-	require.NoError(t, mgr.Recover(context.Background()))
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	row, err := st.Get(12345)
+	require.NoError(t, err)
+	require.Equal(t, store.StateWarm, row.State)
+	require.Equal(t, store.PoolKindWarm, row.PoolKind)
+	require.Zero(t, row.RunnerID)
 
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
-	require.Contains(t, fp.destroys, 12345)
+	require.Empty(t, fp.destroys, "adopt must not destroy any VM")
 }
 
-// TestRecover_MultipleOrphansAllDestroyed: a previous process can leak
-// several VMs across nodes; recover must destroy every one.
-func TestRecover_MultipleOrphansAllDestroyed(t *testing.T) {
+// TestAdopt_PoweredOn_NoRunner_BecomesHot: a powered-on VM with no
+// matching GitHub runner is adopted as Hot — the reconciler treats this
+// as the normal pre-JIT state.
+func TestAdopt_PoweredOn_NoRunner_BecomesHot(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{{VMID: 10001, Node: "pve1", Name: "gh-runner-test-10001"}},
+		powerStateBy: map[int]string{10001: "running"},
+	}
+	cfg := Config{RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+		return map[string]RunnerInfo{}, nil
+	}}
+	mgr := newTestManager(t, st, fp, cfg)
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	row, err := st.Get(10001)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State)
+	require.Equal(t, store.PoolKindHot, row.PoolKind)
+	require.Zero(t, row.RunnerID)
+}
+
+// TestAdopt_BusyRunner_BecomesRunning: a powered-on VM whose runner is
+// busy on GitHub is adopted directly as Running with the right RunnerID.
+// This is the critical job-preservation path: the new leader's power-poll
+// will then watch the VM and trigger MarkCompleted when the runner powers
+// off — exactly the steady-state job-completion flow.
+func TestAdopt_BusyRunner_BecomesRunning(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	const vmid = 10002
+	const runnerID int64 = 7890
+	name := fmt.Sprintf("gh-runner-test-%d", vmid)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{{VMID: vmid, Node: "pve1", Name: name}},
+		powerStateBy: map[int]string{vmid: "running"},
+	}
+	cfg := Config{RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+		return map[string]RunnerInfo{
+			name: {ID: runnerID, Online: true, Busy: true},
+		}, nil
+	}}
+	mgr := newTestManager(t, st, fp, cfg)
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	row, err := st.Get(vmid)
+	require.NoError(t, err)
+	require.Equal(t, store.StateRunning, row.State)
+	require.Equal(t, store.PoolKindHot, row.PoolKind)
+	require.Equal(t, runnerID, row.RunnerID)
+}
+
+// TestAdopt_OnlineIdleRunner_BecomesAssigned: a runner that registered
+// but hasn't picked up a job yet — Assigned is the safe middle ground.
+// The reconciler's AssignedGrace will recycle the row if no job arrives.
+func TestAdopt_OnlineIdleRunner_BecomesAssigned(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	const vmid = 10003
+	const runnerID int64 = 5555
+	name := fmt.Sprintf("gh-runner-test-%d", vmid)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{{VMID: vmid, Node: "pve1", Name: name}},
+		powerStateBy: map[int]string{vmid: "running"},
+	}
+	cfg := Config{RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+		return map[string]RunnerInfo{
+			name: {ID: runnerID, Online: true, Busy: false},
+		}, nil
+	}}
+	mgr := newTestManager(t, st, fp, cfg)
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	row, err := st.Get(vmid)
+	require.NoError(t, err)
+	require.Equal(t, store.StateAssigned, row.State)
+	require.Equal(t, store.PoolKindHot, row.PoolKind)
+	require.Equal(t, runnerID, row.RunnerID)
+}
+
+// TestAdopt_OfflineRunner_BecomesAssigned: a runner registered but
+// observed offline — also Assigned, so AssignedOfflineGrace handles it.
+func TestAdopt_OfflineRunner_BecomesAssigned(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	const vmid = 10004
+	const runnerID int64 = 6666
+	name := fmt.Sprintf("gh-runner-test-%d", vmid)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{{VMID: vmid, Node: "pve1", Name: name}},
+		powerStateBy: map[int]string{vmid: "running"},
+	}
+	cfg := Config{RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+		return map[string]RunnerInfo{
+			name: {ID: runnerID, Online: false, Busy: false},
+		}, nil
+	}}
+	mgr := newTestManager(t, st, fp, cfg)
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	row, err := st.Get(vmid)
+	require.NoError(t, err)
+	require.Equal(t, store.StateAssigned, row.State)
+	require.Equal(t, runnerID, row.RunnerID)
+}
+
+// TestAdopt_PowerQueryFailure_DefaultsToHot: when Proxmox PowerState
+// fails for a single VM, adopt defaults to Hot rather than Warm — Hot
+// keeps the row visible to the gh.Reconciler's matrix, which will
+// promote to Running if a runner does turn out to be busy. Warm would
+// hide the row from the matrix entirely.
+func TestAdopt_PowerQueryFailure_DefaultsToHot(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet:    []*provisioner.VM{{VMID: 10005, Node: "pve1", Name: "gh-runner-test-10005"}},
+		powerStateErrBy: map[int]error{10005: errors.New("proxmox 500")},
+	}
+	mgr := newTestManager(t, st, fp, Config{})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	row, err := st.Get(10005)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State)
+	require.Equal(t, store.PoolKindHot, row.PoolKind)
+}
+
+// TestAdopt_GitHubListFailure_FallsBackToPowerOnly: a whole-pass GitHub
+// API failure must NOT abort adoption — every VM is still classified
+// from its power state, and the gh.Reconciler's next tick will
+// reclassify Hot rows whose runners turn out to be busy.
+func TestAdopt_GitHubListFailure_FallsBackToPowerOnly(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	fp := &fakeProv{
 		listOwnedRet: []*provisioner.VM{
-			{VMID: 10001, Node: "pve1", Name: "orphan-1"},
-			{VMID: 10002, Node: "pve2", Name: "orphan-2"},
-			{VMID: 10003, Node: "pve1", Name: "orphan-3"},
+			{VMID: 10006, Node: "pve1", Name: "gh-runner-test-10006"},
+			{VMID: 10007, Node: "pve1", Name: "gh-runner-test-10007"},
 		},
+		powerStateBy: map[int]string{10006: "running", 10007: "stopped"},
+	}
+	cfg := Config{RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+		return nil, errors.New("github 503")
+	}}
+	mgr := newTestManager(t, st, fp, cfg)
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	hot, err := st.Get(10006)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, hot.State)
+
+	warm, err := st.Get(10007)
+	require.NoError(t, err)
+	require.Equal(t, store.StateWarm, warm.State)
+}
+
+// TestAdopt_NilRunnerLister_OK: a nil lister is treated as "GitHub
+// unavailable" — same behavior as a lister returning an error. Allows
+// callers (e.g. dry-run mode) to skip GitHub wiring entirely.
+func TestAdopt_NilRunnerLister_OK(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{{VMID: 10008, Node: "pve1", Name: "gh-runner-test-10008"}},
+		powerStateBy: map[int]string{10008: "running"},
 	}
 	mgr := newTestManager(t, st, fp, Config{})
 
-	require.NoError(t, mgr.Recover(context.Background()))
+	require.NoError(t, mgr.Adopt(context.Background()))
 
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
-	require.ElementsMatch(t, []int{10001, 10002, 10003}, fp.destroys)
+	row, err := st.Get(10008)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State)
 }
 
-// TestRecover_NoProxmoxVMsIsNoop: a clean startup (no leaked VMs) must
-// neither destroy anything nor return an error.
-func TestRecover_NoProxmoxVMsIsNoop(t *testing.T) {
+// TestAdopt_NoVMs_IsNoop: a clean startup (no inherited VMs) is a
+// successful no-op.
+func TestAdopt_NoVMs_IsNoop(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	fp := &fakeProv{listOwnedRet: nil}
 	mgr := newTestManager(t, st, fp, Config{})
 
-	require.NoError(t, mgr.Recover(context.Background()))
+	require.NoError(t, mgr.Adopt(context.Background()))
 
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
-	require.Empty(t, fp.destroys)
+	rows, err := st.List()
+	require.NoError(t, err)
+	require.Empty(t, rows)
 }
 
-// TestRecover_PropagatesListError: a Proxmox API failure on startup must
-// surface as an error so the operator sees something concrete instead of
-// the orchestrator silently starting with a stale view.
-func TestRecover_PropagatesListError(t *testing.T) {
+// TestAdopt_PropagatesListError: a Proxmox ListOwnedVMs failure aborts
+// adoption — without it, the new leader would start with an empty store
+// AND every gh.Reconciler tick would also fail to enumerate, leaving
+// inherited VMs effectively invisible. Surfacing the error lets the
+// caller log + continue with an empty pool (the reconciler will adopt
+// any stranded VMs once the API recovers).
+func TestAdopt_PropagatesListError(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	fp := &fakeProv{listErr: errors.New("proxmox down")}
 	mgr := newTestManager(t, st, fp, Config{})
 
-	err := mgr.Recover(context.Background())
+	err := mgr.Adopt(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "proxmox down")
 }
 
-// TestRecover_PartialFailureReturnsAggregatedError: even ONE orphan that
-// fails to destroy makes Recover return a non-nil error. The orchestrator
-// would otherwise start cloning fresh VMs on top of leaked ones — exactly
-// the resource exhaustion Recover exists to prevent.
-//
-// Successful destroys are still applied (we don't roll back); the error
-// just signals "the post-condition isn't fully met".
-func TestRecover_PartialFailureReturnsAggregatedError(t *testing.T) {
+// TestAdopt_MultipleVMs_AllAdopted: every inherited VM, across multiple
+// nodes, ends up in the store with no destroys.
+func TestAdopt_MultipleVMs_AllAdopted(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	boom := errors.New("proxmox 500 on node-B")
 	fp := &fakeProv{
 		listOwnedRet: []*provisioner.VM{
-			{VMID: 10001, Node: "pve1", Name: "ok-1"},
-			{VMID: 10002, Node: "pve2", Name: "broken"},
-			{VMID: 10003, Node: "pve1", Name: "ok-2"},
+			{VMID: 10010, Node: "pve1", Name: "gh-runner-test-10010"},
+			{VMID: 10011, Node: "pve2", Name: "gh-runner-test-10011"},
+			{VMID: 10012, Node: "pve1", Name: "gh-runner-test-10012"},
 		},
-		destroyErrFor: map[int]error{10002: boom},
+		powerStateBy: map[int]string{10010: "running", 10011: "stopped", 10012: "running"},
 	}
 	mgr := newTestManager(t, st, fp, Config{})
 
-	err := mgr.Recover(context.Background())
-	require.Error(t, err)
-	// Operator-facing message names how many failed.
-	require.Contains(t, err.Error(), "1 of 3")
-	// The underlying failure is wrapped, not flattened, so errors.Is
-	// against the original sentinel still works.
-	require.ErrorIs(t, err, boom)
-	// The healthy orphans were still destroyed.
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	for _, vmid := range []int{10010, 10011, 10012} {
+		_, err := st.Get(vmid)
+		require.NoError(t, err, "vmid %d should be adopted into the store", vmid)
+	}
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
-	require.ElementsMatch(t, []int{10001, 10002, 10003}, fp.destroys)
-}
-
-// TestRecover_AllOrphansFailReportsAll: all orphans failing must surface
-// every underlying error so an operator dumping the log sees the full
-// scope of the leak.
-func TestRecover_AllOrphansFailReportsAll(t *testing.T) {
-	t.Parallel()
-	st := newTestStore(t)
-	fp := &fakeProv{
-		listOwnedRet: []*provisioner.VM{
-			{VMID: 10001, Node: "pve1"},
-			{VMID: 10002, Node: "pve1"},
-		},
-		destroyErr: errors.New("proxmox unreachable"),
-	}
-	mgr := newTestManager(t, st, fp, Config{})
-
-	err := mgr.Recover(context.Background())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "2 of 2")
-	require.Contains(t, err.Error(), "vmid=10001")
-	require.Contains(t, err.Error(), "vmid=10002")
+	require.Empty(t, fp.destroys, "adopt must not destroy any VM")
 }
 
 // TestAcquire_OldestHotFirst: when multiple Hot VMs are present, Acquire

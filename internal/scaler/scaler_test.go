@@ -122,7 +122,7 @@ func (f *fakePool) SetRunnerID(context.Context, int, int64) error             { 
 func (f *fakePool) PromoteToRunning(context.Context, int, int64, int64) error { return nil }
 func (f *fakePool) ForceDestroy(context.Context, int, string) error           { return nil }
 func (f *fakePool) ListRows(context.Context) ([]pool.RowSnapshot, error)      { return nil, nil }
-func (f *fakePool) Recover(context.Context) error                             { return nil }
+func (f *fakePool) Adopt(context.Context) error                               { return nil }
 func (f *fakePool) Run(context.Context) error                                 { return nil }
 func (f *fakePool) SignalRefill()                                             {}
 
