@@ -15,6 +15,7 @@ linters:
     - revive
     - bodyclose
     - errname
+    - errorlint
     - exhaustive
     - nilerr
     - prealloc
