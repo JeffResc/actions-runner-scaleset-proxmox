@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/app"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
@@ -81,6 +82,19 @@ type Options struct {
 	// see no Clone / Start / Destroy traffic — read calls
 	// (template discovery, ping, list) still pass through.
 	DryRun bool
+
+	// KubeClient enables Kubernetes leader-election mode. When
+	// non-nil, the harness sets cluster.mode = "kubernetes" and
+	// passes the supplied client through to the orchestrator. Tests
+	// pass a k8s.io/client-go/kubernetes/fake clientset; sharing one
+	// across multiple harness instances is what makes leader election
+	// meaningful between them.
+	KubeClient kubernetes.Interface
+
+	// Identity is this replica's K8s identity (mirrors POD_NAME). Only
+	// used when KubeClient is set. Must be unique across replicas
+	// participating in the same Lease.
+	Identity string
 }
 
 // Start spins up the fakes (if not supplied) and launches app.Run in a
@@ -130,7 +144,7 @@ func Start(t testing.TB, opts Options) *Harness {
 	t.Setenv("PROXMOX_TOKEN_SECRET", proxmoxTokenSecret)
 	t.Setenv("SCALESET_ADMIN_SECRET", adminSecret)
 
-	configPath := writeConfig(t, configValues{
+	cv := configValues{
 		ProxmoxURL:           proxmox.URL,
 		Org:                  opts.Org,
 		ScaleSetName:         opts.ScaleSetName,
@@ -139,7 +153,28 @@ func Start(t testing.TB, opts Options) *Harness {
 		MaxConcurrentRunners: opts.MaxConcurrentRunners,
 		ObsAddr:              obsAddr,
 		AdminAddr:            adminAddr,
-	})
+	}
+	if opts.KubeClient != nil {
+		identity := opts.Identity
+		if identity == "" {
+			identity = "replica-default"
+		}
+		cv.ClusterMode = "kubernetes"
+		cv.LeaseName = "scaleset-" + opts.ScaleSetName
+		cv.LeaseNamespace = "e2e"
+		cv.Identity = identity
+		cv.PodIP = "127.0.0.1"
+		// Election timings. Sub-second values flake under -race
+		// because the race detector adds 2-10x overhead on every
+		// renewal goroutine; 1s/700ms/200ms keeps tests fast while
+		// surviving stressful CI conditions and respects the
+		// library's LeaseDuration > RenewDeadline > RetryPeriod
+		// ordering check.
+		cv.LeaseDuration = "1s"
+		cv.RenewDeadline = "700ms"
+		cv.RetryPeriod = "200ms"
+	}
+	configPath := writeConfig(t, cv)
 
 	auth, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
 		Token:       ghToken,
@@ -156,6 +191,7 @@ func Start(t testing.TB, opts Options) *Harness {
 			DryRun:       opts.DryRun,
 			Version:      "e2e",
 			AuthOverride: auth,
+			KubeClient:   opts.KubeClient,
 		})
 	}()
 
@@ -267,6 +303,18 @@ type configValues struct {
 	MaxConcurrentRunners int
 	ObsAddr              string
 	AdminAddr            string
+
+	// Cluster mode plumbing. When ClusterMode is "kubernetes" the
+	// template emits the cluster.kubernetes block; otherwise it's
+	// omitted (default = standalone).
+	ClusterMode    string // "standalone" or "kubernetes"
+	LeaseName      string
+	LeaseNamespace string
+	Identity       string
+	PodIP          string
+	LeaseDuration  string
+	RenewDeadline  string
+	RetryPeriod    string
 }
 
 const configTmpl = `
@@ -323,7 +371,17 @@ admin_api:
   http_addr: "{{.AdminAddr}}"
   shared_secret_env: SCALESET_ADMIN_SECRET
 cluster:
-  mode: standalone
+  mode: {{if .ClusterMode}}{{.ClusterMode}}{{else}}standalone{{end}}
+{{- if eq .ClusterMode "kubernetes" }}
+  kubernetes:
+    lease_name: {{.LeaseName}}
+    lease_namespace: {{.LeaseNamespace}}
+    identity: {{.Identity}}
+    pod_ip: {{.PodIP}}
+    lease_duration: {{.LeaseDuration}}
+    renew_deadline: {{.RenewDeadline}}
+    retry_period: {{.RetryPeriod}}
+{{- end }}
 `
 
 func writeConfig(t testing.TB, v configValues) string {
