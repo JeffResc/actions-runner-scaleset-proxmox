@@ -65,6 +65,20 @@ The same binary supports both single-process and Kubernetes multi-replica deploy
 
 A Helm chart for Kubernetes deployment lives in [deploy/chart/](deploy/chart/).
 
+## Development
+
+Common workflows ship as [Taskfile](https://taskfile.dev) targets — `task --list` to discover them:
+
+| Target | Purpose |
+| --- | --- |
+| `task test` | Unit tests, race-enabled, no build tags |
+| `task e2e` | In-process e2e suite against fake Proxmox + fake GitHub (no external deps; ~30s) |
+| `task e2e-packer` | `packer validate -syntax-only` on the HCL (skips if Packer not installed) |
+| `task build` | Compile `bin/scaleset` |
+| `task lint` | `golangci-lint` over the module |
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full dev setup.
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
