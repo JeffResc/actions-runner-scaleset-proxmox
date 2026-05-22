@@ -1,6 +1,15 @@
 package config_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -587,4 +596,138 @@ func TestCluster_RejectsUnknownMode(t *testing.T) {
 	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
 	_, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: bogus\n"))
 	require.Error(t, err)
+}
+
+// TestParse_AdminAPI_TLSValidation: when admin_api.tls is set, the
+// referenced files must exist; absent files surface as a Config.Validate
+// error with the file path included for ops.
+func TestParse_AdminAPI_TLSValidation(t *testing.T) {
+	certPath, keyPath := writeSelfSignedKeypair(t)
+	caPath := certPath // a self-signed cert doubles as its own CA bundle
+
+	cases := []struct {
+		name      string
+		yamlBlock string
+		wantErr   string
+	}{
+		{
+			name:      "valid one-way tls",
+			yamlBlock: "admin_api:\n  tls:\n    cert_file: " + certPath + "\n    key_file: " + keyPath + "\n",
+		},
+		{
+			name:      "valid mtls",
+			yamlBlock: "admin_api:\n  tls:\n    cert_file: " + certPath + "\n    key_file: " + keyPath + "\n    ca_file: " + caPath + "\n",
+		},
+		{
+			name:      "missing cert_file",
+			yamlBlock: "admin_api:\n  tls:\n    cert_file: /no/such/cert.pem\n    key_file: " + keyPath + "\n",
+			wantErr:   "admin_api.tls.cert_file",
+		},
+		{
+			name:      "missing key_file",
+			yamlBlock: "admin_api:\n  tls:\n    cert_file: " + certPath + "\n    key_file: /no/such/key.pem\n",
+			wantErr:   "admin_api.tls.key_file",
+		},
+		{
+			name:      "missing ca_file",
+			yamlBlock: "admin_api:\n  tls:\n    cert_file: " + certPath + "\n    key_file: " + keyPath + "\n    ca_file: /no/such/ca.pem\n",
+			wantErr:   "admin_api.tls.ca_file",
+		},
+		{
+			name:      "empty cert_file rejected",
+			yamlBlock: "admin_api:\n  tls:\n    cert_file: \"\"\n    key_file: " + keyPath + "\n",
+			wantErr:   "CertFile",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+			src := validPATYAML + tc.yamlBlock
+			_, err := config.Parse([]byte(src))
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestTLSConfig_BuildServerAndClient: BuildServerTLS / BuildClientTLS
+// must load a real keypair, and BuildServerTLS must enforce
+// RequireAndVerifyClientCert when CAFile is set.
+func TestTLSConfig_BuildServerAndClient(t *testing.T) {
+	certPath, keyPath := writeSelfSignedKeypair(t)
+	caPath := certPath // self-signed cert is its own root for this test
+
+	t.Run("oneway", func(t *testing.T) {
+		tc := config.TLSConfig{CertFile: certPath, KeyFile: keyPath}
+		s, err := tc.BuildServerTLS()
+		require.NoError(t, err)
+		require.Equal(t, tls.NoClientCert, s.ClientAuth)
+		require.NotEmpty(t, s.Certificates)
+		c, err := tc.BuildClientTLS()
+		require.NoError(t, err)
+		require.Nil(t, c.RootCAs, "RootCAs unset when no CAFile")
+	})
+	t.Run("mtls", func(t *testing.T) {
+		tc := config.TLSConfig{CertFile: certPath, KeyFile: keyPath, CAFile: caPath}
+		s, err := tc.BuildServerTLS()
+		require.NoError(t, err)
+		require.Equal(t, tls.RequireAndVerifyClientCert, s.ClientAuth,
+			"mTLS mode must require + verify the client cert")
+		c, err := tc.BuildClientTLS()
+		require.NoError(t, err)
+		require.NotNil(t, c.RootCAs, "RootCAs populated when CAFile set")
+	})
+	t.Run("rejects bad pem", func(t *testing.T) {
+		bad := filepath.Join(t.TempDir(), "junk.pem")
+		require.NoError(t, os.WriteFile(bad, []byte("not a pem"), 0o600))
+		tc := config.TLSConfig{CertFile: bad, KeyFile: bad}
+		_, err := tc.BuildServerTLS()
+		require.Error(t, err)
+	})
+}
+
+// writeSelfSignedKeypair generates a fresh self-signed cert + key on
+// disk and returns their paths. The cert is valid for "localhost" only
+// — enough for our admin-API tests, which dial loopback.
+func writeSelfSignedKeypair(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+
+	cfh, err := os.Create(certPath)
+	require.NoError(t, err)
+	require.NoError(t, pem.Encode(cfh, &pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	require.NoError(t, cfh.Close())
+
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	require.NoError(t, err)
+	kfh, err := os.Create(keyPath)
+	require.NoError(t, err)
+	require.NoError(t, pem.Encode(kfh, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	require.NoError(t, kfh.Close())
+
+	return certPath, keyPath
 }

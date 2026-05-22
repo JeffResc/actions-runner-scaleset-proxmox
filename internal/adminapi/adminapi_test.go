@@ -2,12 +2,23 @@ package adminapi
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -564,6 +575,108 @@ func TestRealIP_XFFPrecedence(t *testing.T) {
 
 	require.Equal(t, "203.0.113.10", seenRemote,
 		"first XFF entry should win over X-Real-IP / True-Client-IP")
+}
+
+// TestServe_TLS_RoundTripsBearer: when TLSConfig is set, the admin
+// server listens over https and a correctly-configured client gets a
+// successful 200 with the shared bearer. Guards against the bug where
+// the bearer secret would travel in cleartext between standby
+// Forwarder and leader.
+func TestServe_TLS_RoundTripsBearer(t *testing.T) {
+	t.Parallel()
+	certPath, keyPath := generateAdminAPITestKeypair(t)
+	serverCert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	require.NoError(t, err)
+	pemBytes, err := os.ReadFile(certPath)
+	require.NoError(t, err)
+	rootPool := x509.NewCertPool()
+	require.True(t, rootPool.AppendCertsFromPEM(pemBytes))
+
+	// Reserve an ephemeral port: Serve binds to cfg.HTTPAddr, so we
+	// resolve a free port first.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	s := New(
+		Config{
+			HTTPAddr:     addr,
+			SharedSecret: "topsecret",
+			TLSConfig:    &tls.Config{Certificates: []tls.Certificate{serverCert}, MinVersion: tls.VersionTLS12},
+			TLSCertFile:  certPath,
+			TLSKeyFile:   keyPath,
+		},
+		func() pool.Manager { return &fakePool{stats: pool.Stats{Hot: 1}} },
+		nil,
+		AlwaysLeader{},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Serve(ctx) }()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootPool, MinVersion: tls.VersionTLS12}}}
+	url := "https://" + addr + "/admin/state"
+	var resp *http.Response
+	require.Eventually(t, func() bool {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("Authorization", "Bearer topsecret")
+		r, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		resp = r
+		return true
+	}, 2*time.Second, 25*time.Millisecond, "TLS admin server never accepted")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	cancel()
+	require.NoError(t, <-errCh)
+}
+
+// generateAdminAPITestKeypair writes a self-signed loopback cert and
+// returns the file paths. Standalone helper so this test file doesn't
+// import test fixtures from internal/config.
+func generateAdminAPITestKeypair(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+
+	cfh, err := os.Create(certPath)
+	require.NoError(t, err)
+	require.NoError(t, pem.Encode(cfh, &pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	require.NoError(t, cfh.Close())
+
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	require.NoError(t, err)
+	kfh, err := os.Create(keyPath)
+	require.NoError(t, err)
+	require.NoError(t, pem.Encode(kfh, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	require.NoError(t, kfh.Close())
+	return certPath, keyPath
 }
 
 // TestAuth_RateLimit_CannotBeSpoofedViaXFF: end-to-end guard against

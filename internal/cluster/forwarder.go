@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -21,17 +22,28 @@ import (
 // Unavailable with Retry-After: 2 so a hook script's retry loop can
 // converge once a leader is elected.
 type Forwarder struct {
-	coord Coordinator
-	proxy *httputil.ReverseProxy
+	coord  Coordinator
+	proxy  *httputil.ReverseProxy
+	scheme string // "http" or "https" — chosen at construction time
 }
 
-// NewForwarder builds a Forwarder around the given Coordinator. The
-// returned handler is safe for concurrent use.
-func NewForwarder(coord Coordinator) *Forwarder {
-	f := &Forwarder{coord: coord}
+// NewForwarder builds a Forwarder around the given Coordinator. When
+// tlsClient is non-nil the Forwarder dials the leader over https with
+// the supplied TLS config (typical use: a private CA + client cert for
+// mTLS). Nil leaves inter-replica traffic plain — only safe on a
+// cluster-internal subnet. The returned handler is safe for concurrent
+// use.
+func NewForwarder(coord Coordinator, tlsClient *tls.Config) *Forwarder {
+	f := &Forwarder{coord: coord, scheme: "http"}
+	transport := http.DefaultTransport
+	if tlsClient != nil {
+		f.scheme = "https"
+		transport = &http.Transport{TLSClientConfig: tlsClient.Clone()}
+	}
 	f.proxy = &httputil.ReverseProxy{
 		Director:     f.director,
 		ErrorHandler: f.errorHandler,
+		Transport:    transport,
 	}
 	return f
 }
@@ -57,10 +69,10 @@ func (f *Forwarder) director(r *http.Request) {
 		*r = *r.WithContext(context.WithValue(r.Context(), noLeaderKey{}, true))
 		// Leave URL pointing nowhere; the transport will fail and
 		// errorHandler runs.
-		r.URL = &url.URL{Scheme: "http", Host: "127.0.0.1:0"}
+		r.URL = &url.URL{Scheme: f.scheme, Host: "127.0.0.1:0"}
 		return
 	}
-	r.URL.Scheme = "http"
+	r.URL.Scheme = f.scheme
 	r.URL.Host = endpoint
 	r.Host = endpoint
 	r.RequestURI = ""
