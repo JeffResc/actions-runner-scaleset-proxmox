@@ -216,7 +216,7 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	// repeated retries against the same VMID accumulate orphan runner
 	// registrations and every subsequent GenerateJitRunnerConfig call
 	// returns 409 "runner already exists", permanently breaking the pool.
-	s.cleanupStaleRunnerByName(ctx, vmObj.Name)
+	s.cleanupStaleRunnerByName(vmObj.Name)
 
 	jitCfg, err := s.gh.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{
 		Name:       vmObj.Name,
@@ -267,7 +267,7 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		}
 		// Also deregister the runner we just minted; otherwise the
 		// next clone of this VMID will hit a 409.
-		s.cleanupStaleRunnerByName(ctx, vmObj.Name)
+		s.cleanupStaleRunnerByName(vmObj.Name)
 		if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
 			s.log.Warn("mark completed failed after jit injection error", "vmid", vmObj.VMID, "err", mcErr)
 		}
@@ -284,7 +284,15 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 // break the pool (every clone of the same VMID hits 409), so we surface
 // failures via the GitHubErrors metric — operators see the rate climb
 // even though we don't return the error.
-func (s *Scaler) cleanupStaleRunnerByName(ctx context.Context, name string) {
+func (s *Scaler) cleanupStaleRunnerByName(name string) {
+	// Detach from the listener's ctx: this cleanup is idempotent and
+	// purely defensive (avoid 409 conflicts on retry / avoid leaking a
+	// registration after a failed inject). A cancelled listener ctx
+	// must not abort the in-flight GitHub deregister and leave a stale
+	// registration behind.
+	ctx, cancel := context.WithTimeout(context.Background(), staleRunnerCleanupTimeout)
+	defer cancel()
+
 	existing, err := s.gh.GetRunnerByName(ctx, name)
 	if err != nil {
 		if s.metrics != nil {
@@ -306,6 +314,12 @@ func (s *Scaler) cleanupStaleRunnerByName(ctx context.Context, name string) {
 	}
 	s.log.Info("removed stale runner registration", "name", name, "id", existing.ID)
 }
+
+// staleRunnerCleanupTimeout bounds the detached GitHub round-trip for
+// cleanupStaleRunnerByName. Long enough for a real GH API call, short
+// enough that pathological GH unavailability can't pin the caller.
+// Tests may override this.
+var staleRunnerCleanupTimeout = 15 * time.Second
 
 // injectWithRetry calls InjectJITConfig with a longer retry budget than
 // the underlying HTTP transport for the specific "VM is not running"
