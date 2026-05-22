@@ -141,6 +141,15 @@ type raftCoord struct {
 	tr     raft.Transport
 	leader atomic.Bool
 
+	// onDeposeWait bounds how long the leader-change loop will wait
+	// for a previous OnElected goroutine to finish before starting a
+	// new transition. raft.LeaderCh's old consumer waited
+	// indefinitely, which could freeze the state machine when an
+	// OnElected callback (e.g. runLeaderPlane) was slow to wind down.
+	// Derived from HeartbeatTimeout so a stuck callback can't pin
+	// leadership state longer than the cluster's own heartbeat budget.
+	onDeposeWait time.Duration
+
 	// peersByRaftAddr maps a raft address back to its HTTP address.
 	// Populated once at construction (peer list is static), so
 	// LeaderEndpoint is a pure in-memory lookup.
@@ -241,6 +250,7 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 		log:             log,
 		r:               r,
 		tr:              tr,
+		onDeposeWait:    rcfg.HeartbeatTimeout,
 		peersByRaftAddr: peersByRaftAddr,
 	}, nil
 }
@@ -262,49 +272,105 @@ func (k *raftCoord) Run(ctx context.Context) error {
 		}
 	}()
 
-	// Translate raft.LeaderCh transitions into Callbacks. The channel
-	// emits true when this node becomes leader and false when it
-	// stops. We cancel the per-leadership ctx on stop so OnElected
-	// returns promptly.
+	// Translate leader transitions into Callbacks. We use
+	// raft.RegisterObserver rather than LeaderCh: LeaderCh is a
+	// hidden buffer-1 channel that drops transitions if the receiver
+	// is slow (hashicorp/raft docs flag it best-effort). With a
+	// properly-sized observer channel we see every relevant change.
+	// We don't trust the observation payload — instead we treat each
+	// event as a wake-up and read k.r.State() to derive the current
+	// truth. That makes the loop idempotent: even if the channel
+	// somehow drops one event, the next one converges state again.
+	obsCh := make(chan raft.Observation, 16)
+	filter := func(o *raft.Observation) bool {
+		switch o.Data.(type) {
+		case raft.LeaderObservation, raft.RaftState:
+			return true
+		default:
+			return false
+		}
+	}
+	observer := raft.NewObserver(obsCh, false, filter)
+	k.r.RegisterObserver(observer)
+	defer k.r.DeregisterObserver(observer)
+
 	var (
 		leaderCtx    context.Context
 		leaderCancel context.CancelFunc
 		leaderWG     sync.WaitGroup
+		wasLeader    bool
 	)
+
+	// waitWithCap awaits leaderWG with a timeout so a slow OnElected
+	// (e.g. runLeaderPlane stuck on a 30s GH call) can't freeze the
+	// state machine. If the wait deadline is hit we log and proceed —
+	// IsLeader() has already flipped, so admin-plane forwarding is
+	// already consistent with the new reality.
+	waitWithCap := func() {
+		if k.onDeposeWait <= 0 {
+			leaderWG.Wait()
+			return
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			leaderWG.Wait()
+		}()
+		select {
+		case <-done:
+		case <-time.After(k.onDeposeWait):
+			k.log.Warn("cluster: previous OnElected did not return within onDeposeWait; proceeding",
+				"node_id", k.cfg.NodeID, "wait", k.onDeposeWait)
+		}
+	}
+
+	handle := func() {
+		isLeader := k.r.State() == raft.Leader
+		if isLeader == wasLeader {
+			return
+		}
+		wasLeader = isLeader
+		if isLeader {
+			k.leader.Store(true)
+			k.log.Info("cluster: became leader",
+				"node_id", k.cfg.NodeID,
+				"endpoint", k.cfg.localEndpoint())
+			leaderCtx, leaderCancel = context.WithCancel(ctx)
+			if k.cb.OnElected != nil {
+				leaderWG.Add(1)
+				lctx := leaderCtx
+				go func() {
+					defer leaderWG.Done()
+					k.cb.OnElected(lctx)
+				}()
+			}
+		} else {
+			k.leader.Store(false)
+			k.log.Info("cluster: lost leadership", "node_id", k.cfg.NodeID)
+			if leaderCancel != nil {
+				leaderCancel()
+				waitWithCap()
+				leaderCtx, leaderCancel = nil, nil
+			}
+			if k.cb.OnDeposed != nil {
+				k.cb.OnDeposed()
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			if leaderCancel != nil {
 				leaderCancel()
-				leaderWG.Wait()
 			}
+			// Final, unbounded wait: process is shutting down, so
+			// we must reap the OnElected goroutine before Run
+			// returns.
+			leaderWG.Wait()
 			return nil
-		case isLeader := <-k.r.LeaderCh():
-			if isLeader {
-				k.leader.Store(true)
-				k.log.Info("cluster: became leader",
-					"node_id", k.cfg.NodeID,
-					"endpoint", k.cfg.localEndpoint())
-				leaderCtx, leaderCancel = context.WithCancel(ctx)
-				if k.cb.OnElected != nil {
-					leaderWG.Add(1)
-					go func() {
-						defer leaderWG.Done()
-						k.cb.OnElected(leaderCtx)
-					}()
-				}
-			} else {
-				k.leader.Store(false)
-				k.log.Info("cluster: lost leadership", "node_id", k.cfg.NodeID)
-				if leaderCancel != nil {
-					leaderCancel()
-					leaderWG.Wait()
-					leaderCtx, leaderCancel = nil, nil
-				}
-				if k.cb.OnDeposed != nil {
-					k.cb.OnDeposed()
-				}
-			}
+		case <-obsCh:
+			handle()
 		}
 	}
 }
