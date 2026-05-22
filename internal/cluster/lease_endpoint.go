@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,11 +53,15 @@ type leaderEndpointCache struct {
 	annotation string
 	ttl        time.Duration
 
-	mu       sync.Mutex
-	value    string
-	fetched  time.Time
-	lastErr  error
-	inflight chan struct{} // closed when an in-flight refresh completes
+	mu      sync.Mutex
+	value   string
+	fetched time.Time
+	lastErr error
+
+	// sf collapses concurrent cache-miss refreshes into a single
+	// kube-apiserver round-trip. Same pattern used in
+	// internal/nodeselector for Proxmox /cluster/resources polling.
+	sf singleflight.Group
 }
 
 // newLeaderEndpointCache constructs a cache. TTL defaults to 4× the
@@ -74,9 +79,11 @@ func newLeaderEndpointCache(client kubernetes.Interface, namespace, name, annota
 }
 
 // get returns the cached endpoint when fresh; otherwise refreshes from
-// the K8s API. Concurrent callers during a refresh share the in-flight
-// request via a sync channel so we never issue more than one API call
-// at a time.
+// the K8s API. Concurrent callers during a refresh share one fetch via
+// singleflight so we never issue more than one API call at a time.
+//
+// DoChan (not Do) is used so a late caller can still observe ctx.Done
+// and bail without being pinned to the first caller's fetch duration.
 func (c *leaderEndpointCache) get(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	if !c.fetched.IsZero() && time.Since(c.fetched) < c.ttl {
@@ -84,34 +91,28 @@ func (c *leaderEndpointCache) get(ctx context.Context) (string, error) {
 		c.mu.Unlock()
 		return v, e
 	}
-	// Coalesce with any in-flight refresh.
-	if c.inflight != nil {
-		ch := c.inflight
-		c.mu.Unlock()
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
-		c.mu.Lock()
-		v, e := c.value, c.lastErr
-		c.mu.Unlock()
-		return v, e
+	c.mu.Unlock()
+
+	type result struct {
+		value string
+		err   error
 	}
-	ch := make(chan struct{})
-	c.inflight = ch
-	c.mu.Unlock()
-
-	value, err := c.fetch(ctx)
-
-	c.mu.Lock()
-	c.value = value
-	c.lastErr = err
-	c.fetched = time.Now()
-	c.inflight = nil
-	close(ch)
-	c.mu.Unlock()
-	return value, err
+	ch := c.sf.DoChan("fetch", func() (any, error) {
+		value, err := c.fetch(ctx)
+		c.mu.Lock()
+		c.value = value
+		c.lastErr = err
+		c.fetched = time.Now()
+		c.mu.Unlock()
+		return result{value: value, err: err}, nil
+	})
+	select {
+	case r := <-ch:
+		res := r.Val.(result)
+		return res.value, res.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 func (c *leaderEndpointCache) fetch(ctx context.Context) (string, error) {
