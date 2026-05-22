@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -155,8 +156,13 @@ func mintAdminJWT() string {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleRegistrationToken(w http.ResponseWriter, _ *http.Request) {
+	// #nosec G101 -- this is a fake test server: the literal is the
+	// fake's response payload, not a real credential. gosec flags
+	// any "Token: <string>" field assignment as a possible hardcoded
+	// credential; in test infrastructure that's the whole point.
+	const fakeToken = "fakegithub-registration-token"
 	writeJSON(w, http.StatusCreated, registrationTokenResp{
-		Token:     "fakegithub-registration-token",
+		Token:     fakeToken,
 		ExpiresAt: time.Now().Add(1 * time.Hour),
 	})
 }
@@ -338,8 +344,11 @@ func (s *Server) handleRunnerDelete(w http.ResponseWriter, r *http.Request) {
 	// can assert "scaler removed runner N" without distinguishing
 	// which API surface drove it.
 	idStr := chi.URLParam(r, "id")
-	var id int64
-	fmt.Sscanf(idStr, "%d", &id)
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "bad runner id "+idStr, http.StatusBadRequest)
+		return
+	}
 	s.mu.Lock()
 	s.deletions = append(s.deletions, id)
 	s.mu.Unlock()
