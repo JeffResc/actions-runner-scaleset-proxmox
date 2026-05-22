@@ -1768,6 +1768,70 @@ func TestAllocateVMID_AllRangeRecentlyDestroyedReturnsError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestDestroy_RunnerIDSetDuringDestroyIsObserved: SetRunnerID can land
+// concurrently while destroy() is inside prov.Destroy (a sub-15s job
+// completing before the gh.Reconciler has tagged the row). The previous
+// destroy() read the row BEFORE prov.Destroy, so a concurrent stamp was
+// invisible and the GitHub registration leaked.
+//
+// With DeleteAndReturn the runner_id read happens in the same write
+// txn as the row delete — the orphan callback sees the latest value.
+func TestDestroy_RunnerIDSetDuringDestroyIsObserved(t *testing.T) {
+	st := newTestStore(t)
+
+	const lateRunnerID int64 = 99999
+	stamped := make(chan struct{})
+	fp := &fakeProv{
+		onDestroy: func() {
+			// Simulate the scaler stamping a runner_id mid-destroy.
+			if _, err := st.Update(10060, func(v *store.VM) {
+				v.RunnerID = lateRunnerID
+			}); err != nil {
+				t.Errorf("Update RunnerID failed: %v", err)
+			}
+			close(stamped)
+		},
+	}
+
+	var sawRunnerID atomic.Int64
+	cb := func(_ context.Context, runnerID int64) error {
+		sawRunnerID.Store(runnerID)
+		return nil
+	}
+
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          1,
+		OnRunnerOrphaned: cb,
+		DrainTimeout:     time.Second,
+	})
+
+	// Insert a row that has NO runner_id at first — the pre-Destroy
+	// Get would have read 0 and the orphan callback would have been
+	// skipped entirely. After the in-flight stamp it carries
+	// lateRunnerID.
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 10060, Node: "pve1", Name: "race-victim",
+		PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	_, err := st.UpdateState(10060, store.StateHot, store.StateDestroying, nil)
+	require.NoError(t, err)
+
+	mgr.destroy(context.Background(), 10060, "pve1")
+
+	select {
+	case <-stamped:
+	case <-time.After(time.Second):
+		t.Fatalf("onDestroy hook did not run; test setup is broken")
+	}
+
+	require.Equal(t, lateRunnerID, sawRunnerID.Load(),
+		"OnRunnerOrphaned must observe the RunnerID stamped during destroy, not a stale pre-Destroy read")
+
+	// Row really is gone.
+	_, err = st.Get(10060)
+	require.Error(t, err)
+}
+
 // TestDestroy_OnRunnerOrphanedErrorDoesNotBlockDestroy: when the
 // OnRunnerOrphaned callback (which deregisters the GitHub runner)
 // returns an error — common during a GitHub rate-limit or 5xx burst —

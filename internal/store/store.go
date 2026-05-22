@@ -240,6 +240,32 @@ func (s *Store) Delete(vmid int) error {
 	return nil
 }
 
+// DeleteAndReturn removes the row with the given VMID and returns a
+// snapshot of it as it existed at the instant of deletion. A missing
+// row returns (nil, nil) so callers can treat double-delete as a no-op.
+//
+// The lookup and delete happen in the same write transaction. This is
+// the variant callers should use when they need a field off the row
+// (e.g. RunnerID for orphan cleanup) immediately after destroy: a
+// separate Get-then-Delete races with concurrent SetRunnerID writes.
+func (s *Store) DeleteAndReturn(vmid int) (*VM, error) {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+	existing, err := txn.First(tableVM, "id", vmid)
+	if err != nil {
+		return nil, fmt.Errorf("store: delete-and-return: lookup %d: %w", vmid, err)
+	}
+	if existing == nil {
+		return nil, nil
+	}
+	row := existing.(*VM)
+	if err := txn.Delete(tableVM, existing); err != nil {
+		return nil, fmt.Errorf("store: delete-and-return %d: %w", vmid, err)
+	}
+	txn.Commit()
+	return row.Clone(), nil
+}
+
 // Update applies mutate to a copy of the row and persists it. UpdatedAt is
 // stamped automatically. Returns ErrNotFound if vmid is unknown. The
 // caller's mutate function must NOT change VMID — that field is the
