@@ -21,11 +21,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jellydator/ttlcache/v3"
 	"golang.org/x/time/rate"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
@@ -84,52 +84,35 @@ const (
 	authFailIdle  = 10 * time.Minute
 )
 
-// perIPLimiter holds one token bucket per source IP, with idle entries
-// swept out to bound memory under attack. It's intentionally a small
-// re-implementation of the same pattern previously used by the
-// runner-hook receiver — kept simple because the admin API has a much
-// smaller call-graph and no proxy-header complexity to worry about.
+// perIPLimiter holds one token bucket per source IP. Idle entries are
+// evicted by ttlcache's background goroutine (started in Serve) so the
+// underlying map can't grow under sustained attack from many unique IPs.
+//
+// Default touch-on-hit semantics extend the TTL on every allow() call,
+// so an actively-attacking IP keeps its limiter for the full burst
+// budget rather than being recreated mid-attack with a fresh bucket.
 type perIPLimiter struct {
 	rps   rate.Limit
 	burst int
-	idle  time.Duration
 
-	mu       sync.Mutex
-	limiters map[string]*ipEntry
-}
-
-type ipEntry struct {
-	limiter  *rate.Limiter
-	lastSeen time.Time
+	cache *ttlcache.Cache[string, *rate.Limiter]
 }
 
 func newPerIPLimiter(rps rate.Limit, burst int, idle time.Duration) *perIPLimiter {
 	return &perIPLimiter{
-		rps: rps, burst: burst, idle: idle,
-		limiters: map[string]*ipEntry{},
+		rps:   rps,
+		burst: burst,
+		cache: ttlcache.New[string, *rate.Limiter](
+			ttlcache.WithTTL[string, *rate.Limiter](idle),
+		),
 	}
 }
 
 func (p *perIPLimiter) allow(ip string, now time.Time) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.limiters[ip]
-	if !ok {
-		e = &ipEntry{limiter: rate.NewLimiter(p.rps, p.burst)}
-		p.limiters[ip] = e
-	}
-	e.lastSeen = now
-	return e.limiter.AllowN(now, 1)
-}
-
-func (p *perIPLimiter) sweep(now time.Time) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for ip, e := range p.limiters {
-		if now.Sub(e.lastSeen) > p.idle {
-			delete(p.limiters, ip)
-		}
-	}
+	item, _ := p.cache.GetOrSetFunc(ip, func() *rate.Limiter {
+		return rate.NewLimiter(p.rps, p.burst)
+	})
+	return item.Value().AllowN(now, 1)
 }
 
 // remoteIP strips the port from a net.RemoteAddr string; falls back to
@@ -229,19 +212,13 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		errCh <- nil
 	}()
-	// Sweep idle per-IP rate-limit entries so the limiters map can't
-	// grow unboundedly under sustained attack from many unique IPs.
+	// ttlcache.Start runs a background eviction loop that prunes idle
+	// per-IP rate-limit entries so the underlying map can't grow under
+	// sustained attack from many unique IPs.
+	go s.authFailLimiter.cache.Start()
 	go func() {
-		t := time.NewTicker(authFailIdle)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-t.C:
-				s.authFailLimiter.sweep(now)
-			}
-		}
+		<-ctx.Done()
+		s.authFailLimiter.cache.Stop()
 	}()
 	select {
 	case <-ctx.Done():
