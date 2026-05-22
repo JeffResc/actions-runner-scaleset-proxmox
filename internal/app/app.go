@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -432,20 +433,21 @@ func splitHostPort(addr string) (host, port string) {
 	return h, p
 }
 
-// portFromAddr parses ":9101" / "0.0.0.0:9101" / "127.0.0.1:9101" into
-// the integer port. Returns 0 (no error) when addr is empty so admin
-// API disabled doesn't surface as a startup failure.
+// portFromAddr parses ":9101" / "0.0.0.0:9101" / "127.0.0.1:9101" /
+// "[::1]:9101" into the integer port via net.SplitHostPort, which
+// handles bracketed IPv6 literals correctly. Returns 0 (no error)
+// when addr is empty so admin API disabled doesn't surface as a
+// startup failure.
 func portFromAddr(addr string) (int, error) {
 	if addr == "" {
 		return 0, nil
 	}
-	idx := strings.LastIndexByte(addr, ':')
-	if idx < 0 {
-		return 0, fmt.Errorf("address %q has no port separator", addr)
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, fmt.Errorf("split host:port %q: %w", addr, err)
 	}
-	portStr := addr[idx+1:]
-	var port int
-	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
 		return 0, fmt.Errorf("parse port %q: %w", portStr, err)
 	}
 	if port <= 0 || port > 65535 {
