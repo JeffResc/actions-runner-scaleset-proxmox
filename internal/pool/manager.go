@@ -343,31 +343,40 @@ func (m *manager) PromoteToRunning(_ context.Context, vmid int, runnerID, jobID 
 }
 
 // ForceDestroy unconditionally transitions a row to Draining and kicks
-// the destroy goroutine. Used by the reconciler when GitHub tells us the
-// runner is gone but the store still thinks it's busy. Reason is logged
-// so the forensic trail is preserved.
+// the destroy goroutine. Used by the reconciler when GitHub tells us
+// the runner is gone but the store still thinks it's busy. Reason is
+// logged so the forensic trail is preserved.
+//
+// Concurrent ForceDestroy calls for the same VMID are de-duplicated by
+// CAS: exactly one caller wins the transition into Draining and spawns
+// destroyAsync. Subsequent callers (and callers racing a row that's
+// already Draining/Destroying) observe ok == false and return cleanly,
+// so we don't double-call prov.Destroy or burn duplicate Proxmox /
+// GitHub API budget.
 func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error {
-	target, err := m.store.Get(vmid)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil // already gone
-		}
-		return fmt.Errorf("force destroy: lookup: %w", err)
+	from := []store.State{
+		store.StateProvisioning,
+		store.StateWarm,
+		store.StateBooting,
+		store.StateHot,
+		store.StateAssigned,
+		store.StateRunning,
+		store.StatePoison,
 	}
-	if target.State == store.StateDraining || target.State == store.StateDestroying {
-		// Already on the way out; just make sure the destroy goroutine
-		// is in flight in case the previous attempt died with the process.
-		m.destroyAsync(target.VMID, target.Node)
+	var node string
+	ok, err := m.store.UpdateStateIn(vmid, from, store.StateDraining, func(v *store.VM) {
+		node = v.Node
+	})
+	if err != nil {
+		return fmt.Errorf("force destroy: cas: %w", err)
+	}
+	if !ok {
+		// Either the row is gone, or it's already Draining/Destroying
+		// — another caller owns its teardown. Nothing more to do.
 		return nil
 	}
-	m.log.Warn("force destroy", "vmid", vmid, "from_state", target.State, "reason", reason)
-	if _, err := m.store.Update(vmid, func(v *store.VM) {
-		v.State = store.StateDraining
-		v.StateSince = time.Now()
-	}); err != nil {
-		return fmt.Errorf("force destroy: drain: %w", err)
-	}
-	m.destroyAsync(target.VMID, target.Node)
+	m.log.Warn("force destroy", "vmid", vmid, "reason", reason)
+	m.destroyAsync(vmid, node)
 	return nil
 }
 
