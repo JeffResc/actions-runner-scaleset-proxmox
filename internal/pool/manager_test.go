@@ -508,6 +508,49 @@ func TestForceDestroy_MissingRowIsNoop(t *testing.T) {
 	require.NoError(t, mgr.ForceDestroy(context.Background(), 99999, "test: missing"))
 }
 
+// TestForceDestroy_ConcurrentCallsDedupe locks in the bug fix:
+// previously a second concurrent ForceDestroy against an already-Draining
+// row would spawn a redundant destroy goroutine (wasted Proxmox + GitHub
+// API budget and noisy 404 warnings). The CAS-guarded version must
+// ensure exactly one prov.Destroy call regardless of caller count.
+func TestForceDestroy_ConcurrentCallsDedupe(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedHot(t, st, 1)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
+
+	// Acquire so the row is in Assigned (the realistic stuck-row state).
+	_, err := mgr.Acquire(context.Background(), 0)
+	require.NoError(t, err)
+
+	// Fire ten concurrent ForceDestroy calls for the same vmid.
+	const N = 10
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for range N {
+		go func() {
+			defer wg.Done()
+			_ = mgr.ForceDestroy(context.Background(), 20000, "concurrent")
+		}()
+	}
+	wg.Wait()
+
+	// Wait for the (single) destroy goroutine to finish and report.
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.destroys) >= 1
+	}, time.Second, 10*time.Millisecond)
+
+	// And confirm no further destroys queue up.
+	time.Sleep(50 * time.Millisecond)
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Equal(t, 1, len(fp.destroys),
+		"ForceDestroy must dedupe concurrent callers via CAS; saw %d destroys", len(fp.destroys))
+}
+
 // TestListRows_ExcludesTerminal: the reconciler must not waste a GH API
 // call inspecting rows that are already on their way out.
 func TestListRows_ExcludesTerminal(t *testing.T) {
