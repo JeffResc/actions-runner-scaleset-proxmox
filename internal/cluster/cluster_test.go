@@ -7,16 +7,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
-
-	coordv1 "k8s.io/api/coordination/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
 )
 
 func discardLogger() *slog.Logger {
@@ -78,147 +76,265 @@ func TestStandalone_NilCallbacksOK(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Kubernetes (Lease-backed)
+// Raft
 // ---------------------------------------------------------------------------
 
-func newTestKubeCoord(t *testing.T, identity string, port int) (Coordinator, *fake.Clientset, *atomic.Bool, *atomic.Bool) {
-	t.Helper()
-	client := fake.NewSimpleClientset()
-	var elected atomic.Bool
-	var deposed atomic.Bool
-	cfg := Config{
-		LeaseName:      "scaleset-test",
-		LeaseNamespace: "ns",
-		Identity:       identity,
-		PodIP:          "10.0.0.1",
-		AdminPort:      port,
-		LeaseDuration:  200 * time.Millisecond,
-		RenewDeadline:  100 * time.Millisecond,
-		RetryPeriod:    20 * time.Millisecond,
-	}
-	cb := Callbacks{
-		OnElected: func(ctx context.Context) {
-			elected.Store(true)
-			<-ctx.Done()
-		},
-		OnDeposed: func() { deposed.Store(true) },
-	}
-	return NewKubernetesWithClient(cfg, cb, discardLogger(), client), client, &elected, &deposed
+// raftCluster spins up N replicas wired together via raft.InmemTransport
+// so the test never touches a real socket.
+type raftCluster struct {
+	coords     []Coordinator
+	cancels    []context.CancelFunc
+	dones      []chan error
+	transports []*raft.InmemTransport
+	addrs      []raft.ServerAddress
+	elected    []*atomic.Bool
+	deposed    []*atomic.Bool
 }
 
-func TestKubernetes_WinsElectionAndPublishesEndpoint(t *testing.T) {
+// newRaftCluster constructs an n-replica raft cluster using InmemTransport.
+// Replica 0 is the bootstrapper; the others join via the transport's
+// peer-discovery on top of the bootstrapped configuration.
+func newRaftCluster(t *testing.T, n int) *raftCluster {
+	t.Helper()
+	rc := &raftCluster{
+		coords:     make([]Coordinator, n),
+		cancels:    make([]context.CancelFunc, n),
+		dones:      make([]chan error, n),
+		transports: make([]*raft.InmemTransport, n),
+		addrs:      make([]raft.ServerAddress, n),
+		elected:    make([]*atomic.Bool, n),
+		deposed:    make([]*atomic.Bool, n),
+	}
+	for i := 0; i < n; i++ {
+		addr, tr := raft.NewInmemTransport("")
+		rc.transports[i] = tr
+		rc.addrs[i] = addr
+	}
+	// Wire every transport to every other transport so peers can reach
+	// each other.
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			if i == j {
+				continue
+			}
+			rc.transports[i].Connect(rc.addrs[j], rc.transports[j])
+		}
+	}
+
+	peers := make([]RaftPeer, n)
+	for i := 0; i < n; i++ {
+		peers[i] = RaftPeer{
+			NodeID:   nodeID(i),
+			RaftAddr: string(rc.addrs[i]),
+			HTTPAddr: httpAddr(i),
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		var elected, deposed atomic.Bool
+		rc.elected[i] = &elected
+		rc.deposed[i] = &deposed
+		cb := Callbacks{
+			OnElected: func(ctx context.Context) {
+				elected.Store(true)
+				<-ctx.Done()
+			},
+			OnDeposed: func() { deposed.Store(true) },
+		}
+		cfg := RaftConfig{
+			NodeID:           nodeID(i),
+			AdminHost:        "127.0.0.1",
+			AdminPort:        9100 + i,
+			Peers:            peers,
+			Bootstrap:        i == 0, // only replica 0 bootstraps
+			HeartbeatTimeout: 50 * time.Millisecond,
+			ElectionTimeout:  50 * time.Millisecond,
+			CommitTimeout:    10 * time.Millisecond,
+			TestTransport:    rc.transports[i],
+			TestLocalAddr:    rc.addrs[i],
+		}
+		coord, err := NewRaft(cfg, cb, discardLogger())
+		require.NoError(t, err)
+		rc.coords[i] = coord
+
+		ctx, cancel := context.WithCancel(context.Background())
+		rc.cancels[i] = cancel
+		done := make(chan error, 1)
+		go func(c Coordinator) { done <- c.Run(ctx) }(coord)
+		rc.dones[i] = done
+	}
+	t.Cleanup(func() { rc.shutdown() })
+	return rc
+}
+
+func (rc *raftCluster) shutdown() {
+	for i, cancel := range rc.cancels {
+		if cancel == nil {
+			continue
+		}
+		cancel()
+		select {
+		case <-rc.dones[i]:
+		case <-time.After(5 * time.Second):
+		}
+		rc.cancels[i] = nil
+	}
+}
+
+func nodeID(i int) string   { return "node-" + strconv.Itoa(i) }
+func httpAddr(i int) string { return "10.0.0." + strconv.Itoa(i+1) + ":9100" }
+
+func TestRaft_SingleNodeElectsSelf(t *testing.T) {
 	t.Parallel()
 
-	coord, client, elected, deposed := newTestKubeCoord(t, "pod-1", 9101)
+	rc := newRaftCluster(t, 1)
+	require.Eventually(t, func() bool { return rc.coords[0].IsLeader() },
+		3*time.Second, 20*time.Millisecond, "single-node cluster never elected itself")
+	require.Eventually(t, rc.elected[0].Load,
+		2*time.Second, 20*time.Millisecond, "OnElected never fired")
+}
 
+func TestRaft_ThreeNodesElectExactlyOneLeader(t *testing.T) {
+	t.Parallel()
+
+	rc := newRaftCluster(t, 3)
+	require.Eventually(t, func() bool {
+		leaders := 0
+		for _, c := range rc.coords {
+			if c.IsLeader() {
+				leaders++
+			}
+		}
+		return leaders == 1
+	}, 5*time.Second, 50*time.Millisecond, "expected exactly 1 leader across 3 replicas")
+}
+
+func TestRaft_LeaderEndpointResolvesPeerHTTPAddr(t *testing.T) {
+	t.Parallel()
+
+	rc := newRaftCluster(t, 3)
+	// Wait for a leader to emerge.
+	leaderIdx := -1
+	require.Eventually(t, func() bool {
+		for i, c := range rc.coords {
+			if c.IsLeader() {
+				leaderIdx = i
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 50*time.Millisecond, "no leader emerged")
+
+	// Every follower's LeaderEndpoint resolves to the leader's HTTP
+	// peer entry (httpAddr(leaderIdx)). The leader's own
+	// LeaderEndpoint returns its local fast-path address.
+	for i, c := range rc.coords {
+		ep, err := c.LeaderEndpoint(context.Background())
+		require.NoError(t, err)
+		if i == leaderIdx {
+			require.Equal(t, "127.0.0.1:"+strconv.Itoa(9100+i), ep,
+				"leader %d should return its own local endpoint", i)
+		} else {
+			require.Equal(t, httpAddr(leaderIdx), ep,
+				"follower %d should resolve leader to peer http addr", i)
+		}
+	}
+}
+
+func TestRaft_LeaderEndpointEmptyBeforeElection(t *testing.T) {
+	t.Parallel()
+
+	// Build a 3-node cluster but DON'T bootstrap any — election will
+	// never converge, so LeaderEndpoint must return "" cleanly (no
+	// error) so callers respond 503 + Retry-After.
+	transports := make([]*raft.InmemTransport, 3)
+	addrs := make([]raft.ServerAddress, 3)
+	for i := 0; i < 3; i++ {
+		addr, tr := raft.NewInmemTransport("")
+		transports[i] = tr
+		addrs[i] = addr
+	}
+	peers := make([]RaftPeer, 3)
+	for i := 0; i < 3; i++ {
+		peers[i] = RaftPeer{
+			NodeID:   nodeID(i),
+			RaftAddr: string(addrs[i]),
+			HTTPAddr: httpAddr(i),
+		}
+	}
+	cfg := RaftConfig{
+		NodeID:           nodeID(0),
+		AdminHost:        "127.0.0.1",
+		AdminPort:        9100,
+		Peers:            peers,
+		Bootstrap:        false, // deliberately don't bootstrap
+		HeartbeatTimeout: 50 * time.Millisecond,
+		ElectionTimeout:  50 * time.Millisecond,
+		CommitTimeout:    10 * time.Millisecond,
+		TestTransport:    transports[0],
+		TestLocalAddr:    addrs[0],
+	}
+	coord, err := NewRaft(cfg, Callbacks{}, discardLogger())
+	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- coord.Run(ctx) }()
-
-	require.Eventually(t, elected.Load, 2*time.Second, 10*time.Millisecond, "OnElected never fired")
-	require.True(t, coord.IsLeader())
-
-	// Endpoint is published into the Lease annotation.
-	require.Eventually(t, func() bool {
-		lease, err := client.CoordinationV1().Leases("ns").Get(context.Background(), "scaleset-test", metav1.GetOptions{})
-		if err != nil {
-			return false
-		}
-		return lease.Annotations[DefaultEndpointAnnotation] == "10.0.0.1:9101"
-	}, 2*time.Second, 10*time.Millisecond, "leader endpoint annotation never appeared")
-
-	// Local fast path returns the local endpoint while leader.
-	ep, err := coord.LeaderEndpoint(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "10.0.0.1:9101", ep)
-
-	cancel()
-	require.NoError(t, <-done)
-	require.True(t, deposed.Load())
-	require.False(t, coord.IsLeader())
-}
-
-func TestKubernetes_StandbyReadsAnnotation(t *testing.T) {
-	t.Parallel()
-
-	// Seed a Lease with an endpoint annotation as if some other leader
-	// had published it; a standby Coordinator on the same client should
-	// observe that endpoint via LeaderEndpoint without ever winning.
-	client := fake.NewSimpleClientset(&coordv1.Lease{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "scaleset-test",
-			Namespace: "ns",
-			Annotations: map[string]string{
-				DefaultEndpointAnnotation: "10.0.0.99:9101",
-			},
-		},
+	t.Cleanup(func() {
+		cancel()
+		<-done
 	})
-
-	cfg := Config{
-		LeaseName:      "scaleset-test",
-		LeaseNamespace: "ns",
-		Identity:       "pod-2",
-		PodIP:          "10.0.0.2",
-		AdminPort:      9101,
-		LeaseDuration:  200 * time.Millisecond,
-		RenewDeadline:  100 * time.Millisecond,
-		RetryPeriod:    20 * time.Millisecond,
-	}
-	coord := NewKubernetesWithClient(cfg, Callbacks{}, discardLogger(), client)
-
-	ep, err := coord.LeaderEndpoint(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, "10.0.0.99:9101", ep)
-}
-
-func TestKubernetes_LeaderEndpointEmptyBeforeAnyLeader(t *testing.T) {
-	t.Parallel()
-
-	client := fake.NewSimpleClientset() // no Lease exists yet
-	cfg := Config{
-		LeaseName:      "scaleset-test",
-		LeaseNamespace: "ns",
-		Identity:       "pod-1",
-		PodIP:          "10.0.0.1",
-		AdminPort:      9101,
-		LeaseDuration:  200 * time.Millisecond,
-		RenewDeadline:  100 * time.Millisecond,
-		RetryPeriod:    20 * time.Millisecond,
-	}
-	coord := NewKubernetesWithClient(cfg, Callbacks{}, discardLogger(), client)
 
 	ep, err := coord.LeaderEndpoint(context.Background())
 	require.NoError(t, err)
 	require.Empty(t, ep, "should return empty (election in flight) rather than an error")
 }
 
-func TestConfig_ValidateTimingOrdering(t *testing.T) {
+func TestRaftConfig_ValidationRejectsBadInputs(t *testing.T) {
 	t.Parallel()
 
-	// LeaseDuration must be > RenewDeadline > RetryPeriod.
-	bad := Config{
-		LeaseName:      "x",
-		LeaseNamespace: "y",
-		Identity:       "z",
-		LeaseDuration:  100 * time.Millisecond,
-		RenewDeadline:  100 * time.Millisecond, // not <
-		RetryPeriod:    10 * time.Millisecond,
+	base := RaftConfig{
+		NodeID:        "a",
+		BindAddr:      "0.0.0.0:7000",
+		Peers:         []RaftPeer{{NodeID: "a", RaftAddr: "10.0.0.1:7000"}},
+		TestTransport: nil,
+	}
+
+	// Happy path.
+	require.NoError(t, base.validate())
+
+	// Missing NodeID.
+	bad := base
+	bad.NodeID = ""
+	require.Error(t, bad.validate())
+
+	// Empty Peers.
+	bad = base
+	bad.Peers = nil
+	require.Error(t, bad.validate())
+
+	// Self not in Peers.
+	bad = base
+	bad.Peers = []RaftPeer{{NodeID: "other", RaftAddr: "10.0.0.2:7000"}}
+	require.Error(t, bad.validate())
+
+	// Duplicate NodeID.
+	bad = base
+	bad.Peers = []RaftPeer{
+		{NodeID: "a", RaftAddr: "10.0.0.1:7000"},
+		{NodeID: "a", RaftAddr: "10.0.0.2:7000"},
 	}
 	require.Error(t, bad.validate())
 
-	bad.RenewDeadline = 90 * time.Millisecond
-	bad.RetryPeriod = 90 * time.Millisecond // not <
+	// Missing peer RaftAddr.
+	bad = base
+	bad.Peers = []RaftPeer{{NodeID: "a", RaftAddr: ""}}
 	require.Error(t, bad.validate())
 
-	good := Config{
-		LeaseName:      "x",
-		LeaseNamespace: "y",
-		Identity:       "z",
-		LeaseDuration:  100 * time.Millisecond,
-		RenewDeadline:  80 * time.Millisecond,
-		RetryPeriod:    20 * time.Millisecond,
-	}
-	require.NoError(t, good.validate())
+	// Production mode (no TestTransport) without BindAddr.
+	bad = base
+	bad.BindAddr = ""
+	require.Error(t, bad.validate())
 }
 
 // ---------------------------------------------------------------------------

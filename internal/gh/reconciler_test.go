@@ -132,7 +132,7 @@ func (f *fakeManager) MarkRunning(context.Context, int, int64) error { return ni
 func (f *fakeManager) SetRunnerID(context.Context, int, int64) error { return nil }
 func (f *fakeManager) MarkCompleted(context.Context, int) error      { return nil }
 func (f *fakeManager) Stats(context.Context) (pool.Stats, error)     { return pool.Stats{}, nil }
-func (f *fakeManager) Recover(context.Context) error                 { return nil }
+func (f *fakeManager) Adopt(context.Context) error                   { return nil }
 func (f *fakeManager) Run(context.Context) error                     { return nil }
 func (f *fakeManager) SignalRefill()                                 {}
 func (f *fakeManager) SetDesiredCount(int)                           {}
@@ -542,8 +542,8 @@ func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T
 	r.now = func() time.Time { return t0 }
 
 	// Tick 1: runner A observed without a DB row → tracked.
-	r.cleanupOrphanRunners(context.Background(), nil, map[string]runnerState{
-		"gh-runner-test-1": {id: 1, online: true, busy: false},
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
 	})
 	first, ok := r.orphanFirstSeen["gh-runner-test-1"]
 	require.True(t, ok, "orphan must be tracked after first observation")
@@ -552,13 +552,13 @@ func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T
 	// Tick 2: runners list comes back empty (transient). The bug: the
 	// previous implementation wiped orphanFirstSeen entirely here.
 	r.now = func() time.Time { return t0.Add(10 * time.Second) }
-	r.cleanupOrphanRunners(context.Background(), nil, map[string]runnerState{})
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{})
 
 	// Tick 3: runner A observed again. Its grace clock must still be
 	// anchored at t0, not restarted to t0+20s.
 	r.now = func() time.Time { return t0.Add(20 * time.Second) }
-	r.cleanupOrphanRunners(context.Background(), nil, map[string]runnerState{
-		"gh-runner-test-1": {id: 1, online: true, busy: false},
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
 	})
 	preserved, ok := r.orphanFirstSeen["gh-runner-test-1"]
 	require.True(t, ok, "orphan tracking must survive an empty-runners tick")

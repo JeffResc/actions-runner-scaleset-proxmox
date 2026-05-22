@@ -248,25 +248,31 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 	return nil
 }
 
-// runnerState is what we observed for a single GitHub runner.
-type runnerState struct {
-	id     int64
-	online bool // status == "online"
-	busy   bool
+// listOurRunners returns every runner on the scope whose name matches
+// our prefix, keyed by runner name. Delegates to ListRunnersByPrefix
+// so the leader's one-shot Adopt pass and this reconcile loop share a
+// single implementation (pagination cap, prefix filter, scope dispatch).
+func (r *Reconciler) listOurRunners(ctx context.Context) (map[string]pool.RunnerInfo, error) {
+	return ListRunnersByPrefix(ctx, r.gh, r.cfg.Scope, r.cfg.RunnerNamePrefix, r.log)
 }
 
-// listOurRunners returns every runner on the scope whose name matches
-// our prefix, keyed by runner name.
+// ListRunnersByPrefix returns every runner on the scope whose name
+// matches the given prefix, keyed by runner name (which is also the VM
+// name produced by pool.Manager).
 //
 // Pagination is capped at maxListPages (50 × 100 = 5000 runners) so a
 // scope that's accumulated a stale runner backlog (e.g. an operator
 // resetting the orchestrator several times) can't blow our API budget
-// or memory in one Tick. Anything past the cap is processed on the
+// or memory in one call. Anything past the cap is processed on the
 // next tick — eventual consistency is fine because the reconciler
 // itself is a backstop, not a primary signal.
-func (r *Reconciler) listOurRunners(ctx context.Context) (map[string]runnerState, error) {
+//
+// Exported so pool.Manager.Adopt can call it without owning a
+// *Reconciler — its result is wrapped by NewRunnerLister into a
+// pool.RunnerLister suitable for pool.Config.RunnerLister.
+func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubauth.Scope, prefix string, log *slog.Logger) (map[string]pool.RunnerInfo, error) {
 	const maxListPages = 50
-	out := make(map[string]runnerState)
+	out := make(map[string]pool.RunnerInfo)
 	opt := &github.ListRunnersOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	for page := 0; page < maxListPages; page++ {
 		var (
@@ -274,24 +280,24 @@ func (r *Reconciler) listOurRunners(ctx context.Context) (map[string]runnerState
 			resp        *github.Response
 			err         error
 		)
-		if r.cfg.Scope.Org != "" {
-			runnersPage, resp, err = r.gh.Actions.ListOrganizationRunners(ctx, r.cfg.Scope.Org, opt)
+		if scope.Org != "" {
+			runnersPage, resp, err = gh.Actions.ListOrganizationRunners(ctx, scope.Org, opt)
 		} else {
-			owner, repo := splitRepo(r.cfg.Scope.Repo)
-			runnersPage, resp, err = r.gh.Actions.ListRunners(ctx, owner, repo, opt)
+			owner, repo := splitRepo(scope.Repo)
+			runnersPage, resp, err = gh.Actions.ListRunners(ctx, owner, repo, opt)
 		}
 		if err != nil {
 			return nil, err
 		}
 		for _, gr := range runnersPage.Runners {
 			name := gr.GetName()
-			if !strings.HasPrefix(name, r.cfg.RunnerNamePrefix) {
+			if !strings.HasPrefix(name, prefix) {
 				continue
 			}
-			out[name] = runnerState{
-				id:     gr.GetID(),
-				online: gr.GetStatus() == "online",
-				busy:   gr.GetBusy(),
+			out[name] = pool.RunnerInfo{
+				ID:     gr.GetID(),
+				Online: gr.GetStatus() == "online",
+				Busy:   gr.GetBusy(),
 			}
 		}
 		if resp == nil || resp.NextPage == 0 {
@@ -299,14 +305,26 @@ func (r *Reconciler) listOurRunners(ctx context.Context) (map[string]runnerState
 		}
 		opt.Page = resp.NextPage
 	}
-	r.log.Warn("listOurRunners: hit max-pages cap; deferring rest to next tick",
-		"max_pages", maxListPages, "matched", len(out))
+	if log != nil {
+		log.Warn("ListRunnersByPrefix: hit max-pages cap; deferring rest to next call",
+			"max_pages", maxListPages, "matched", len(out))
+	}
 	return out, nil
+}
+
+// NewRunnerLister returns a pool.RunnerLister that pages the GitHub
+// runners API for the given scope and prefix. Adopt uses it once at
+// leader startup; the reconciler's polling loop builds its own snapshot
+// independently via listOurRunners.
+func NewRunnerLister(gh *github.Client, scope githubauth.Scope, prefix string, log *slog.Logger) pool.RunnerLister {
+	return func(ctx context.Context) (map[string]pool.RunnerInfo, error) {
+		return ListRunnersByPrefix(ctx, gh, scope, prefix, log)
+	}
 }
 
 // applyMatrix walks each row and applies the state-transition table
 // defined in the package doc.
-func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, runners map[string]runnerState) {
+func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo) {
 	now := time.Now()
 	for _, row := range rows {
 		gr, present := runners[row.Name]
@@ -324,18 +342,18 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 	}
 }
 
-func (r *Reconciler) reconcileAssigned(ctx context.Context, row pool.RowSnapshot, gr runnerState, present bool, age time.Duration, ghLabel string) {
+func (r *Reconciler) reconcileAssigned(ctx context.Context, row pool.RowSnapshot, gr pool.RunnerInfo, present bool, age time.Duration, ghLabel string) {
 	switch {
-	case present && gr.busy:
+	case present && gr.Busy:
 		// Listener missed JobStarted. Catch up.
 		r.log.Info("reconcile: promoting assigned->running (missed JobStarted)",
-			"vmid", row.VMID, "runner_id", gr.id)
-		r.promoteToRunning(ctx, row, gr.id)
+			"vmid", row.VMID, "runner_id", gr.ID)
+		r.promoteToRunning(ctx, row, gr.ID)
 		r.recordMismatch(row.State, ghLabel, "promote_running")
-	case present && !gr.online && age >= r.cfg.AssignedOfflineGrace:
+	case present && !gr.Online && age >= r.cfg.AssignedOfflineGrace:
 		// Runner registered then went offline before picking up work.
 		r.forceDestroy(ctx, row.VMID, "assigned: runner registered then went offline", row.State, ghLabel)
-	case present && gr.online && !gr.busy && age >= r.cfg.AssignedGrace:
+	case present && gr.Online && !gr.Busy && age >= r.cfg.AssignedGrace:
 		// JIT injected, runner online, but never picked up a job.
 		r.forceDestroy(ctx, row.VMID, "assigned: runner online but never picked up a job", row.State, ghLabel)
 	case !present && age >= r.cfg.AssignedGrace:
@@ -344,14 +362,14 @@ func (r *Reconciler) reconcileAssigned(ctx context.Context, row pool.RowSnapshot
 	}
 }
 
-func (r *Reconciler) reconcileRunning(ctx context.Context, row pool.RowSnapshot, gr runnerState, present bool, age time.Duration, ghLabel string) {
+func (r *Reconciler) reconcileRunning(ctx context.Context, row pool.RowSnapshot, gr pool.RunnerInfo, present bool, age time.Duration, ghLabel string) {
 	switch {
-	case present && gr.busy:
+	case present && gr.Busy:
 		// Working as expected.
-	case present && gr.online && !gr.busy && age >= r.cfg.RunningIdleGrace:
+	case present && gr.Online && !gr.Busy && age >= r.cfg.RunningIdleGrace:
 		// Job done; missed JobCompleted.
 		r.forceDestroy(ctx, row.VMID, "running: runner went idle (missed JobCompleted)", row.State, ghLabel)
-	case present && !gr.online:
+	case present && !gr.Online:
 		// Runner crashed or exited. Destroy and move on.
 		r.forceDestroy(ctx, row.VMID, "running: runner went offline", row.State, ghLabel)
 	case !present:
@@ -360,18 +378,18 @@ func (r *Reconciler) reconcileRunning(ctx context.Context, row pool.RowSnapshot,
 	}
 }
 
-func (r *Reconciler) reconcileHot(ctx context.Context, row pool.RowSnapshot, gr runnerState, present bool, _ time.Duration, ghLabel string) {
+func (r *Reconciler) reconcileHot(ctx context.Context, row pool.RowSnapshot, gr pool.RunnerInfo, present bool, _ time.Duration, ghLabel string) {
 	// Only act on the one anomalous case for Hot rows: GitHub observed
 	// the runner as busy without our local Hot -> Assigned ever firing.
 	// Hot + offline/missing is the NORMAL pre-JIT state (runners don't
 	// register until they boot), and the pool's own age-based recycle
 	// handles Hot rows that never come up.
-	if !present || !gr.busy {
+	if !present || !gr.Busy {
 		return
 	}
 	r.log.Warn("reconcile: hot row observed as busy on GitHub; promoting",
-		"vmid", row.VMID, "runner_id", gr.id)
-	r.promoteToRunning(ctx, row, gr.id)
+		"vmid", row.VMID, "runner_id", gr.ID)
+	r.promoteToRunning(ctx, row, gr.ID)
 	r.recordMismatch(row.State, ghLabel, "promote_running")
 }
 
@@ -398,7 +416,7 @@ func (r *Reconciler) promoteToRunning(ctx context.Context, row pool.RowSnapshot,
 //
 // State for the grace logic lives in r.orphanFirstSeen, which is pruned
 // here as runners reappear matched to rows.
-func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSnapshot, runners map[string]runnerState) {
+func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo) {
 	known := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
 		known[row.Name] = struct{}{}
@@ -440,13 +458,13 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 			continue
 		}
 		r.log.Info("reconcile: orphan github runner; removing",
-			"name", name, "runner_id", gr.id, "orphan_age", now.Sub(firstSeen))
+			"name", name, "runner_id", gr.ID, "orphan_age", now.Sub(firstSeen))
 		var err error
 		if r.cfg.Scope.Org != "" {
-			_, err = r.gh.Actions.RemoveOrganizationRunner(ctx, r.cfg.Scope.Org, gr.id)
+			_, err = r.gh.Actions.RemoveOrganizationRunner(ctx, r.cfg.Scope.Org, gr.ID)
 		} else {
 			owner, repo := splitRepo(r.cfg.Scope.Repo)
-			_, err = r.gh.Actions.RemoveRunner(ctx, owner, repo, gr.id)
+			_, err = r.gh.Actions.RemoveRunner(ctx, owner, repo, gr.ID)
 		}
 		if err != nil {
 			r.log.Warn("reconcile: orphan runner removal failed", "name", name, "err", err)
@@ -536,14 +554,14 @@ func (r *Reconciler) recordMismatch(dbState, ghState, action string) {
 
 // ghStateLabel collapses the (present, online, busy) tuple into a single
 // low-cardinality label suitable for Prometheus.
-func ghStateLabel(gr runnerState, present bool) string {
+func ghStateLabel(gr pool.RunnerInfo, present bool) string {
 	if !present {
 		return "missing"
 	}
-	if !gr.online {
+	if !gr.Online {
 		return "offline"
 	}
-	if gr.busy {
+	if gr.Busy {
 		return "busy"
 	}
 	return "idle"

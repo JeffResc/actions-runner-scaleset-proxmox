@@ -461,87 +461,100 @@ func TestLoad_ReadsFromDisk(t *testing.T) {
 }
 
 // Cluster defaults: omitted cluster block falls back to standalone with
-// sane Lease timings; the lease name is derived from the scale set.
+// sane raft timing defaults applied even though they're unused in
+// standalone mode.
 func TestCluster_DefaultsToStandalone(t *testing.T) {
 	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
 	cfg, err := config.Parse([]byte(validPATYAML))
 	require.NoError(t, err)
 	require.Equal(t, "standalone", cfg.Cluster.Mode)
-	require.Equal(t, "scaleset-proxmox-ubuntu-x64", cfg.Cluster.Kubernetes.LeaseName)
-	require.Equal(t, 15*time.Second, cfg.Cluster.Kubernetes.LeaseDurationD)
-	require.Equal(t, 10*time.Second, cfg.Cluster.Kubernetes.RenewDeadlineD)
-	require.Equal(t, 2*time.Second, cfg.Cluster.Kubernetes.RetryPeriodD)
-	require.Equal(t, "scaleset.jeffresc.dev/leader-endpoint",
-		cfg.Cluster.Kubernetes.LeaderEndpointAnnotation)
+	require.Equal(t, time.Second, cfg.Cluster.Raft.HeartbeatTimeoutD)
+	require.Equal(t, time.Second, cfg.Cluster.Raft.ElectionTimeoutD)
+	require.Equal(t, 50*time.Millisecond, cfg.Cluster.Raft.CommitTimeoutD)
 }
 
-// Kubernetes mode resolves Identity/Namespace/PodIP from the Downward
-// API env vars when the YAML leaves them empty.
-func TestCluster_KubernetesUsesDownwardAPIEnvs(t *testing.T) {
+// Raft mode parses a complete peer list and confirms this replica is
+// part of it. NodeID defaults to $HOSTNAME / os.Hostname() when YAML
+// leaves it empty.
+func TestCluster_RaftResolvesNodeIDFromHostname(t *testing.T) {
 	setEnv(t, map[string]string{
 		"TEST_GH_TOKEN":  "x",
 		"TEST_PVE_TOKEN": "y",
-		"POD_NAME":       "scaleset-0",
-		"POD_NAMESPACE":  "gh-runners",
-		"POD_IP":         "10.42.0.5",
-	})
-	cfg, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: kubernetes\n"))
-	require.NoError(t, err)
-	require.Equal(t, "kubernetes", cfg.Cluster.Mode)
-	require.Equal(t, "scaleset-0", cfg.Cluster.Kubernetes.Identity)
-	require.Equal(t, "gh-runners", cfg.Cluster.Kubernetes.LeaseNamespace)
-	require.Equal(t, "10.42.0.5", cfg.Cluster.Kubernetes.PodIP)
-}
-
-// Kubernetes mode without POD_IP refuses to start — the leader-endpoint
-// annotation cannot be published.
-func TestCluster_KubernetesRequiresPodIP(t *testing.T) {
-	setEnv(t, map[string]string{
-		"TEST_GH_TOKEN":  "x",
-		"TEST_PVE_TOKEN": "y",
-		"POD_NAME":       "scaleset-0",
-		"POD_NAMESPACE":  "gh-runners",
-	})
-	t.Setenv("POD_IP", "")
-	_, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: kubernetes\n"))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "pod_ip")
-}
-
-// Kubernetes mode without POD_NAMESPACE refuses to start.
-func TestCluster_KubernetesRequiresNamespace(t *testing.T) {
-	setEnv(t, map[string]string{
-		"TEST_GH_TOKEN":  "x",
-		"TEST_PVE_TOKEN": "y",
-		"POD_NAME":       "scaleset-0",
-		"POD_IP":         "10.42.0.5",
-	})
-	t.Setenv("POD_NAMESPACE", "")
-	_, err := config.Parse([]byte(validPATYAML + "cluster:\n  mode: kubernetes\n"))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "lease_namespace")
-}
-
-// Bad timing relationships are rejected before the leader-election
-// library would panic on them.
-func TestCluster_KubernetesRejectsBadTimings(t *testing.T) {
-	setEnv(t, map[string]string{
-		"TEST_GH_TOKEN":  "x",
-		"TEST_PVE_TOKEN": "y",
-		"POD_NAME":       "p",
-		"POD_NAMESPACE":  "n",
-		"POD_IP":         "10.0.0.1",
+		"HOSTNAME":       "replica-a",
 	})
 	yaml := validPATYAML + `cluster:
-  mode: kubernetes
-  kubernetes:
-    lease_duration: 5s
-    renew_deadline: 10s
-    retry_period: 1s
+  mode: raft
+  raft:
+    bind_addr: "0.0.0.0:7000"
+    peers:
+      - node_id: replica-a
+        raft_addr: "10.0.0.1:7000"
+        http_addr: "10.0.0.1:8080"
+      - node_id: replica-b
+        raft_addr: "10.0.0.2:7000"
+        http_addr: "10.0.0.2:8080"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	require.NoError(t, err)
+	require.Equal(t, "raft", cfg.Cluster.Mode)
+	require.Equal(t, "replica-a", cfg.Cluster.Raft.NodeID)
+	require.Len(t, cfg.Cluster.Raft.Peers, 2)
+}
+
+// Raft mode without bind_addr refuses to start.
+func TestCluster_RaftRequiresBindAddr(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"HOSTNAME":       "replica-a",
+	})
+	yaml := validPATYAML + `cluster:
+  mode: raft
+  raft:
+    peers:
+      - node_id: replica-a
+        raft_addr: "10.0.0.1:7000"
 `
 	_, err := config.Parse([]byte(yaml))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "renew_deadline")
+	require.Contains(t, err.Error(), "bind_addr")
+}
+
+// Raft mode without an entry for this replica's NodeID is rejected.
+func TestCluster_RaftRequiresSelfInPeers(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"HOSTNAME":       "replica-a",
+	})
+	yaml := validPATYAML + `cluster:
+  mode: raft
+  raft:
+    bind_addr: "0.0.0.0:7000"
+    peers:
+      - node_id: replica-b
+        raft_addr: "10.0.0.2:7000"
+`
+	_, err := config.Parse([]byte(yaml))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "node_id")
+}
+
+// Raft mode with an empty peers list is rejected.
+func TestCluster_RaftRequiresPeers(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"HOSTNAME":       "replica-a",
+	})
+	yaml := validPATYAML + `cluster:
+  mode: raft
+  raft:
+    bind_addr: "0.0.0.0:7000"
+`
+	_, err := config.Parse([]byte(yaml))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "peers")
 }
 
 // An unknown mode is rejected by the validator tags.

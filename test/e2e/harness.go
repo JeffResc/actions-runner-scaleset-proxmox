@@ -21,8 +21,8 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
-	"k8s.io/client-go/kubernetes"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/app"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
@@ -83,18 +83,81 @@ type Options struct {
 	// (template discovery, ping, list) still pass through.
 	DryRun bool
 
-	// KubeClient enables Kubernetes leader-election mode. When
-	// non-nil, the harness sets cluster.mode = "kubernetes" and
-	// passes the supplied client through to the orchestrator. Tests
-	// pass a k8s.io/client-go/kubernetes/fake clientset; sharing one
-	// across multiple harness instances is what makes leader election
-	// meaningful between them.
-	KubeClient kubernetes.Interface
+	// RaftCluster, when non-nil, enables raft leader election. The
+	// caller creates one RaftCluster shared between every replica
+	// (call NewRaftCluster), then passes (RaftCluster, ReplicaIndex)
+	// in each per-replica Start. The cluster owns the InmemTransport
+	// network that wires replicas to each other; without that wiring
+	// raft election would never converge in-process.
+	RaftCluster *RaftCluster
 
-	// Identity is this replica's K8s identity (mirrors POD_NAME). Only
-	// used when KubeClient is set. Must be unique across replicas
-	// participating in the same Lease.
+	// ReplicaIndex identifies which slot in RaftCluster.Peers this
+	// replica occupies. Required when RaftCluster is set; ignored
+	// otherwise. Must be unique per replica in the same cluster.
+	ReplicaIndex int
+
+	// Identity is the replica's NodeID in raft mode. Defaults to
+	// RaftCluster.Peers[ReplicaIndex].NodeID when empty.
 	Identity string
+}
+
+// RaftCluster manages the in-process raft transport network shared
+// across N replicas in a single e2e scenario. Construct once with
+// NewRaftCluster, then pass it to each per-replica Start.
+//
+// Internally it pre-allocates N InmemTransports + synthetic addresses
+// and wires every pair via Connect, so the moment each replica's
+// raft.NewRaft call lands the membership protocol can converge
+// without a real network hop.
+type RaftCluster struct {
+	Transports []*raft.InmemTransport
+	Addrs      []raft.ServerAddress
+	Peers      []RaftPeerSpec
+}
+
+// RaftPeerSpec is one entry in the shared peer list. The orchestrator
+// config marshals these into cluster.raft.peers; the harness also
+// injects the matching transport into app.Options.
+type RaftPeerSpec struct {
+	NodeID   string
+	RaftAddr string // matches Addrs[i] — the InmemTransport synthetic addr
+	HTTPAddr string // 127.0.0.1:<adminPort> — used by Forwarder
+}
+
+// NewRaftCluster builds the shared transport network for n replicas.
+// Caller-supplied adminAddrs match each replica's expected admin
+// HTTPAddr so leader-endpoint resolution lines up with the harness's
+// pre-bound admin port. Order matters: adminAddrs[i] is the i-th
+// replica.
+func NewRaftCluster(t testing.TB, adminAddrs []string) *RaftCluster {
+	t.Helper()
+	n := len(adminAddrs)
+	rc := &RaftCluster{
+		Transports: make([]*raft.InmemTransport, n),
+		Addrs:      make([]raft.ServerAddress, n),
+		Peers:      make([]RaftPeerSpec, n),
+	}
+	for i := 0; i < n; i++ {
+		addr, tr := raft.NewInmemTransport("")
+		rc.Transports[i] = tr
+		rc.Addrs[i] = addr
+	}
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			if i == j {
+				continue
+			}
+			rc.Transports[i].Connect(rc.Addrs[j], rc.Transports[j])
+		}
+	}
+	for i := 0; i < n; i++ {
+		rc.Peers[i] = RaftPeerSpec{
+			NodeID:   "replica-" + strconv.Itoa(i),
+			RaftAddr: string(rc.Addrs[i]),
+			HTTPAddr: adminAddrs[i],
+		}
+	}
+	return rc
 }
 
 // Start spins up the fakes (if not supplied) and launches app.Run in a
@@ -134,8 +197,21 @@ func Start(t testing.TB, opts Options) *Harness {
 	// and admin client traffic. There's a tiny TOCTOU race between
 	// closing the probe listener and the orchestrator binding — small
 	// enough not to matter in a single-process test runner.
-	obsAddr := pickAddr(t)
-	adminAddr := pickAddr(t)
+	var (
+		obsAddr   string
+		adminAddr string
+	)
+	if opts.RaftCluster != nil {
+		// In raft mode the admin port must match the peer list the
+		// shared RaftCluster already committed to — the test scenario
+		// builds the cluster with each replica's adminAddr declared
+		// upfront, then we just look it up here.
+		adminAddr = opts.RaftCluster.Peers[opts.ReplicaIndex].HTTPAddr
+		obsAddr = pickAddr(t)
+	} else {
+		obsAddr = pickAddr(t)
+		adminAddr = pickAddr(t)
+	}
 
 	const adminSecret = "fake-admin-secret"
 	const proxmoxTokenSecret = "fake-proxmox-secret"
@@ -154,25 +230,35 @@ func Start(t testing.TB, opts Options) *Harness {
 		ObsAddr:              obsAddr,
 		AdminAddr:            adminAddr,
 	}
-	if opts.KubeClient != nil {
+	var (
+		raftTransport raft.Transport
+		raftLocalAddr raft.ServerAddress
+	)
+	if opts.RaftCluster != nil {
 		identity := opts.Identity
 		if identity == "" {
-			identity = "replica-default"
+			identity = opts.RaftCluster.Peers[opts.ReplicaIndex].NodeID
 		}
-		cv.ClusterMode = "kubernetes"
-		cv.LeaseName = "scaleset-" + opts.ScaleSetName
-		cv.LeaseNamespace = "e2e"
-		cv.Identity = identity
-		cv.PodIP = "127.0.0.1"
-		// Election timings. Sub-second values flake under -race
-		// because the race detector adds 2-10x overhead on every
-		// renewal goroutine; 1s/700ms/200ms keeps tests fast while
-		// surviving stressful CI conditions and respects the
-		// library's LeaseDuration > RenewDeadline > RetryPeriod
-		// ordering check.
-		cv.LeaseDuration = "1s"
-		cv.RenewDeadline = "700ms"
-		cv.RetryPeriod = "200ms"
+		cv.ClusterMode = "raft"
+		cv.NodeID = identity
+		// BindAddr is a placeholder — the in-mem TestTransport takes
+		// over before any TCP listener is ever built — but the config
+		// validator still requires a non-empty value, so we give it
+		// one that's obviously synthetic.
+		cv.BindAddr = "test-inmem://" + string(opts.RaftCluster.Addrs[opts.ReplicaIndex])
+		cv.Peers = opts.RaftCluster.Peers
+		// Bootstrap the first replica only; the rest discover the
+		// bootstrapped configuration via the transport.
+		cv.Bootstrap = opts.ReplicaIndex == 0
+		// Aggressive timings keep election fast for short-lived tests
+		// while still satisfying raft's internal invariant that
+		// LeaderLease <= Heartbeat.
+		cv.HeartbeatTimeout = "100ms"
+		cv.ElectionTimeout = "100ms"
+		cv.CommitTimeout = "20ms"
+
+		raftTransport = opts.RaftCluster.Transports[opts.ReplicaIndex]
+		raftLocalAddr = opts.RaftCluster.Addrs[opts.ReplicaIndex]
 	}
 	configPath := writeConfig(t, cv)
 
@@ -187,11 +273,12 @@ func Start(t testing.TB, opts Options) *Harness {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- app.Run(ctx, app.Options{
-			ConfigPath:   configPath,
-			DryRun:       opts.DryRun,
-			Version:      "e2e",
-			AuthOverride: auth,
-			KubeClient:   opts.KubeClient,
+			ConfigPath:    configPath,
+			DryRun:        opts.DryRun,
+			Version:       "e2e",
+			AuthOverride:  auth,
+			RaftTransport: raftTransport,
+			RaftLocalAddr: raftLocalAddr,
 		})
 	}()
 
@@ -294,6 +381,18 @@ func pickAddr(t testing.TB) string {
 	return addr
 }
 
+// PickAdminAddrs returns n free 127.0.0.1 ports — used by raft cluster
+// tests that need to commit to each replica's admin address before
+// any harness has started.
+func PickAdminAddrs(t testing.TB, n int) []string {
+	t.Helper()
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		out[i] = pickAddr(t)
+	}
+	return out
+}
+
 type configValues struct {
 	ProxmoxURL           string
 	Org                  string
@@ -304,17 +403,17 @@ type configValues struct {
 	ObsAddr              string
 	AdminAddr            string
 
-	// Cluster mode plumbing. When ClusterMode is "kubernetes" the
-	// template emits the cluster.kubernetes block; otherwise it's
-	// omitted (default = standalone).
-	ClusterMode    string // "standalone" or "kubernetes"
-	LeaseName      string
-	LeaseNamespace string
-	Identity       string
-	PodIP          string
-	LeaseDuration  string
-	RenewDeadline  string
-	RetryPeriod    string
+	// Cluster mode plumbing. When ClusterMode is "raft" the template
+	// emits the cluster.raft block; otherwise it's omitted
+	// (default = standalone).
+	ClusterMode      string // "standalone" or "raft"
+	NodeID           string
+	BindAddr         string
+	Peers            []RaftPeerSpec
+	Bootstrap        bool
+	HeartbeatTimeout string
+	ElectionTimeout  string
+	CommitTimeout    string
 }
 
 const configTmpl = `
@@ -372,15 +471,20 @@ admin_api:
   shared_secret_env: SCALESET_ADMIN_SECRET
 cluster:
   mode: {{if .ClusterMode}}{{.ClusterMode}}{{else}}standalone{{end}}
-{{- if eq .ClusterMode "kubernetes" }}
-  kubernetes:
-    lease_name: {{.LeaseName}}
-    lease_namespace: {{.LeaseNamespace}}
-    identity: {{.Identity}}
-    pod_ip: {{.PodIP}}
-    lease_duration: {{.LeaseDuration}}
-    renew_deadline: {{.RenewDeadline}}
-    retry_period: {{.RetryPeriod}}
+{{- if eq .ClusterMode "raft" }}
+  raft:
+    node_id: {{.NodeID}}
+    bind_addr: "{{.BindAddr}}"
+    bootstrap: {{.Bootstrap}}
+    heartbeat_timeout: {{.HeartbeatTimeout}}
+    election_timeout: {{.ElectionTimeout}}
+    commit_timeout: {{.CommitTimeout}}
+    peers:
+{{- range .Peers }}
+      - node_id: {{.NodeID}}
+        raft_addr: "{{.RaftAddr}}"
+        http_addr: "{{.HTTPAddr}}"
+{{- end }}
 {{- end }}
 `
 

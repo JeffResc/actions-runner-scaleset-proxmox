@@ -3,7 +3,7 @@
 //
 // Subcommands:
 //
-//	scaleset run [--config=path] [--dry-run] [--allow-partial-recovery]
+//	scaleset run [--config=path] [--dry-run]
 //	scaleset version
 package main
 
@@ -31,9 +31,8 @@ func main() {
 	}
 
 	var (
-		configPath           string
-		dryRun               bool
-		allowPartialRecovery bool
+		configPath string
+		dryRun     bool
 	)
 	root.PersistentFlags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config YAML.")
 
@@ -44,18 +43,13 @@ func main() {
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 			return app.Run(ctx, app.Options{
-				ConfigPath:           configPath,
-				DryRun:               dryRun,
-				AllowPartialRecovery: allowPartialRecovery,
-				Version:              version,
+				ConfigPath: configPath,
+				DryRun:     dryRun,
+				Version:    version,
 			})
 		},
 	}
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Log intended Proxmox actions without executing them.")
-	runCmd.Flags().BoolVar(&allowPartialRecovery, "allow-partial-recovery", false,
-		"Start even when crash recovery couldn't destroy every orphaned Proxmox VM. "+
-			"Dangerous — the orchestrator will clone fresh VMs on top of leaked ones. "+
-			"Use only as a one-time escape hatch when a Proxmox node is permanently unreachable.")
 
 	versionCmd := &cobra.Command{
 		Use:   "version",

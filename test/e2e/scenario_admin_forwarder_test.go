@@ -4,12 +4,10 @@ package e2e
 
 import (
 	"io"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakegithub"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakeproxmox"
@@ -18,22 +16,24 @@ import (
 // TestE2E_AdminForwarderRoutesFollowerToLeader proves a follower's
 // admin API reverse-proxies to the current leader. Operators hitting
 // /admin/state via a stable Service IP / LB don't need to know which
-// replica is leader — the standby reads the leader endpoint from the
-// Lease annotation and forwards the request unchanged.
+// replica is leader — the standby resolves the leader's HTTP endpoint
+// from the static raft peer list and forwards the request unchanged.
 //
 // Driven through the real adminapi.coordAdminGate + cluster.Forwarder
 // path; the unit tests in internal/cluster cover the forwarder logic
 // in isolation, but only this scenario exercises the full chain
-// (lease publish -> annotation -> follower fetch -> reverse proxy)
-// against a live orchestrator.
+// (raft leadership → peer-map lookup → reverse proxy) against a live
+// orchestrator.
 func TestE2E_AdminForwarderRoutesFollowerToLeader(t *testing.T) {
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{Name: "fwd-set"},
 	})
-	kube := kubefake.NewSimpleClientset()
 
 	const replicas = 2
+	adminAddrs := PickAdminAddrs(t, replicas)
+	rc := NewRaftCluster(t, adminAddrs)
+
 	harnesses := make([]*Harness, replicas)
 	for i := 0; i < replicas; i++ {
 		harnesses[i] = Start(t, Options{
@@ -42,13 +42,13 @@ func TestE2E_AdminForwarderRoutesFollowerToLeader(t *testing.T) {
 			ScaleSetName:         "fwd-set",
 			FakeProxmox:          proxmox,
 			FakeGitHub:           gh,
-			KubeClient:           kube,
-			Identity:             "replica-" + strconv.Itoa(i),
+			RaftCluster:          rc,
+			ReplicaIndex:         i,
 		})
 	}
 
 	// Wait for the gauge to settle on one leader.
-	var leaderIdx int = -1
+	leaderIdx := -1
 	require.Eventually(t, func() bool {
 		for i, h := range harnesses {
 			if h.MetricValue(t, "scaleset_leader") >= 1 {

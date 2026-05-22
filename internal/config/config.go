@@ -261,53 +261,67 @@ type AdminAPIConfig struct {
 
 // ClusterConfig selects the leader-election backend. In "standalone"
 // mode (the default) the process is always leader; multi-replica
-// deployment is unsupported. In "kubernetes" mode the process
-// participates in a coordination.k8s.io/v1 Lease via
-// k8s.io/client-go/tools/leaderelection and only runs the control
-// plane while it holds the Lease.
+// deployment is unsupported. In "raft" mode the process participates
+// in an embedded hashicorp/raft cluster across the peers declared in
+// Raft.Peers and only runs the control plane while it holds raft
+// leadership.
 type ClusterConfig struct {
-	// Mode is "standalone" (default) or "kubernetes".
-	Mode string `yaml:"mode" validate:"oneof=standalone kubernetes"`
+	// Mode is "standalone" (default) or "raft".
+	Mode string `yaml:"mode" validate:"oneof=standalone raft"`
 
-	// Kubernetes is only consulted when Mode == "kubernetes".
-	Kubernetes ClusterKubernetesConfig `yaml:"kubernetes"`
+	// Raft is only consulted when Mode == "raft".
+	Raft ClusterRaftConfig `yaml:"raft"`
 }
 
-// ClusterKubernetesConfig configures the Lease-backed leader election.
-// All fields default to sensible values resolved from the Downward API
-// env vars POD_NAME / POD_NAMESPACE / POD_IP when present.
-type ClusterKubernetesConfig struct {
-	// LeaseName is the metadata.name of the Lease object. Defaults to
-	// "scaleset-<scaleset.name>" when empty.
-	LeaseName string `yaml:"lease_name"`
+// ClusterRaftConfig configures the embedded raft coordinator. The
+// orchestrator runs raft purely as a leader-election primitive — the
+// FSM is a no-op and no state is replicated. Operators declare the
+// full peer list once; dynamic membership changes are not supported.
+type ClusterRaftConfig struct {
+	// NodeID uniquely identifies this replica in the raft
+	// configuration. Must match exactly one entry in Peers.NodeID.
+	// Defaults to $HOSTNAME, then os.Hostname.
+	NodeID string `yaml:"node_id"`
 
-	// LeaseNamespace is the metadata.namespace of the Lease. Defaults
-	// to $POD_NAMESPACE when empty.
-	LeaseNamespace string `yaml:"lease_namespace"`
+	// BindAddr is the listen address for the raft TCP transport,
+	// e.g. "0.0.0.0:7000". Required.
+	BindAddr string `yaml:"bind_addr"`
 
-	// Identity uniquely identifies this replica in election logs and
-	// as the Lease holderIdentity. Defaults to $POD_NAME, then
-	// os.Hostname.
-	Identity string `yaml:"identity"`
+	// AdvertiseAddr is what other peers use to dial this replica's
+	// raft port, e.g. "10.0.0.1:7000". When empty, falls back to
+	// BindAddr — only safe when BindAddr is a routable (non-wildcard)
+	// address.
+	AdvertiseAddr string `yaml:"advertise_addr"`
 
-	// PodIP is this pod's IP, published alongside the admin port in
-	// the Lease annotation so standbys can reverse-proxy admin traffic
-	// to the leader. Defaults to $POD_IP.
-	PodIP string `yaml:"pod_ip"`
+	// Peers is the full static peer list, including this replica.
+	// All replicas must agree on this list at startup.
+	Peers []ClusterRaftPeer `yaml:"peers"`
 
-	LeaseDuration string `yaml:"lease_duration"` // default 15s
-	RenewDeadline string `yaml:"renew_deadline"` // default 10s
-	RetryPeriod   string `yaml:"retry_period"`   // default  2s
+	// Bootstrap, when true, makes this replica call
+	// raft.BootstrapCluster on first start. Should be true on exactly
+	// one replica during initial cluster setup. Safe to leave true on
+	// subsequent restarts — raft tolerates concurrent BootstrapCluster
+	// against an already-formed cluster.
+	Bootstrap bool `yaml:"bootstrap"`
 
-	// LeaderEndpointAnnotation is the Lease metadata.annotations key
-	// used to publish the leader's endpoint. Defaults to
-	// "scaleset.jeffresc.dev/leader-endpoint".
-	LeaderEndpointAnnotation string `yaml:"leader_endpoint_annotation"`
+	HeartbeatTimeout string `yaml:"heartbeat_timeout"` // default 1s
+	ElectionTimeout  string `yaml:"election_timeout"`  // default 1s
+	CommitTimeout    string `yaml:"commit_timeout"`    // default 50ms
 
 	// Resolved durations (populated by Resolve).
-	LeaseDurationD time.Duration `yaml:"-"`
-	RenewDeadlineD time.Duration `yaml:"-"`
-	RetryPeriodD   time.Duration `yaml:"-"`
+	HeartbeatTimeoutD time.Duration `yaml:"-"`
+	ElectionTimeoutD  time.Duration `yaml:"-"`
+	CommitTimeoutD    time.Duration `yaml:"-"`
+}
+
+// ClusterRaftPeer describes one replica in the raft cluster. NodeID +
+// RaftAddr uniquely identify the peer to raft; HTTPAddr is what
+// standbys reverse-proxy admin requests to once that peer becomes
+// leader.
+type ClusterRaftPeer struct {
+	NodeID   string `yaml:"node_id" validate:"required"`
+	RaftAddr string `yaml:"raft_addr" validate:"required"`
+	HTTPAddr string `yaml:"http_addr"`
 }
 
 // Load reads, parses, defaults, env-resolves, and validates a YAML config
@@ -395,17 +409,14 @@ func (c *Config) ApplyDefaults() {
 	if c.Cluster.Mode == "" {
 		c.Cluster.Mode = "standalone"
 	}
-	if c.Cluster.Kubernetes.LeaseDuration == "" {
-		c.Cluster.Kubernetes.LeaseDuration = "15s"
+	if c.Cluster.Raft.HeartbeatTimeout == "" {
+		c.Cluster.Raft.HeartbeatTimeout = "1s"
 	}
-	if c.Cluster.Kubernetes.RenewDeadline == "" {
-		c.Cluster.Kubernetes.RenewDeadline = "10s"
+	if c.Cluster.Raft.ElectionTimeout == "" {
+		c.Cluster.Raft.ElectionTimeout = "1s"
 	}
-	if c.Cluster.Kubernetes.RetryPeriod == "" {
-		c.Cluster.Kubernetes.RetryPeriod = "2s"
-	}
-	if c.Cluster.Kubernetes.LeaderEndpointAnnotation == "" {
-		c.Cluster.Kubernetes.LeaderEndpointAnnotation = "scaleset.jeffresc.dev/leader-endpoint"
+	if c.Cluster.Raft.CommitTimeout == "" {
+		c.Cluster.Raft.CommitTimeout = "50ms"
 	}
 }
 
@@ -530,57 +541,61 @@ func (c *Config) Resolve() error {
 	return nil
 }
 
-// resolveCluster fills in defaults from the Downward API env vars when
-// the corresponding YAML fields are empty, parses durations, and
-// validates that "kubernetes" mode has the inputs it needs.
+// resolveCluster fills in NodeID from $HOSTNAME/os.Hostname when
+// empty, parses raft timing durations, and validates that "raft"
+// mode has a self-consistent peer list.
 func (c *Config) resolveCluster() error {
-	k := &c.Cluster.Kubernetes
-	if k.LeaseName == "" {
-		k.LeaseName = "scaleset-" + c.ScaleSet.Name
-	}
-	if k.LeaseNamespace == "" {
-		k.LeaseNamespace = os.Getenv("POD_NAMESPACE")
-	}
-	if k.Identity == "" {
-		if id := os.Getenv("POD_NAME"); id != "" {
-			k.Identity = id
+	r := &c.Cluster.Raft
+	if r.NodeID == "" {
+		if id := os.Getenv("HOSTNAME"); id != "" {
+			r.NodeID = id
 		} else if host, err := os.Hostname(); err == nil {
-			k.Identity = host
+			r.NodeID = host
 		}
-	}
-	if k.PodIP == "" {
-		k.PodIP = os.Getenv("POD_IP")
 	}
 	var err error
-	k.LeaseDurationD, err = time.ParseDuration(k.LeaseDuration)
+	r.HeartbeatTimeoutD, err = time.ParseDuration(r.HeartbeatTimeout)
 	if err != nil {
-		return fmt.Errorf("cluster.kubernetes.lease_duration: %w", err)
+		return fmt.Errorf("cluster.raft.heartbeat_timeout: %w", err)
 	}
-	k.RenewDeadlineD, err = time.ParseDuration(k.RenewDeadline)
+	r.ElectionTimeoutD, err = time.ParseDuration(r.ElectionTimeout)
 	if err != nil {
-		return fmt.Errorf("cluster.kubernetes.renew_deadline: %w", err)
+		return fmt.Errorf("cluster.raft.election_timeout: %w", err)
 	}
-	k.RetryPeriodD, err = time.ParseDuration(k.RetryPeriod)
+	r.CommitTimeoutD, err = time.ParseDuration(r.CommitTimeout)
 	if err != nil {
-		return fmt.Errorf("cluster.kubernetes.retry_period: %w", err)
+		return fmt.Errorf("cluster.raft.commit_timeout: %w", err)
 	}
-	if c.Cluster.Mode == "kubernetes" {
-		switch {
-		case k.LeaseNamespace == "":
-			return errors.New("cluster.kubernetes.lease_namespace is required (set the field or $POD_NAMESPACE) when cluster.mode=kubernetes")
-		case k.Identity == "":
-			return errors.New("cluster.kubernetes.identity is required (set the field, $POD_NAME, or have a usable hostname) when cluster.mode=kubernetes")
-		case k.PodIP == "":
-			return errors.New("cluster.kubernetes.pod_ip is required (set the field or $POD_IP) when cluster.mode=kubernetes")
+	if c.Cluster.Mode != "raft" {
+		return nil
+	}
+	switch {
+	case r.NodeID == "":
+		return errors.New("cluster.raft.node_id is required (set the field, $HOSTNAME, or have a usable hostname) when cluster.mode=raft")
+	case r.BindAddr == "":
+		return errors.New("cluster.raft.bind_addr is required when cluster.mode=raft")
+	case len(r.Peers) == 0:
+		return errors.New("cluster.raft.peers must list every replica (including this one) when cluster.mode=raft")
+	}
+	selfFound := false
+	seen := make(map[string]struct{}, len(r.Peers))
+	for i, p := range r.Peers {
+		if p.NodeID == "" {
+			return fmt.Errorf("cluster.raft.peers[%d].node_id is required", i)
 		}
-		if k.RenewDeadlineD >= k.LeaseDurationD {
-			return fmt.Errorf("cluster.kubernetes.renew_deadline (%s) must be < lease_duration (%s)",
-				k.RenewDeadlineD, k.LeaseDurationD)
+		if _, dup := seen[p.NodeID]; dup {
+			return fmt.Errorf("cluster.raft.peers: duplicate node_id %q", p.NodeID)
 		}
-		if k.RetryPeriodD >= k.RenewDeadlineD {
-			return fmt.Errorf("cluster.kubernetes.retry_period (%s) must be < renew_deadline (%s)",
-				k.RetryPeriodD, k.RenewDeadlineD)
+		seen[p.NodeID] = struct{}{}
+		if p.RaftAddr == "" {
+			return fmt.Errorf("cluster.raft.peers[%d].raft_addr is required", i)
 		}
+		if p.NodeID == r.NodeID {
+			selfFound = true
+		}
+	}
+	if !selfFound {
+		return fmt.Errorf("cluster.raft.peers does not include this replica's node_id %q", r.NodeID)
 	}
 	return nil
 }

@@ -82,6 +82,14 @@ type Config struct {
 	// effort — errors are logged but don't block destruction. Nil is OK
 	// and treated as a no-op (e.g. in tests).
 	OnRunnerOrphaned func(ctx context.Context, runnerID int64) error
+
+	// RunnerLister is consulted by Adopt to classify owner-tagged
+	// Proxmox VMs more precisely: a VM whose runner is busy on GitHub
+	// is adopted directly as Running with the right RunnerID, skipping
+	// the Hot → reconcile → promote round-trip the gh.Reconciler would
+	// otherwise do. Nil is OK — Adopt falls back to power-state-only
+	// classification (the gh.Reconciler's first tick converges anyway).
+	RunnerLister RunnerLister
 }
 
 // manager is the in-process Manager implementation.
@@ -447,36 +455,111 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 
 // Recover reconciles the (empty) in-memory store against Proxmox reality
 // on startup. With no persistent state to load, this collapses to
-// "destroy any Proxmox VM tagged as ours that has no in-memory row" —
-// i.e. clean up orphans left by a previous process crash.
+// Adopt seeds the in-memory store from Proxmox + GitHub observations
+// for every owner-tagged VM the previous leader (or this process's
+// prior incarnation) left behind. The classification matrix is:
 //
-// Returns a non-nil error if any orphan destruction failed; the caller
-// should refuse to start unless an explicit override is in effect.
-// Partial recovery is the worst possible state: the orchestrator would
-// start cloning fresh VMs on top of leaked ones, leading to the very
-// resource exhaustion Recover exists to prevent.
-func (m *manager) Recover(ctx context.Context) error {
+//	power=stopped                          → Warm   / PoolKindWarm
+//	power=running, no GitHub runner        → Hot    / PoolKindHot
+//	power=running, runner busy             → Running  / PoolKindHot (with RunnerID)
+//	power=running, runner online & idle    → Assigned / PoolKindHot (with RunnerID)
+//	power=running, runner offline          → Assigned / PoolKindHot (with RunnerID)
+//	power query failed                     → Hot    / PoolKindHot (safe fallback)
+//
+// The gh.Reconciler's matrix converges any misclassifications on its
+// next tick (Hot+busy → promote to Running, Assigned/Running grace
+// timers, etc.), so adoption only needs to be approximately right.
+//
+// Best-effort by design: a per-VM PowerState or store.Insert failure
+// is logged and the loop continues. The whole-pass error is returned
+// only when ListOwnedVMs itself fails — Proxmox is unreachable, no
+// classification is possible. The caller (app.runLeaderPlane) logs
+// and continues with an empty pool; the orphan-sweep in gh.Reconciler
+// will reap any stranded VMs once Proxmox recovers.
+//
+// JobID is intentionally left 0: we don't know which GitHub job an
+// in-flight runner is executing, and the power-poller / reconciler
+// don't need it — they key on RunnerID and VM power state.
+func (m *manager) Adopt(ctx context.Context) error {
 	pmoxVMs, err := m.prov.ListOwnedVMs(ctx)
 	if err != nil {
-		return fmt.Errorf("recover: list owned vms: %w", err)
+		return fmt.Errorf("adopt: list owned vms: %w", err)
 	}
-	var failed []error
+
+	// Best-effort GitHub runner snapshot. A whole-pass failure here is
+	// non-fatal: power-state-only classification still preserves every
+	// inherited VM; the next gh.Reconciler tick reclassifies Hot rows
+	// whose runners turn out to be busy.
+	var runners map[string]RunnerInfo
+	if m.cfg.RunnerLister != nil {
+		runners, err = m.cfg.RunnerLister(ctx)
+		if err != nil {
+			m.log.Warn("adopt: github runner list failed; classifying by power-state only", "err", err)
+			runners = nil
+		}
+	}
+
 	for _, pv := range pmoxVMs {
-		m.log.Warn("recover: orphan proxmox vm; destroying", "vmid", pv.VMID, "node", pv.Node)
-		if err := m.prov.Destroy(ctx, pv); err != nil {
-			m.log.Warn("recover: destroy orphan failed", "vmid", pv.VMID, "err", err)
-			failed = append(failed, fmt.Errorf("vmid=%d node=%s: %w", pv.VMID, pv.Node, err))
-			continue
-		}
-		if m.metrics != nil {
-			m.metrics.VMsTotal.WithLabelValues("recovered_orphan").Inc()
-		}
-	}
-	if len(failed) > 0 {
-		return fmt.Errorf("recover: %d of %d orphans failed to destroy: %w",
-			len(failed), len(pmoxVMs), errors.Join(failed...))
+		m.adoptOne(ctx, pv, runners)
 	}
 	return nil
+}
+
+// adoptOne classifies a single inherited VM and inserts it into the
+// store. Extracted so the per-VM error paths can `return` cleanly
+// without leaking the loop control structure into the classification.
+func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) {
+	state, kind, runnerID := m.classifyAdoption(ctx, pv, runners)
+	row := &store.VM{
+		VMID:     pv.VMID,
+		Node:     pv.Node,
+		Name:     pv.Name,
+		PoolKind: kind,
+		State:    state,
+		RunnerID: runnerID,
+	}
+	if err := m.store.Insert(row); err != nil {
+		m.log.Warn("adopt: insert failed; skipping",
+			"vmid", pv.VMID, "node", pv.Node, "state", state, "err", err)
+		return
+	}
+	m.log.Info("adopt: inherited vm",
+		"vmid", pv.VMID, "node", pv.Node, "name", pv.Name,
+		"state", state, "pool_kind", kind, "runner_id", runnerID)
+	if m.metrics != nil {
+		m.metrics.VMsTotal.WithLabelValues("adopted_" + string(state)).Inc()
+	}
+}
+
+// classifyAdoption picks (State, PoolKind, RunnerID) for one inherited
+// VM from observable Proxmox power state and the GitHub runner snapshot
+// (which may be nil when GitHub was unreachable).
+//
+// The PowerState query failure path defaults to Hot (NOT Warm) so the
+// reconciler's hot+busy → promote-to-Running rule can recover any
+// in-flight job if a runner does turn out to be registered. Defaulting
+// to Warm would hide the VM from the reconciler's matrix entirely.
+func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) (store.State, store.PoolKind, int64) {
+	power, err := m.prov.PowerState(ctx, pv)
+	if err != nil {
+		m.log.Warn("adopt: power-state query failed; defaulting to hot",
+			"vmid", pv.VMID, "node", pv.Node, "err", err)
+		return store.StateHot, store.PoolKindHot, 0
+	}
+	if power != "running" {
+		return store.StateWarm, store.PoolKindWarm, 0
+	}
+	gr, present := runners[pv.Name]
+	if !present {
+		return store.StateHot, store.PoolKindHot, 0
+	}
+	if gr.Busy {
+		return store.StateRunning, store.PoolKindHot, gr.ID
+	}
+	// Online-idle or offline registered runner: Assigned is the safe
+	// middle. The reconciler's AssignedGrace / AssignedOfflineGrace
+	// will recycle the row if no job arrives or the runner stays down.
+	return store.StateAssigned, store.PoolKindHot, gr.ID
 }
 
 // Run is the reconcile loop.

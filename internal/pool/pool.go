@@ -100,6 +100,26 @@ type RowSnapshot struct {
 	CreatedAt  time.Time
 }
 
+// RunnerInfo is the subset of GitHub's per-runner state that the
+// orchestrator needs for adoption + reconciliation. ID == 0 only ever
+// appears in synthesised "unknown" entries; production callers receive
+// the GitHub-assigned positive int64.
+type RunnerInfo struct {
+	ID     int64
+	Online bool
+	Busy   bool
+}
+
+// RunnerLister returns every GitHub runner registered against this
+// scaleset's scope whose name matches the orchestrator's prefix, keyed
+// by runner name (which is also the VM name). Used by both the gh
+// reconciler's polling loop and the leader's one-shot Adopt pass.
+//
+// Implementations MUST be safe for concurrent calls. A nil lister is
+// allowed — Adopt treats it as "GitHub unavailable" and falls back to
+// power-state-only classification.
+type RunnerLister func(ctx context.Context) (map[string]RunnerInfo, error)
+
 // Manager is the entry point for the rest of the orchestrator.
 type Manager interface {
 	// Acquire atomically transitions one Hot VM to Assigned, associates
@@ -145,10 +165,22 @@ type Manager interface {
 	// Stats returns a snapshot of the pool.
 	Stats(ctx context.Context) (Stats, error)
 
-	// Recover reconciles the (empty) in-memory state against Proxmox
-	// reality on startup — used to destroy orphaned Proxmox VMs left
-	// over from a previous process. Must be called before Run.
-	Recover(ctx context.Context) error
+	// Adopt seeds the (empty) in-memory state from Proxmox + GitHub
+	// observations on startup, preserving every owner-tagged VM and its
+	// in-flight job across leader transitions. For each VM returned by
+	// Provisioner.ListOwnedVMs, it queries the VM's Proxmox power state
+	// and (when a RunnerLister is wired) the corresponding GitHub
+	// runner, then inserts a row with the best-inferred PoolKind, State,
+	// and RunnerID. The continuous gh.Reconciler matrix converges any
+	// approximations on its next tick. Must be called before Run.
+	//
+	// Adopt is best-effort by design: a transient Proxmox or GitHub API
+	// blip skips an individual VM (logged at warn) rather than aborting
+	// leader startup. Returns a non-nil error only when ListOwnedVMs
+	// itself fails — the caller is expected to log it and continue with
+	// an empty pool (the orphan-sweep in gh.Reconciler will reap any
+	// stranded VMs once the API recovers).
+	Adopt(ctx context.Context) error
 
 	// Run is the reconcile loop. Blocks until ctx is cancelled, then
 	// performs a graceful drain.
