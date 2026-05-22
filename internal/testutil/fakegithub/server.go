@@ -1,17 +1,16 @@
-// Package fakegithub is an httptest-backed fake of the subset of the
-// GitHub REST API the orchestrator's `gh` reconciler talks to:
+// Package fakegithub is an httptest-backed fake of the GitHub
+// endpoints the orchestrator talks to:
 //
-//   - GET  /orgs/{org}/actions/runners
-//   - GET  /repos/{owner}/{repo}/actions/runners
-//   - DELETE /orgs/{org}/actions/runners/{id}
-//   - DELETE /repos/{owner}/{repo}/actions/runners/{id}
+//   - GitHub REST runners API (used by internal/gh's reconciler):
+//     GET / DELETE /orgs/{org}/actions/runners and the /repos/...
+//     equivalents.
 //
-// The scaleset library's listener handshake (the
-// /actions/runner-registration token exchange, message-session
-// long-polling, and JIT-config minting) is intentionally NOT
-// implemented here yet — the full-binary e2e harness will add those
-// endpoints when it needs them. This package's current scope is what
-// the gh reconciler needs in isolation.
+//   - The scaleset library's listener handshake (used by
+//     internal/app's leader plane): registration-token exchange,
+//     /actions/runner-registration, runner-scale-set
+//     lookup/create, message-session lifecycle with long-polled
+//     GetMessage, acquirejobs, and generatejitconfig. The full
+//     wire surface lives in scaleset.go.
 //
 // New tests should prefer this package over hand-rolled httptest
 // fixtures. The existing fakeRunner / runnersServer / newTestClient
