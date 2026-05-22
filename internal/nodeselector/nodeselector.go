@@ -21,8 +21,10 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/jellydator/ttlcache/v3"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/luthermonson/go-proxmox"
@@ -141,18 +143,28 @@ func (f *proxmoxResourceFetcher) Fetch(ctx context.Context) (map[string]float64,
 
 type leastLoaded struct {
 	fetcher resourceFetcher
-	nodes   []string
-	refresh time.Duration
-	timeNow func() time.Time
 
-	mu       sync.Mutex
-	cached   map[string]float64
-	lastSeen time.Time
+	// cache holds the most recent successful Fetch result. Expired reads
+	// return nil from Get; on miss we singleflight a new Fetch. ttlcache
+	// owns the TTL accounting (WithDisableTouchOnHit so reads don't
+	// extend the freshness window).
+	cache *ttlcache.Cache[string, map[string]float64]
+
+	// lastFresh holds the most recent successful Fetch result regardless
+	// of TTL. Consulted on the fetch-error path so a transient Proxmox
+	// blip falls back to stale data instead of failing a selection.
+	lastFresh atomic.Pointer[map[string]float64]
+
 	// sf collapses concurrent cache-miss fetches into a single Proxmox
 	// API call. Without it, N concurrent Select callers can each see a
 	// stale cache, all call Fetch, and pile load on the API.
 	sf singleflight.Group
 }
+
+// scoresCacheKey is the single key used in cache. The cache only ever
+// holds one entry; we use ttlcache rather than a one-shot struct to
+// delegate TTL accounting to the library.
+const scoresCacheKey = "scores"
 
 // NewLeastLoaded returns a Selector that polls Proxmox at most every
 // `refresh` interval for node load. If `nodes` is non-empty, only nodes in
@@ -164,12 +176,19 @@ func NewLeastLoaded(cli *proxmox.Client, nodes []string, refresh time.Duration) 
 	if refresh <= 0 {
 		refresh = 30 * time.Second
 	}
+	return newLeastLoadedFromFetcher(&proxmoxResourceFetcher{cli: cli, nodes: nodes}, refresh), nil
+}
+
+// newLeastLoadedFromFetcher is the constructor used by tests to inject a
+// fake fetcher. Production goes through NewLeastLoaded.
+func newLeastLoadedFromFetcher(fetcher resourceFetcher, refresh time.Duration) *leastLoaded {
 	return &leastLoaded{
-		fetcher: &proxmoxResourceFetcher{cli: cli, nodes: nodes},
-		nodes:   nodes,
-		refresh: refresh,
-		timeNow: time.Now,
-	}, nil
+		fetcher: fetcher,
+		cache: ttlcache.New[string, map[string]float64](
+			ttlcache.WithTTL[string, map[string]float64](refresh),
+			ttlcache.WithDisableTouchOnHit[string, map[string]float64](),
+		),
+	}
 }
 
 func (l *leastLoaded) Select(ctx context.Context, hint Hint) (string, error) {
@@ -197,36 +216,30 @@ func (l *leastLoaded) Select(ctx context.Context, hint Hint) (string, error) {
 }
 
 func (l *leastLoaded) scores(ctx context.Context) (map[string]float64, error) {
-	l.mu.Lock()
-	now := l.timeNow()
-	if l.cached != nil && now.Sub(l.lastSeen) < l.refresh {
-		out := maps.Clone(l.cached)
-		l.mu.Unlock()
-		return out, nil
+	if item := l.cache.Get(scoresCacheKey); item != nil {
+		return maps.Clone(item.Value()), nil
 	}
-	l.mu.Unlock()
 
 	// Collapse concurrent fetches into one Proxmox API call. Key is
 	// constant — at most one Fetch in flight at a time across all
 	// callers. Late arrivals share the result.
-	v, err, _ := l.sf.Do("fetch", func() (any, error) {
-		return l.fetcher.Fetch(ctx)
+	v, err, _ := l.sf.Do(scoresCacheKey, func() (any, error) {
+		fresh, err := l.fetcher.Fetch(ctx)
+		if err != nil {
+			return nil, err
+		}
+		l.cache.Set(scoresCacheKey, fresh, ttlcache.DefaultTTL)
+		l.lastFresh.Store(&fresh)
+		return fresh, nil
 	})
 	if err != nil {
-		// Fall back to cached data if we have any — stale info is better
-		// than failing a selection during a transient Proxmox blip.
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		if l.cached != nil {
-			return maps.Clone(l.cached), nil
+		// Fall back to last known-good if we have any — stale info is
+		// better than failing a selection during a transient Proxmox
+		// blip.
+		if prev := l.lastFresh.Load(); prev != nil {
+			return maps.Clone(*prev), nil
 		}
 		return nil, err
 	}
-	fresh := v.(map[string]float64)
-	l.mu.Lock()
-	l.cached = fresh
-	l.lastSeen = now
-	out := maps.Clone(fresh)
-	l.mu.Unlock()
-	return out, nil
+	return maps.Clone(v.(map[string]float64)), nil
 }
