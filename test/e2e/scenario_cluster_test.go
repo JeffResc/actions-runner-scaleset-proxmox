@@ -145,7 +145,7 @@ func TestE2E_ClusterLeaderTakeover(t *testing.T) {
 	}
 
 	// Identify the initial leader.
-	var leaderIdx int = -1
+	leaderIdx := -1
 	require.Eventually(t, func() bool {
 		for i, h := range harnesses {
 			if h.MetricValue(t, "scaleset_leader") >= 1 {

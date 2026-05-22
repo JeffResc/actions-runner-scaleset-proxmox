@@ -214,7 +214,7 @@ func TestRaft_LeaderEndpointResolvesPeerHTTPAddr(t *testing.T) {
 
 	rc := newRaftCluster(t, 3)
 	// Wait for a leader to emerge.
-	var leaderIdx int = -1
+	leaderIdx := -1
 	require.Eventually(t, func() bool {
 		for i, c := range rc.coords {
 			if c.IsLeader() {

@@ -48,7 +48,7 @@ func TestE2E_AdminForwarderRoutesFollowerToLeader(t *testing.T) {
 	}
 
 	// Wait for the gauge to settle on one leader.
-	var leaderIdx int = -1
+	leaderIdx := -1
 	require.Eventually(t, func() bool {
 		for i, h := range harnesses {
 			if h.MetricValue(t, "scaleset_leader") >= 1 {
