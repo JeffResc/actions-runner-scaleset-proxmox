@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/google/go-github/v84/github"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -178,7 +179,18 @@ const orphanGrace = 30 * time.Second
 // FailureBackoffMax, then collapses back to PollInterval on the first
 // successful tick. This keeps API budget intact during GitHub outages
 // without abandoning recovery once the API comes back.
+//
+// backoff.ExponentialBackOff owns the doubling + cap; we call its
+// NextBackOff/Reset around the infinite-poll loop. backoff.Retry isn't
+// a fit because Run never "succeeds and returns" — it runs forever
+// until ctx is cancelled.
 func (r *Reconciler) Run(ctx context.Context) error {
+	eb := backoff.NewExponentialBackOff()
+	eb.InitialInterval = r.cfg.PollInterval
+	eb.MaxInterval = r.cfg.FailureBackoffMax
+	eb.Multiplier = 2.0
+	eb.RandomizationFactor = 0 // deterministic to keep operator-facing log timings predictable
+	eb.Reset()
 	delay := r.cfg.PollInterval
 	for {
 		// time.NewTimer (not time.After) so the timer is reclaimed
@@ -194,13 +206,11 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 		if err := r.Tick(ctx); err != nil {
-			delay *= 2
-			if delay > r.cfg.FailureBackoffMax {
-				delay = r.cfg.FailureBackoffMax
-			}
+			delay = eb.NextBackOff()
 			r.log.Warn("reconciler tick failed; backing off", "err", err, "next_in", delay)
 			continue
 		}
+		eb.Reset()
 		delay = r.cfg.PollInterval
 	}
 }

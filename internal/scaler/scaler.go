@@ -16,7 +16,6 @@ package scaler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -26,6 +25,7 @@ import (
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
+	"github.com/cenkalti/backoff/v5"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
@@ -321,34 +321,38 @@ func (s *Scaler) injectWithRetry(ctx context.Context, vm *provisioner.VM, jit st
 		maxAttempts  = 6
 		maxWallClock = 60 * time.Second
 	)
-	retryCtx, cancel := context.WithTimeout(ctx, maxWallClock)
-	defer cancel()
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := s.prov.InjectJITConfig(retryCtx, vm, jit)
+	eb := backoff.NewExponentialBackOff()
+	eb.InitialInterval = 2 * time.Second
+	eb.MaxInterval = 10 * time.Second
+	eb.Multiplier = 2.0
+	eb.RandomizationFactor = 0 // deterministic; matches the prior fixed-step schedule
+	var attempts int
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		attempts++
+		err := s.prov.InjectJITConfig(ctx, vm, jit)
 		if err == nil {
-			if attempt > 1 {
-				s.log.Info("jit inject recovered", "vmid", vm.VMID, "attempts", attempt)
-			}
-			return nil
+			return struct{}{}, nil
 		}
-		lastErr = err
-		// Non-transient errors fail fast.
+		// Non-transient errors fail fast via Permanent so Retry stops immediately.
 		if !isTransientInjectError(err) {
-			return err
+			return struct{}{}, backoff.Permanent(err)
 		}
-		if attempt < maxAttempts {
-			// 2, 4, 6, 8, 10s = 30s cumulative beyond HTTP transport retries
-			backoff := time.Duration(attempt*2) * time.Second
-			s.log.Warn("jit inject failed; retrying", "vmid", vm.VMID, "attempt", attempt, "backoff", backoff, "err", err)
-			select {
-			case <-time.After(backoff):
-			case <-retryCtx.Done():
-				return fmt.Errorf("inject: %w (last: %w)", retryCtx.Err(), lastErr)
-			}
-		}
+		return struct{}{}, err
+	},
+		backoff.WithBackOff(eb),
+		backoff.WithMaxTries(maxAttempts),
+		backoff.WithMaxElapsedTime(maxWallClock),
+		backoff.WithNotify(func(err error, d time.Duration) {
+			s.log.Warn("jit inject failed; retrying", "vmid", vm.VMID, "attempt", attempts, "backoff", d, "err", err)
+		}),
+	)
+	if err != nil {
+		return err
 	}
-	return lastErr
+	if attempts > 1 {
+		s.log.Info("jit inject recovered", "vmid", vm.VMID, "attempts", attempts)
+	}
+	return nil
 }
 
 // isTransientInjectError recognises the "agent socket briefly
