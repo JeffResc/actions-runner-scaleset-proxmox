@@ -417,6 +417,7 @@ func buildCoordinator(cfg *config.Config, cb cluster.Callbacks, log *slog.Logger
 		NodeID:           cfg.Cluster.Raft.NodeID,
 		BindAddr:         cfg.Cluster.Raft.BindAddr,
 		AdvertiseAddr:    cfg.Cluster.Raft.AdvertiseAddr,
+		DataDir:          cfg.Cluster.Raft.DataDir,
 		AdminPort:        port,
 		AdminHost:        host,
 		Peers:            peers,

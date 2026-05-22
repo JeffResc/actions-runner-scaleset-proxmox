@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -340,12 +341,101 @@ func TestRaft_LeadershipTransferFiresOnElectedOnNewLeader(t *testing.T) {
 		2*time.Second, 50*time.Millisecond, "OnDeposed never fired on the old leader")
 }
 
+// TestRaft_PersistentStateSurvivesRestart spins a single-node raft
+// against a persistent DataDir, lets it elect itself, shuts it down,
+// then re-constructs it pointed at the same DataDir without
+// Bootstrap. Raft must detect the existing state (currentTerm /
+// votedFor / configuration) and elect itself again — this is the
+// election-safety invariant that in-memory stores violated and that
+// #57 was filed to fix.
+//
+// Uses a real TCP transport on a 127.0.0.1 ephemeral port so the
+// BoltDB-backed path actually runs (the in-mem TestTransport path
+// uses in-memory stores by design).
+func TestRaft_PersistentStateSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+
+	// Reserve a real ephemeral port and immediately release it; raft
+	// will re-open it. There's a tiny race here (the port could be
+	// stolen between Close and raft binding) but it's vanishingly
+	// rare on a developer machine and zero-cost on CI.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	bindAddr := l.Addr().String()
+	require.NoError(t, l.Close())
+
+	peer := RaftPeer{
+		NodeID:   "solo",
+		RaftAddr: bindAddr,
+		HTTPAddr: "127.0.0.1:9100",
+	}
+
+	build := func(bootstrap bool) Coordinator {
+		t.Helper()
+		cfg := RaftConfig{
+			NodeID:           "solo",
+			BindAddr:         bindAddr,
+			AdvertiseAddr:    bindAddr,
+			AdminHost:        "127.0.0.1",
+			AdminPort:        9100,
+			DataDir:          dataDir,
+			Peers:            []RaftPeer{peer},
+			Bootstrap:        bootstrap,
+			HeartbeatTimeout: 100 * time.Millisecond,
+			ElectionTimeout:  100 * time.Millisecond,
+			CommitTimeout:    20 * time.Millisecond,
+		}
+		coord, err := NewRaft(cfg, Callbacks{}, discardLogger())
+		require.NoError(t, err)
+		return coord
+	}
+
+	// First run: bootstrap a single-node cluster, observe leader, shut down.
+	{
+		coord := build(true)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- coord.Run(ctx) }()
+
+		require.Eventually(t, coord.IsLeader, 3*time.Second, 20*time.Millisecond,
+			"first run never elected itself")
+
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("first run did not shut down cleanly")
+		}
+	}
+
+	// Second run: same DataDir, Bootstrap=false. Raft must recover
+	// state from BoltDB + the snapshot dir and elect itself without
+	// being told to bootstrap.
+	{
+		coord := build(false)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- coord.Run(ctx) }()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+
+		require.Eventually(t, coord.IsLeader, 3*time.Second, 20*time.Millisecond,
+			"second run did not re-elect from persistent state")
+	}
+}
+
 func TestRaftConfig_ValidationRejectsBadInputs(t *testing.T) {
 	t.Parallel()
 
 	base := RaftConfig{
 		NodeID:        "a",
 		BindAddr:      "0.0.0.0:7000",
+		DataDir:       "/var/lib/scaleset/raft",
 		Peers:         []RaftPeer{{NodeID: "a", RaftAddr: "10.0.0.1:7000"}},
 		TestTransport: nil,
 	}
@@ -353,8 +443,13 @@ func TestRaftConfig_ValidationRejectsBadInputs(t *testing.T) {
 	// Happy path.
 	require.NoError(t, base.validate())
 
-	// Missing NodeID.
+	// Production mode (no TestTransport) without DataDir.
 	bad := base
+	bad.DataDir = ""
+	require.Error(t, bad.validate())
+
+	// Missing NodeID.
+	bad = base
 	bad.NodeID = ""
 	require.Error(t, bad.validate())
 

@@ -246,6 +246,12 @@ func Start(t testing.TB, opts Options) *Harness {
 		// validator still requires a non-empty value, so we give it
 		// one that's obviously synthetic.
 		cv.BindAddr = "test-inmem://" + string(opts.RaftCluster.Addrs[opts.ReplicaIndex])
+		// DataDir is required by config validation even though the
+		// in-mem TestTransport keeps the cluster from ever touching
+		// disk. Give it a per-replica temp dir so config.Parse is
+		// satisfied; the in-mem store path inside NewRaft bypasses
+		// it.
+		cv.DataDir = filepath.Join(t.TempDir(), "raft")
 		cv.Peers = opts.RaftCluster.Peers
 		// Bootstrap the first replica only; the rest discover the
 		// bootstrapped configuration via the transport.
@@ -409,6 +415,7 @@ type configValues struct {
 	ClusterMode      string // "standalone" or "raft"
 	NodeID           string
 	BindAddr         string
+	DataDir          string
 	Peers            []RaftPeerSpec
 	Bootstrap        bool
 	HeartbeatTimeout string
@@ -475,6 +482,7 @@ cluster:
   raft:
     node_id: {{.NodeID}}
     bind_addr: "{{.BindAddr}}"
+    data_dir: "{{.DataDir}}"
     bootstrap: {{.Bootstrap}}
     heartbeat_timeout: {{.HeartbeatTimeout}}
     election_timeout: {{.ElectionTimeout}}
