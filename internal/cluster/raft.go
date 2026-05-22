@@ -353,9 +353,9 @@ func (c *RaftConfig) localEndpoint() string {
 // have nothing to do because no state is being replicated.
 type noopFSM struct{}
 
-func (*noopFSM) Apply(*raft.Log) any                    { return nil }
-func (*noopFSM) Snapshot() (raft.FSMSnapshot, error)    { return noopSnapshot{}, nil }
-func (*noopFSM) Restore(snapshot io.ReadCloser) error   { return snapshot.Close() }
+func (*noopFSM) Apply(*raft.Log) any                  { return nil }
+func (*noopFSM) Snapshot() (raft.FSMSnapshot, error)  { return noopSnapshot{}, nil }
+func (*noopFSM) Restore(snapshot io.ReadCloser) error { return snapshot.Close() }
 
 type noopSnapshot struct{}
 

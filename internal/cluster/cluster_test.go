@@ -181,7 +181,7 @@ func (rc *raftCluster) shutdown() {
 	}
 }
 
-func nodeID(i int) string  { return "node-" + strconv.Itoa(i) }
+func nodeID(i int) string   { return "node-" + strconv.Itoa(i) }
 func httpAddr(i int) string { return "10.0.0." + strconv.Itoa(i+1) + ":9100" }
 
 func TestRaft_SingleNodeElectsSelf(t *testing.T) {

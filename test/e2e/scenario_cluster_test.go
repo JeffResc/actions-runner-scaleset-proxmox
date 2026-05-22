@@ -293,4 +293,3 @@ func taggedOrchestratorVMIDs(snap []fakeproxmox.VMSnapshot, scaleSetName string)
 	}
 	return out
 }
-
