@@ -216,7 +216,7 @@ type kubeCoord struct {
 	client kubernetes.Interface
 	log    *slog.Logger
 	leader atomic.Bool
-	cache  leaderEndpointCache
+	cache  *leaderEndpointCache
 }
 
 // NewKubernetes returns a Coordinator backed by a coordination.k8s.io/v1
