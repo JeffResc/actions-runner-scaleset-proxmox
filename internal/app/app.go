@@ -6,6 +6,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -310,11 +311,29 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("init cluster coordinator: %w", err)
 	}
 
-	admin := adminapi.New(adminapi.Config{
+	var adminServerTLS, adminClientTLS *tls.Config
+	if cfg.AdminAPI.TLS != nil {
+		adminServerTLS, err = cfg.AdminAPI.TLS.BuildServerTLS()
+		if err != nil {
+			return fmt.Errorf("admin api: build server tls: %w", err)
+		}
+		adminClientTLS, err = cfg.AdminAPI.TLS.BuildClientTLS()
+		if err != nil {
+			return fmt.Errorf("admin api: build client tls: %w", err)
+		}
+	}
+
+	adminAPIConfig := adminapi.Config{
 		HTTPAddr:       cfg.AdminAPI.HTTPAddr,
 		SharedSecret:   cfg.AdminAPI.SharedSecret,
 		TrustedProxies: cfg.AdminAPI.TrustedProxies,
-	}, poolFn, prov, buildAdminGate(cfg, coord), func() {
+		TLSConfig:      adminServerTLS,
+	}
+	if cfg.AdminAPI.TLS != nil {
+		adminAPIConfig.TLSCertFile = cfg.AdminAPI.TLS.CertFile
+		adminAPIConfig.TLSKeyFile = cfg.AdminAPI.TLS.KeyFile
+	}
+	admin := adminapi.New(adminAPIConfig, poolFn, prov, buildAdminGate(cfg, coord, adminClientTLS), func() {
 		log.Warn("admin drain triggered; cancelling root context")
 		cancel()
 	}, log)
@@ -502,12 +521,14 @@ func (g *coordAdminGate) Forward(w http.ResponseWriter, r *http.Request) {
 // buildAdminGate picks the LeaderGate that matches the cluster mode.
 // Standalone deployments always serve admin locally; multi-replica
 // deployments either serve locally (when leader) or proxy to the
-// leader.
-func buildAdminGate(cfg *config.Config, coord cluster.Coordinator) adminapi.LeaderGate {
+// leader. When admin TLS is configured, the Forwarder dials the leader
+// over https with the same TLSConfig (so a private-CA mTLS bundle
+// applies on both ends).
+func buildAdminGate(cfg *config.Config, coord cluster.Coordinator, tlsClient *tls.Config) adminapi.LeaderGate {
 	if cfg.Cluster.Mode == "standalone" {
 		return adminapi.AlwaysLeader{}
 	}
-	return &coordAdminGate{coord: coord, fwd: cluster.NewForwarder(coord)}
+	return &coordAdminGate{coord: coord, fwd: cluster.NewForwarder(coord, tlsClient)}
 }
 
 // buildNodeSelector translates config into a Selector. Pass the

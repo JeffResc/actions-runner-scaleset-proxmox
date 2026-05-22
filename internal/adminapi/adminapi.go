@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +48,20 @@ type Config struct {
 	//
 	// Empty list = trust nothing = always use the immediate peer's IP.
 	TrustedProxies []string
+
+	// TLSConfig, when non-nil, switches the admin server from
+	// ListenAndServe to ListenAndServeTLS so the shared bearer secret
+	// is transported encrypted between standbys (Forwarder) and the
+	// leader. A private CA pinned via ClientCAs + RequireAndVerifyClientCert
+	// gives mutual authentication.
+	TLSConfig *tls.Config
+
+	// TLSCertFile / TLSKeyFile are the on-disk paths
+	// ListenAndServeTLS reads from. They mirror the (cert, key) pair
+	// embedded in TLSConfig — ListenAndServeTLS insists on file paths
+	// rather than parsed certs. Required when TLSConfig is set.
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // LeaderGate decouples the admin API from internal/cluster. The admin
@@ -227,11 +242,18 @@ func (s *Server) Serve(ctx context.Context) error {
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		TLSConfig:         s.cfg.TLSConfig,
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		s.log.Info("admin api listening", "addr", s.cfg.HTTPAddr)
-		err := srv.ListenAndServe()
+		var err error
+		if s.cfg.TLSConfig != nil {
+			s.log.Info("admin api listening (tls)", "addr", s.cfg.HTTPAddr)
+			err = srv.ListenAndServeTLS(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
+		} else {
+			s.log.Info("admin api listening", "addr", s.cfg.HTTPAddr)
+			err = srv.ListenAndServe()
+		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return

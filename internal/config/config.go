@@ -10,6 +10,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -273,6 +275,38 @@ type AdminAPIConfig struct {
 	// pod. Operators terminating TLS via an in-cluster proxy should
 	// add that proxy's CIDR explicitly.
 	TrustedProxies []string `yaml:"trusted_proxies"`
+
+	// TLS turns on https for the admin HTTP server and the standby
+	// Forwarder dial. Nil = plain HTTP (back-compat, only safe on a
+	// cluster-internal ClusterIP/NodePort). Set CAFile to enable mTLS
+	// — standbys then present a client cert and the leader verifies
+	// it; without CAFile the connection is one-way TLS.
+	TLS *TLSConfig `yaml:"tls"`
+}
+
+// TLSConfig is a reusable PEM-on-disk TLS bundle. Both server and
+// client sides of an inter-replica transport reuse it: the server
+// presents (CertFile, KeyFile) and (when CAFile is set) verifies
+// presented client certs against it; the client presents the same
+// (CertFile, KeyFile) as its client cert.
+type TLSConfig struct {
+	// CertFile is the PEM-encoded server (and client, for mTLS) cert
+	// chain. Required when TLSConfig is non-nil.
+	CertFile string `yaml:"cert_file" validate:"required"`
+
+	// KeyFile is the PEM-encoded private key matching CertFile.
+	// Required when TLSConfig is non-nil.
+	KeyFile string `yaml:"key_file" validate:"required"`
+
+	// CAFile is the PEM-encoded CA bundle used to verify the peer's
+	// cert. Empty = one-way TLS (no client-cert verification on
+	// either side). Set on both replicas for full mTLS.
+	CAFile string `yaml:"ca_file,omitempty"`
+
+	// InsecureSkipVerify disables peer-cert verification. Intended for
+	// lab use; refuse to set in production unless paired with a
+	// well-understood lab environment.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify,omitempty"`
 }
 
 // ClusterConfig selects the leader-election backend. In "standalone"
@@ -658,6 +692,96 @@ func (c *Config) Validate() error {
 	for _, cidr := range c.AdminAPI.TrustedProxies {
 		if _, err := netip.ParsePrefix(cidr); err != nil {
 			return fmt.Errorf("admin_api.trusted_proxies: invalid CIDR %q: %w", cidr, err)
+		}
+	}
+	if c.AdminAPI.TLS != nil {
+		if err := c.AdminAPI.TLS.validate("admin_api.tls"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BuildServerTLS returns a *tls.Config suitable for an
+// http.Server.TLSConfig. When CAFile is set, ClientAuth is set to
+// RequireAndVerifyClientCert so mTLS is enforced — pair with a
+// matching client-side cert on every peer.
+func (t *TLSConfig) BuildServerTLS() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load tls keypair %q/%q: %w", t.CertFile, t.KeyFile, err)
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if t.CAFile != "" {
+		pool, err := loadCAPool(t.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return cfg, nil
+}
+
+// BuildClientTLS returns a *tls.Config suitable for an
+// http.Transport.TLSClientConfig. CAFile pins the server cert against
+// a private CA when set; otherwise the system roots are used (subject
+// to InsecureSkipVerify).
+func (t *TLSConfig) BuildClientTLS() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load tls keypair %q/%q: %w", t.CertFile, t.KeyFile, err)
+	}
+	cfg := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: t.InsecureSkipVerify, //nolint:gosec // user-opt-in for lab/test
+	}
+	if t.CAFile != "" {
+		pool, err := loadCAPool(t.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = pool
+	}
+	return cfg, nil
+}
+
+func loadCAPool(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path) //nolint:gosec // path comes from a trusted config file
+	if err != nil {
+		return nil, fmt.Errorf("read ca file %q: %w", path, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("ca file %q contained no usable PEM blocks", path)
+	}
+	return pool, nil
+}
+
+// validate checks that referenced files exist. Loading and parsing the
+// PEM content happens lazily in BuildServerTLS / BuildClientTLS so a
+// missing cert at config-load time is a hard failure, but a bad PEM
+// surfaces with file context when the server actually starts.
+func (t *TLSConfig) validate(prefix string) error {
+	if t.CertFile == "" {
+		return fmt.Errorf("%s.cert_file is required when tls is configured", prefix)
+	}
+	if t.KeyFile == "" {
+		return fmt.Errorf("%s.key_file is required when tls is configured", prefix)
+	}
+	if _, err := os.Stat(t.CertFile); err != nil {
+		return fmt.Errorf("%s.cert_file %q: %w", prefix, t.CertFile, err)
+	}
+	if _, err := os.Stat(t.KeyFile); err != nil {
+		return fmt.Errorf("%s.key_file %q: %w", prefix, t.KeyFile, err)
+	}
+	if t.CAFile != "" {
+		if _, err := os.Stat(t.CAFile); err != nil {
+			return fmt.Errorf("%s.ca_file %q: %w", prefix, t.CAFile, err)
 		}
 	}
 	return nil

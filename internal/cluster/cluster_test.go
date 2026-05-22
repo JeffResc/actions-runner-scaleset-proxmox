@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -515,7 +516,7 @@ func TestForwarder_RoutesToLeader(t *testing.T) {
 	defer upstream.Close()
 
 	endpoint := strings.TrimPrefix(upstream.URL, "http://")
-	fwd := NewForwarder(&fakeCoord{endpoint: endpoint})
+	fwd := NewForwarder(&fakeCoord{endpoint: endpoint}, nil)
 
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
@@ -551,7 +552,7 @@ func TestForwarder_RoutesToLeader(t *testing.T) {
 func TestForwarder_NoLeaderReturns503(t *testing.T) {
 	t.Parallel()
 
-	fwd := NewForwarder(&fakeCoord{endpoint: ""})
+	fwd := NewForwarder(&fakeCoord{endpoint: ""}, nil)
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
@@ -567,7 +568,7 @@ func TestForwarder_LeaderUnreachableReturns502(t *testing.T) {
 	t.Parallel()
 
 	// Point at a port nobody listens on so the upstream dial fails.
-	fwd := NewForwarder(&fakeCoord{endpoint: "127.0.0.1:1"})
+	fwd := NewForwarder(&fakeCoord{endpoint: "127.0.0.1:1"}, nil)
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
@@ -581,7 +582,7 @@ func TestForwarder_LeaderUnreachableReturns502(t *testing.T) {
 func TestForwarder_LookupErrorTreatedAsNoLeader(t *testing.T) {
 	t.Parallel()
 
-	fwd := NewForwarder(&fakeCoord{err: errors.New("lookup failed")})
+	fwd := NewForwarder(&fakeCoord{err: errors.New("lookup failed")}, nil)
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
@@ -589,4 +590,60 @@ func TestForwarder_LookupErrorTreatedAsNoLeader(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}
+
+// TestForwarder_TLSDialsHTTPS: with a non-nil tlsClient, the Forwarder
+// must dial the leader over https — proving the bearer-token-bearing
+// admin request travels encrypted between standbys and leader.
+func TestForwarder_TLSDialsHTTPS(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// httptest.NewTLSServer-served handlers only run if TLS
+		// completed; that's the assertion.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	endpoint := strings.TrimPrefix(upstream.URL, "https://")
+	// Use the test server's own TLS config; it pins the self-signed
+	// cert so the Forwarder can dial successfully.
+	clientTLS := upstream.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+
+	fwd := NewForwarder(&fakeCoord{endpoint: endpoint}, clientTLS)
+	srv := httptest.NewServer(fwd)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/admin/state")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "Forwarder must successfully dial the https upstream")
+	require.Equal(t, "ok", string(body))
+}
+
+// TestForwarder_TLSRefusesPlainUpstream: a TLS Forwarder talking to a
+// plain-HTTP upstream must fail at the transport layer rather than
+// silently downgrade. The plain-http upstream's response would never be
+// seen by a TLS client, so the Forwarder returns 502 via errorHandler.
+func TestForwarder_TLSRefusesPlainUpstream(t *testing.T) {
+	t.Parallel()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	endpoint := strings.TrimPrefix(upstream.URL, "http://")
+
+	clientTLS := &tls.Config{MinVersion: tls.VersionTLS12} //nolint:gosec // test only
+	fwd := NewForwarder(&fakeCoord{endpoint: endpoint}, clientTLS)
+	srv := httptest.NewServer(fwd)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/admin/state")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode,
+		"TLS Forwarder must NOT downgrade to plain http")
 }
