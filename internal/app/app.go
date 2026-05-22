@@ -311,8 +311,9 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	admin := adminapi.New(adminapi.Config{
-		HTTPAddr:     cfg.AdminAPI.HTTPAddr,
-		SharedSecret: cfg.AdminAPI.SharedSecret,
+		HTTPAddr:       cfg.AdminAPI.HTTPAddr,
+		SharedSecret:   cfg.AdminAPI.SharedSecret,
+		TrustedProxies: cfg.AdminAPI.TrustedProxies,
 	}, poolFn, prov, buildAdminGate(cfg, coord), func() {
 		log.Warn("admin drain triggered; cancelling root context")
 		cancel()

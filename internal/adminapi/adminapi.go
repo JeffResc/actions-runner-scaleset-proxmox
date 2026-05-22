@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,16 @@ import (
 type Config struct {
 	HTTPAddr     string
 	SharedSecret string
+
+	// TrustedProxies is the list of CIDR ranges from which the server
+	// will honor X-Forwarded-For / X-Real-IP headers when deriving the
+	// source IP for per-IP auth-failure rate limiting. Requests whose
+	// immediate TCP peer is not in this list have those headers
+	// ignored; the peer's IP is used instead, so a hostile client
+	// cannot spoof its source IP via a header.
+	//
+	// Empty list = trust nothing = always use the immediate peer's IP.
+	TrustedProxies []string
 }
 
 // LeaderGate decouples the admin API from internal/cluster. The admin
@@ -73,6 +84,11 @@ type Server struct {
 	// A successful auth is not metered — operators with the correct
 	// secret never hit it.
 	authFailLimiter *perIPLimiter
+
+	// trustedProxies are the parsed CIDRs from cfg.TrustedProxies.
+	// Populated in New so the realIP middleware can do O(N) prefix
+	// checks per request without re-parsing.
+	trustedProxies []netip.Prefix
 }
 
 // authFail* are the per-IP throttle parameters applied to bad-bearer
@@ -140,9 +156,20 @@ func New(cfg Config, poolFn PoolAccessor, prov provisioner.Provisioner, gate Lea
 	if gate == nil {
 		gate = AlwaysLeader{}
 	}
+	// Pre-parse the trusted-proxy CIDRs once at startup; the config
+	// validator has already rejected malformed entries, but defensively
+	// skip any that fail to parse here so a broken entry can't
+	// short-circuit the middleware.
+	prefixes := make([]netip.Prefix, 0, len(cfg.TrustedProxies))
+	for _, cidr := range cfg.TrustedProxies {
+		if p, err := netip.ParsePrefix(cidr); err == nil {
+			prefixes = append(prefixes, p)
+		}
+	}
 	return &Server{
 		cfg: cfg, pool: poolFn, prov: prov, gate: gate, drain: drain, log: log,
 		authFailLimiter: newPerIPLimiter(rate.Limit(authFailRPS), authFailBurst, authFailIdle),
+		trustedProxies:  prefixes,
 	}
 }
 
@@ -172,15 +199,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 
 	r := chi.NewRouter()
-	// middleware.RealIP trusts X-Forwarded-For / X-Real-IP unconditionally
-	// to derive r.RemoteAddr — which the per-IP auth-failure limiter
-	// downstream then keys on. SAFE today because the admin port is
-	// expected to be a cluster-internal ClusterIP/NodePort, where these
-	// headers only arrive via an in-cluster reverse-proxy we own (the
-	// standby's cluster.Forwarder). If you ever expose this port to
-	// arbitrary clients, replace this with a trusted-proxy allowlist
-	// (chi has middleware.RealIP variants for that).
-	r.Use(middleware.RealIP)
+	// realIP() honors X-Forwarded-For / X-Real-IP / True-Client-IP only
+	// when the immediate TCP peer matches one of the configured
+	// TrustedProxies CIDRs. Otherwise the immediate peer's IP is used
+	// — which prevents a hostile client from spoofing its source IP via
+	// a header to bypass the per-IP auth-failure rate limiter
+	// downstream. cluster.Forwarder also strips these headers before
+	// proxying, so even a compromised standby cannot inject them.
+	r.Use(s.realIP)
 	r.Use(s.accessLog)
 	r.Use(s.maxBody(64 * 1024)) // 64 KiB cap on any admin request body
 	// Forward-to-leader runs BEFORE bearer-token auth: when a standby
@@ -228,6 +254,64 @@ func (s *Server) Serve(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// realIP rewrites r.RemoteAddr from X-Forwarded-For / X-Real-IP /
+// True-Client-IP only when the immediate TCP peer's IP is within one
+// of the configured TrustedProxies CIDRs. From other peers the
+// inbound headers are ignored — preserving r.RemoteAddr as the real
+// connection peer so per-IP rate limiters key on something a hostile
+// client can't fake.
+//
+// The two-step "check peer, then maybe rewrite" is intentional: chi's
+// middleware.RealIP rewrites unconditionally, which is the bug
+// motivating this variant.
+func (s *Server) realIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.peerIsTrustedProxy(r.RemoteAddr) {
+			if forwarded := headerFirstIP(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+				r.RemoteAddr = forwarded
+			} else if real := r.Header.Get("X-Real-IP"); real != "" {
+				r.RemoteAddr = real
+			} else if tc := r.Header.Get("True-Client-IP"); tc != "" {
+				r.RemoteAddr = tc
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// peerIsTrustedProxy reports whether remoteAddr's host falls within
+// any configured TrustedProxies CIDR. Falls back to false on parse
+// failure — the safe default when in doubt.
+func (s *Server) peerIsTrustedProxy(remoteAddr string) bool {
+	if len(s.trustedProxies) == 0 {
+		return false
+	}
+	host := remoteIP(remoteAddr)
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	for _, p := range s.trustedProxies {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// headerFirstIP returns the first comma-separated IP from an XFF-style
+// header, trimmed of whitespace, or "" when empty. RFC 7239 says the
+// first entry is the original client.
+func headerFirstIP(hv string) string {
+	if hv == "" {
+		return ""
+	}
+	if comma := strings.IndexByte(hv, ','); comma >= 0 {
+		hv = hv[:comma]
+	}
+	return strings.TrimSpace(hv)
 }
 
 // accessLog logs every admin request with method, path, remote addr,
