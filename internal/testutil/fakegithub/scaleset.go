@@ -220,11 +220,15 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.session != nil && !s.session.closed.Load() {
-		// Tests should not normally hit this; surface clearly so the
-		// failure mode is obvious rather than silently swapping
-		// sessions out from under the listener.
-		http.Error(w, "session already open; close it first", http.StatusConflict)
-		return
+		// Cluster-mode tests can leave a stale session behind when a
+		// leader exits without explicitly closing — real GitHub
+		// expires the old session after a few minutes and the new
+		// leader simply opens a fresh one. Mirror that by retiring
+		// the prior session here instead of returning 409, which
+		// would otherwise wedge the new leader's handshake.
+		s.session.closed.Store(true)
+		close(s.session.pending)
+		s.session = nil
 	}
 	sid := uuid.New()
 	s.session = &sessionState{
