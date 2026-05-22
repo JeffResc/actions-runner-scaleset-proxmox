@@ -502,10 +502,12 @@ func (f *fakeCoord) LeaderEndpoint(_ context.Context) (string, error) {
 func TestForwarder_RoutesToLeader(t *testing.T) {
 	t.Parallel()
 
-	var gotXFF string
+	var gotXFF, gotXRealIP, gotTrueClient string
 	var gotPath string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotXFF = r.Header.Get("X-Forwarded-For")
+		gotXRealIP = r.Header.Get("X-Real-IP")
+		gotTrueClient = r.Header.Get("True-Client-IP")
 		gotPath = r.URL.Path
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("hello from leader"))
@@ -520,7 +522,11 @@ func TestForwarder_RoutesToLeader(t *testing.T) {
 
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/admin/state", strings.NewReader(`{"q":1}`))
 	require.NoError(t, err)
-	req.Header.Set("X-Forwarded-For", "203.0.113.10") // simulate Ingress-set header
+	// Simulate a hostile client attempting to spoof the source IP via
+	// each of the three commonly-trusted forwarded-for header variants.
+	req.Header.Set("X-Forwarded-For", "203.0.113.10")
+	req.Header.Set("X-Real-IP", "203.0.113.11")
+	req.Header.Set("True-Client-IP", "203.0.113.12")
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -529,10 +535,17 @@ func TestForwarder_RoutesToLeader(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "hello from leader", string(body))
 	require.Equal(t, "/admin/state", gotPath)
-	// httputil.ReverseProxy appends the direct peer; we should see the
-	// original X-Forwarded-For preserved at the front.
-	require.True(t, strings.HasPrefix(gotXFF, "203.0.113.10"),
-		"X-Forwarded-For should preserve the original client IP, got %q", gotXFF)
+
+	// Forwarder must strip client-supplied source-IP headers before
+	// delegating. httputil.ReverseProxy then sets a fresh
+	// X-Forwarded-For containing only the standby's connection peer
+	// (loopback in this test). A hostile client cannot inject
+	// 203.0.113.* through to the leader.
+	require.NotContains(t, gotXFF, "203.0.113.10",
+		"X-Forwarded-For must not contain the spoofed client value, got %q", gotXFF)
+	require.Empty(t, gotXRealIP, "X-Real-IP must be stripped")
+	require.Empty(t, gotTrueClient, "True-Client-IP must be stripped")
+	require.NotEmpty(t, gotXFF, "ReverseProxy should still set XFF to the standby's peer")
 }
 
 func TestForwarder_NoLeaderReturns503(t *testing.T) {

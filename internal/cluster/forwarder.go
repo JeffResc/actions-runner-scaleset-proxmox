@@ -9,10 +9,12 @@ import (
 
 // Forwarder is an http.Handler that reverse-proxies inbound requests to
 // the current leader's endpoint, looked up dynamically via a
-// [Coordinator]. The standard library's [httputil.ReverseProxy] already
-// appends RemoteAddr to X-Forwarded-For; this wrapper leaves all
-// upstream proxy headers intact so the leader can recover the original
-// client IP for logging or per-IP rate-limiting.
+// [Coordinator]. Before delegating, it strips any inbound
+// X-Forwarded-For / X-Real-IP / True-Client-IP headers so an attacker
+// hitting a standby cannot spoof the source IP the leader sees — the
+// stdlib [httputil.ReverseProxy] then sets a fresh X-Forwarded-For
+// containing only the standby's connection peer (a trusted in-cluster
+// proxy from the leader's perspective).
 //
 // When the Coordinator's [Coordinator.LeaderEndpoint] returns the empty
 // string (no leader observed yet), the Forwarder writes 503 Service
@@ -40,6 +42,15 @@ func NewForwarder(coord Coordinator) *Forwarder {
 // request-context key to surface the no-leader case to errorHandler so
 // the response code is distinguishable from a real upstream failure.
 func (f *Forwarder) director(r *http.Request) {
+	// Drop any client-supplied source-IP headers BEFORE delegating to
+	// ReverseProxy. ReverseProxy.ServeHTTP appends r.RemoteAddr to
+	// X-Forwarded-For; with the inbound values removed, the leader sees
+	// only the standby's connection peer and downstream rate-limiters
+	// can't be tricked into keying on a spoofed IP.
+	r.Header.Del("X-Forwarded-For")
+	r.Header.Del("X-Real-IP")
+	r.Header.Del("True-Client-IP")
+
 	endpoint, err := f.coord.LeaderEndpoint(r.Context())
 	if err != nil || endpoint == "" {
 		// Mark the request so errorHandler can emit 503.
@@ -53,8 +64,6 @@ func (f *Forwarder) director(r *http.Request) {
 	r.URL.Host = endpoint
 	r.Host = endpoint
 	r.RequestURI = ""
-	// httputil.ReverseProxy.ServeHTTP appends r.RemoteAddr to
-	// X-Forwarded-For for us; nothing else to do.
 }
 
 type noLeaderKey struct{}

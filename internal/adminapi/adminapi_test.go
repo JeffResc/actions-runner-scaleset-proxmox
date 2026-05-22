@@ -3,6 +3,7 @@ package adminapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -222,6 +223,7 @@ func TestState_ReturnsPoolStats(t *testing.T) {
 // uses in production.
 func chiHandler(s *Server) http.Handler {
 	r := chi.NewRouter()
+	r.Use(s.realIP)
 	r.Use(s.leaderOrForward)
 	r.Use(s.requireBearerToken)
 	r.Get("/admin/state", s.handleState)
@@ -478,4 +480,117 @@ func TestServe_NoAddrIsNoOp(t *testing.T) {
 	defer cancel()
 	err := s.Serve(ctx)
 	require.NoError(t, err)
+}
+
+// newTestServerTrustedProxies is like newTestServer but populates the
+// TrustedProxies CIDR list, so tests can exercise realIP's
+// honors-when-trusted / ignores-when-untrusted behavior.
+func newTestServerTrustedProxies(t *testing.T, secret string, trusted []string) (*Server, *fakePool) {
+	t.Helper()
+	fp := &fakePool{stats: pool.Stats{Hot: 3, Warm: 2}}
+	s := New(
+		Config{HTTPAddr: "ignored", SharedSecret: secret, TrustedProxies: trusted},
+		func() pool.Manager { return fp },
+		nil,
+		AlwaysLeader{},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	return s, fp
+}
+
+// TestRealIP_IgnoresHeadersFromUntrustedPeer: the whole point of the
+// realIP variant — a hostile client connecting from outside the trusted
+// CIDRs cannot inject X-Forwarded-For to swap r.RemoteAddr.
+func TestRealIP_IgnoresHeadersFromUntrustedPeer(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestServerTrustedProxies(t, "topsecret", []string{"10.0.0.0/8"})
+
+	var seenRemote string
+	h := s.realIP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenRemote = r.RemoteAddr
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r.RemoteAddr = "203.0.113.50:5555" // untrusted peer
+	r.Header.Set("X-Forwarded-For", "1.2.3.4")
+	r.Header.Set("X-Real-IP", "5.6.7.8")
+	r.Header.Set("True-Client-IP", "9.10.11.12")
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	require.Equal(t, "203.0.113.50:5555", seenRemote,
+		"untrusted peer headers must be ignored; r.RemoteAddr must stay as the connection peer")
+}
+
+// TestRealIP_HonorsHeadersFromTrustedPeer: when an in-cluster
+// reverse-proxy (loopback in tests) hits the leader, X-Forwarded-For
+// SHOULD be honored so per-IP rate limiting reflects the real client.
+func TestRealIP_HonorsHeadersFromTrustedPeer(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestServerTrustedProxies(t, "topsecret", []string{"127.0.0.0/8"})
+
+	var seenRemote string
+	h := s.realIP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenRemote = r.RemoteAddr
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r.RemoteAddr = "127.0.0.1:5555" // trusted loopback
+	r.Header.Set("X-Forwarded-For", "203.0.113.10")
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	require.Equal(t, "203.0.113.10", seenRemote,
+		"trusted peer's X-Forwarded-For must be honored")
+}
+
+// TestRealIP_XFFPrecedence: when several forwarded-for headers are
+// present from a trusted peer, X-Forwarded-For wins (RFC 7239
+// chronology) over X-Real-IP and True-Client-IP.
+func TestRealIP_XFFPrecedence(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestServerTrustedProxies(t, "topsecret", []string{"127.0.0.0/8"})
+
+	var seenRemote string
+	h := s.realIP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenRemote = r.RemoteAddr
+	}))
+
+	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r.RemoteAddr = "127.0.0.1:5555"
+	r.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.1")
+	r.Header.Set("X-Real-IP", "203.0.113.11")
+	r.Header.Set("True-Client-IP", "203.0.113.12")
+	h.ServeHTTP(httptest.NewRecorder(), r)
+
+	require.Equal(t, "203.0.113.10", seenRemote,
+		"first XFF entry should win over X-Real-IP / True-Client-IP")
+}
+
+// TestAuth_RateLimit_CannotBeSpoofedViaXFF: end-to-end guard against
+// the bug — a hostile client sending bad bearer attempts must not
+// reset the limiter by rotating X-Forwarded-For per request.
+func TestAuth_RateLimit_CannotBeSpoofedViaXFF(t *testing.T) {
+	t.Parallel()
+	// trustedProxies empty: NO peer is trusted, so XFF is always ignored.
+	s, _ := newTestServerTrustedProxies(t, "topsecret", nil)
+	h := chiHandler(s)
+
+	var seen401, seen429 int
+	for i := range 50 {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+		r.Header.Set("Authorization", "Bearer wrong")
+		r.RemoteAddr = "203.0.113.99:5555" // single attacker IP
+		// Try to spoof a different "origin" per request.
+		r.Header.Set("X-Forwarded-For", fmt.Sprintf("10.0.0.%d", i))
+		h.ServeHTTP(w, r)
+		switch w.Code {
+		case http.StatusUnauthorized:
+			seen401++
+		case http.StatusTooManyRequests:
+			seen429++
+		}
+	}
+	require.Positive(t, seen429,
+		"spoofed XFF must NOT defeat the per-IP rate limiter; got %d 401 / %d 429", seen401, seen429)
 }

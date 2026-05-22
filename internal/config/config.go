@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -258,6 +259,20 @@ type AdminAPIConfig struct {
 	HTTPAddr        string `yaml:"http_addr"`
 	SharedSecretEnv string `yaml:"shared_secret_env"`
 	SharedSecret    string `yaml:"-"`
+
+	// TrustedProxies is the list of CIDR ranges from which the admin
+	// server will honor X-Forwarded-For / X-Real-IP headers when
+	// deriving the source IP for per-IP rate limiting. Requests from
+	// peers outside this list have their forwarded-for headers ignored
+	// — the immediate TCP peer's IP is used instead, so an attacker
+	// cannot spoof the source IP via a header.
+	//
+	// Defaults to loopback only ("127.0.0.0/8", "::1/128") at
+	// ApplyDefaults time, which is correct for the standalone case and
+	// for raft deployments where the Forwarder is always on the same
+	// pod. Operators terminating TLS via an in-cluster proxy should
+	// add that proxy's CIDR explicitly.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 // ClusterConfig selects the leader-election backend. In "standalone"
@@ -426,6 +441,13 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Cluster.Raft.CommitTimeout == "" {
 		c.Cluster.Raft.CommitTimeout = "50ms"
+	}
+	// Admin API: default trusted-proxy list to loopback. Operators
+	// terminating TLS via an in-cluster proxy can override; raft
+	// deployments where the Forwarder lives on the same pod are
+	// covered by the default.
+	if c.AdminAPI.TrustedProxies == nil {
+		c.AdminAPI.TrustedProxies = []string{"127.0.0.0/8", "::1/128"}
 	}
 }
 
@@ -632,6 +654,11 @@ func (c *Config) Validate() error {
 	u, err := url.Parse(c.Proxmox.Endpoint)
 	if err != nil || u.Scheme != "https" {
 		return errors.New("proxmox.endpoint must use https:// (the API token is sent on every request and would leak in cleartext over http)")
+	}
+	for _, cidr := range c.AdminAPI.TrustedProxies {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			return fmt.Errorf("admin_api.trusted_proxies: invalid CIDR %q: %w", cidr, err)
+		}
 	}
 	return nil
 }
