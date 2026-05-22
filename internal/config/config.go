@@ -293,6 +293,14 @@ type ClusterRaftConfig struct {
 	// address.
 	AdvertiseAddr string `yaml:"advertise_addr"`
 
+	// DataDir is the on-disk directory where raft persists its log,
+	// stable, and snapshot stores. Raft's election-safety invariants
+	// (currentTerm, votedFor) require these to survive restart: with
+	// in-memory stores, a partition + restart in the wrong window
+	// could let two replicas each believe they are leader for the
+	// same term. Required when cluster.mode=raft.
+	DataDir string `yaml:"data_dir"`
+
 	// Peers is the full static peer list, including this replica.
 	// All replicas must agree on this list at startup.
 	Peers []ClusterRaftPeer `yaml:"peers"`
@@ -300,8 +308,8 @@ type ClusterRaftConfig struct {
 	// Bootstrap, when true, makes this replica call
 	// raft.BootstrapCluster on first start. Should be true on exactly
 	// one replica during initial cluster setup. Safe to leave true on
-	// subsequent restarts — raft tolerates concurrent BootstrapCluster
-	// against an already-formed cluster.
+	// subsequent restarts — with persistent stores (data_dir set) raft
+	// detects existing state and skips re-bootstrap.
 	Bootstrap bool `yaml:"bootstrap"`
 
 	HeartbeatTimeout string `yaml:"heartbeat_timeout"` // default 1s
@@ -596,6 +604,9 @@ func (c *Config) resolveCluster() error {
 	}
 	if !selfFound {
 		return fmt.Errorf("cluster.raft.peers does not include this replica's node_id %q", r.NodeID)
+	}
+	if r.DataDir == "" {
+		return errors.New("cluster.raft.data_dir is required when cluster.mode=raft (raft consensus state must survive restart)")
 	}
 	return nil
 }

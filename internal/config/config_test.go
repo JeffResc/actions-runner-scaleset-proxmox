@@ -486,6 +486,7 @@ func TestCluster_RaftResolvesNodeIDFromHostname(t *testing.T) {
   mode: raft
   raft:
     bind_addr: "0.0.0.0:7000"
+    data_dir: "/var/lib/scaleset/raft"
     peers:
       - node_id: replica-a
         raft_addr: "10.0.0.1:7000"
@@ -498,7 +499,31 @@ func TestCluster_RaftResolvesNodeIDFromHostname(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "raft", cfg.Cluster.Mode)
 	require.Equal(t, "replica-a", cfg.Cluster.Raft.NodeID)
+	require.Equal(t, "/var/lib/scaleset/raft", cfg.Cluster.Raft.DataDir)
 	require.Len(t, cfg.Cluster.Raft.Peers, 2)
+}
+
+// Raft mode without data_dir refuses to start: persistent raft stores
+// are required for election safety. The check runs AFTER the topology
+// validations so missing-peer / wrong-self errors surface first.
+func TestCluster_RaftRequiresDataDir(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "x",
+		"TEST_PVE_TOKEN": "y",
+		"HOSTNAME":       "replica-a",
+	})
+	yaml := validPATYAML + `cluster:
+  mode: raft
+  raft:
+    bind_addr: "0.0.0.0:7000"
+    peers:
+      - node_id: replica-a
+        raft_addr: "10.0.0.1:7000"
+        http_addr: "10.0.0.1:8080"
+`
+	_, err := config.Parse([]byte(yaml))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "data_dir")
 }
 
 // Raft mode without bind_addr refuses to start.

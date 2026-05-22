@@ -7,12 +7,15 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
 // RaftConfig configures the embedded-raft coordinator.
@@ -40,6 +43,14 @@ type RaftConfig struct {
 	// (non-wildcard) address.
 	AdvertiseAddr string
 
+	// DataDir is the on-disk directory where raft persists its log,
+	// stable, and snapshot stores. Raft's election-safety invariants
+	// (currentTerm, votedFor) require these to survive restart so a
+	// node cannot vote twice in the same term. Required in production
+	// (TestTransport == nil). Tests may leave it empty to use
+	// in-memory stores.
+	DataDir string
+
 	// AdminPort is this replica's admin HTTP port. Combined with the
 	// peer's HTTPAddr at LeaderEndpoint time; 0 disables the local
 	// fast-path (LeaderEndpoint still resolves via the peer map).
@@ -59,10 +70,9 @@ type RaftConfig struct {
 	// that node call raft.BootstrapCluster on first start. Other
 	// nodes wait to be discovered by the bootstrapped leader. Should
 	// be true on exactly one replica during initial cluster setup;
-	// safe to leave true on subsequent restarts (the in-memory store
-	// always has zero existing state so the call is required, but
-	// raft tolerates concurrent BootstrapCluster against an
-	// already-formed cluster).
+	// safe to leave true on subsequent restarts — with persistent
+	// stores raft.HasExistingState returns true after the first start
+	// and BootstrapCluster is skipped.
 	Bootstrap bool
 
 	// Timing knobs. Zero falls back to hashicorp/raft's DefaultConfig
@@ -122,12 +132,60 @@ func (c *RaftConfig) validate() error {
 		if c.BindAddr == "" {
 			return fmt.Errorf("%w: BindAddr is required (or supply TestTransport)", ErrInvalidConfig)
 		}
-	} else {
-		if c.TestLocalAddr == "" {
-			return fmt.Errorf("%w: TestLocalAddr is required when TestTransport is set", ErrInvalidConfig)
+		if c.DataDir == "" {
+			return fmt.Errorf("%w: DataDir is required in production (raft consensus state must survive restart)", ErrInvalidConfig)
 		}
+	} else if c.TestLocalAddr == "" {
+		return fmt.Errorf("%w: TestLocalAddr is required when TestTransport is set", ErrInvalidConfig)
 	}
 	return nil
+}
+
+// newRaftStores builds the log, stable, and snapshot stores raft
+// needs. With persistent=false (test mode — TestTransport is set) the
+// stores are in-memory and election state vanishes on restart. With
+// persistent=true (production), raft's election-safety invariants
+// (currentTerm, votedFor) must survive restart so a node cannot vote
+// twice in the same term, even across a partition + crash window.
+//
+// The returned closer releases the BoltDB file handles; raft.NewRaft
+// does not own them, so the caller MUST invoke closer after
+// raft.Shutdown completes. The closer is a no-op for the in-memory
+// path.
+func newRaftStores(persistent bool, dataDir string, log *slog.Logger) (raft.LogStore, raft.StableStore, raft.SnapshotStore, func(), error) {
+	if !persistent {
+		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), func() {}, nil
+	}
+	snapDir := filepath.Join(dataDir, "snapshots")
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("cluster: create raft snapshot dir %s: %w", snapDir, err)
+	}
+	logStore, err := raftboltdb.NewBoltStore(filepath.Join(dataDir, "logs.bolt"))
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("cluster: open raft log store: %w", err)
+	}
+	stableStore, err := raftboltdb.NewBoltStore(filepath.Join(dataDir, "stable.bolt"))
+	if err != nil {
+		_ = logStore.Close()
+		return nil, nil, nil, nil, fmt.Errorf("cluster: open raft stable store: %w", err)
+	}
+	// retain=3 keeps the last three snapshots for operator recovery
+	// while keeping the disk footprint bounded.
+	snapStore, err := raft.NewFileSnapshotStore(snapDir, 3, slogWriter{log: log, level: slog.LevelDebug})
+	if err != nil {
+		_ = logStore.Close()
+		_ = stableStore.Close()
+		return nil, nil, nil, nil, fmt.Errorf("cluster: open raft snapshot store: %w", err)
+	}
+	closer := func() {
+		if err := logStore.Close(); err != nil {
+			log.Warn("cluster: close raft log store", "err", err)
+		}
+		if err := stableStore.Close(); err != nil {
+			log.Warn("cluster: close raft stable store", "err", err)
+		}
+	}
+	return logStore, stableStore, snapStore, closer, nil
 }
 
 // raftCoord is a Coordinator backed by hashicorp/raft. The FSM is a
@@ -141,17 +199,25 @@ type raftCoord struct {
 	tr     raft.Transport
 	leader atomic.Bool
 
+	// closeStores releases the persistent log/stable BoltDB handles
+	// after raft.Shutdown completes. raft.NewRaft does not take
+	// ownership of the stores, so we must close them ourselves —
+	// otherwise a same-process restart (e.g. tests, or a future
+	// in-place reload) would block on Bolt's exclusive file lock.
+	// Nil when the stores are in-memory.
+	closeStores func()
+
 	// peersByRaftAddr maps a raft address back to its HTTP address.
 	// Populated once at construction (peer list is static), so
 	// LeaderEndpoint is a pure in-memory lookup.
 	peersByRaftAddr map[raft.ServerAddress]string
 }
 
-// NewRaft constructs a hashicorp/raft-backed Coordinator. The raft
-// log/stable/snapshot stores are in-memory: a full-fleet restart
-// re-bootstraps the cluster (membership in cfg.Peers is enough to
-// recover), and per-process restarts rejoin via the existing
-// transport.
+// NewRaft constructs a hashicorp/raft-backed Coordinator. In
+// production (cfg.DataDir set) the raft log/stable/snapshot stores
+// persist to disk under cfg.DataDir — required for election safety
+// because currentTerm/votedFor must survive restart. In tests with
+// TestTransport set and DataDir empty, the stores are in-memory.
 func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -185,9 +251,10 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 		rcfg.LeaderLeaseTimeout = rcfg.HeartbeatTimeout
 	}
 
-	logs := raft.NewInmemStore()
-	stable := raft.NewInmemStore()
-	snaps := raft.NewInmemSnapshotStore()
+	logs, stable, snaps, closeStores, err := newRaftStores(cfg.TestTransport == nil, cfg.DataDir, log)
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		tr      raft.Transport
@@ -225,6 +292,7 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 				})
 			}
 			if err := raft.BootstrapCluster(rcfg, logs, stable, snaps, tr, raft.Configuration{Servers: servers}); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
+				closeStores()
 				return nil, fmt.Errorf("cluster: bootstrap: %w", err)
 			}
 		}
@@ -232,12 +300,14 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 
 	r, err := raft.NewRaft(rcfg, &noopFSM{}, logs, stable, snaps, tr)
 	if err != nil {
+		closeStores()
 		return nil, fmt.Errorf("cluster: new-raft: %w", err)
 	}
 
 	return &raftCoord{
 		cfg:             cfg,
 		cb:              cb,
+		closeStores:     closeStores,
 		log:             log,
 		r:               r,
 		tr:              tr,
@@ -259,6 +329,11 @@ func (k *raftCoord) Run(ctx context.Context) error {
 		case <-shutdownDone:
 		case <-time.After(5 * time.Second):
 			k.log.Warn("cluster: raft shutdown exceeded deadline; abandoning")
+		}
+		// Close BoltDB handles AFTER raft.Shutdown returns — raft
+		// keeps reading/writing the log/stable stores until then.
+		if k.closeStores != nil {
+			k.closeStores()
 		}
 	}()
 
