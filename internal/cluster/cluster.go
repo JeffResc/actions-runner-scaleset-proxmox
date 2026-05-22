@@ -296,15 +296,23 @@ func (k *kubeCoord) Run(ctx context.Context) error {
 					"lease", k.cfg.LeaseName,
 					"endpoint", leaderEndpoint)
 				// Publish our endpoint into the Lease annotation so
-				// standbys can forward to us. Best-effort — if the
-				// annotation patch fails the lease is still ours and
-				// the rest of the control plane should still run.
+				// standbys can forward to us. The leader-election
+				// library's renewal path calls Lock.Update with its
+				// cached lease object — if our patch lands between
+				// the library's Get and Update, the Update will
+				// overwrite the annotation back to empty. Re-publish
+				// on every RetryPeriod tick to repair that window;
+				// the patch is idempotent so a no-op patch costs one
+				// apiserver round trip and nothing else. Initial
+				// publish is best-effort — if it fails the lease is
+				// still ours and the rest of the control plane runs.
 				if leaderEndpoint != "" {
 					if err := publishLeaderEndpoint(leaderCtx, k.client, k.cfg.LeaseNamespace, k.cfg.LeaseName, k.cfg.EndpointAnnotation, leaderEndpoint); err != nil {
 						k.log.Warn("cluster: publish leader endpoint failed",
 							"err", err,
 							"endpoint", leaderEndpoint)
 					}
+					go k.republishLoop(leaderCtx, leaderEndpoint)
 				}
 				if k.cb.OnElected != nil {
 					k.cb.OnElected(leaderCtx)
@@ -340,6 +348,34 @@ func (k *kubeCoord) Run(ctx context.Context) error {
 	default:
 	}
 	return nil
+}
+
+// republishLoop re-patches the leader-endpoint annotation onto the
+// Lease on every RetryPeriod tick while leaderCtx is alive. Necessary
+// because the leader-election library's renewal Updates the Lease with
+// its own cached copy — any annotation patch that lands between the
+// library's Get and Update is overwritten back to empty. Continuously
+// re-patching guarantees standbys see the annotation within at most
+// one RetryPeriod after that race.
+//
+// The patch is idempotent; a steady-state tick is one PATCH that
+// changes nothing on the apiserver side. Errors are logged at Debug
+// to avoid noise — the worst case is a transient empty annotation
+// that heals on the next tick.
+func (k *kubeCoord) republishLoop(leaderCtx context.Context, endpoint string) {
+	tick := time.NewTicker(k.cfg.RetryPeriod)
+	defer tick.Stop()
+	for {
+		select {
+		case <-leaderCtx.Done():
+			return
+		case <-tick.C:
+			if err := publishLeaderEndpoint(leaderCtx, k.client, k.cfg.LeaseNamespace, k.cfg.LeaseName, k.cfg.EndpointAnnotation, endpoint); err != nil {
+				k.log.Debug("cluster: republish leader endpoint failed (will retry)",
+					"err", err, "endpoint", endpoint)
+			}
+		}
+	}
 }
 
 func (k *kubeCoord) IsLeader() bool { return k.leader.Load() }
