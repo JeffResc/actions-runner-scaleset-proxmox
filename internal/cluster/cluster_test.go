@@ -290,6 +290,56 @@ func TestRaft_LeaderEndpointEmptyBeforeElection(t *testing.T) {
 	require.Empty(t, ep, "should return empty (election in flight) rather than an error")
 }
 
+// TestRaft_LeadershipTransferFiresOnElectedOnNewLeader exercises the
+// switch from raft.LeaderCh (best-effort, hidden buffer-1 channel that
+// can drop transitions) to raft.RegisterObserver. After a deliberate
+// LeadershipTransfer, the new leader's OnElected must fire and the
+// old leader's OnDeposed must fire — no transition may be silently
+// dropped.
+func TestRaft_LeadershipTransferFiresOnElectedOnNewLeader(t *testing.T) {
+	t.Parallel()
+
+	rc := newRaftCluster(t, 3)
+
+	// Wait for an initial leader to emerge.
+	leaderIdx := -1
+	require.Eventually(t, func() bool {
+		for i, c := range rc.coords {
+			if c.IsLeader() {
+				leaderIdx = i
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 50*time.Millisecond, "no initial leader emerged")
+
+	// Pick a transfer target that is NOT the current leader, reset
+	// its elected flag so we can detect the next OnElected, and
+	// reset the current leader's deposed flag too.
+	targetIdx := (leaderIdx + 1) % 3
+	rc.elected[targetIdx].Store(false)
+	rc.deposed[leaderIdx].Store(false)
+
+	rcoord, ok := rc.coords[leaderIdx].(*raftCoord)
+	require.True(t, ok, "type assertion to *raftCoord failed")
+
+	fut := rcoord.r.LeadershipTransferToServer(
+		raft.ServerID(nodeID(targetIdx)),
+		rc.addrs[targetIdx],
+	)
+	require.NoError(t, fut.Error(), "LeadershipTransferToServer failed")
+
+	require.Eventually(t, rc.coords[targetIdx].IsLeader,
+		3*time.Second, 50*time.Millisecond, "transfer target never became leader")
+	require.Eventually(t, rc.elected[targetIdx].Load,
+		2*time.Second, 50*time.Millisecond, "OnElected never fired on transfer target")
+
+	require.Eventually(t, func() bool { return !rc.coords[leaderIdx].IsLeader() },
+		2*time.Second, 50*time.Millisecond, "old leader did not lose leadership flag")
+	require.Eventually(t, rc.deposed[leaderIdx].Load,
+		2*time.Second, 50*time.Millisecond, "OnDeposed never fired on the old leader")
+}
+
 func TestRaftConfig_ValidationRejectsBadInputs(t *testing.T) {
 	t.Parallel()
 
