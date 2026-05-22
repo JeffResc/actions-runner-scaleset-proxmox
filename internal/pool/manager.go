@@ -1030,6 +1030,17 @@ func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
 		v.StateSince = time.Now()
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Row was deleted while Clone was in flight — typically by
+			// admin ForceDestroy or a stuck-state sweep that didn't see
+			// the in-flight clone. The Proxmox VM is real; without an
+			// immediate destroy it lives until sweepProxmoxOrphans picks
+			// it up (OrphanGrace + reconcile tick). Destroy it now.
+			m.log.Info("clone: row deleted mid-clone, destroying orphan vm",
+				"vmid", vmid, "node", node)
+			m.destroyOrSyncFallback(vmid, node)
+			return
+		}
 		m.log.Warn("clone: update row state failed", "vmid", vmid, "err", err)
 		return
 	}
