@@ -68,6 +68,19 @@ type Server struct {
 	adminToken   string
 	session      *sessionState
 	jitMintCount int
+
+	// statistics is what the fake reports in every session-create,
+	// session-refresh, and GetMessage envelope. Zero-valued by default;
+	// tests use SetStatistics to drive the orchestrator's listener
+	// loop — TotalAssignedJobs is what HandleDesiredRunnerCount keys
+	// on, which is the only signal that triggers a Hot → Assigned
+	// transition end-to-end.
+	statistics fakeRunnerScaleSetStatistic
+
+	// nextMessageID is the per-server message-ID counter used by the
+	// PostJob* helpers. Each posted envelope claims a unique ID so the
+	// listener's lastMessageID tracking advances naturally.
+	nextMessageID int
 }
 
 // New starts the fake and registers cleanup on t.Cleanup.
@@ -214,6 +227,12 @@ func (s *Server) routes() http.Handler {
 	r.Post("/_apis/runtime/runnerscalesets/{id}/acquirejobs", s.handleAcquireJobs)
 	r.Post("/_apis/runtime/runnerscalesets/{id}/generatejitconfig", s.handleGenerateJIT)
 	r.Delete("/_apis/runtime/runners/{id}", s.handleRunnerDelete)
+	// scaleset.Client.RemoveRunner uses the distributed-task surface
+	// (a separate path from /_apis/runtime/runners). Real GitHub
+	// serves both; we mount the same handler so OnRunnerOrphaned ends
+	// up in s.deletions regardless of which client surface the
+	// orchestrator chose.
+	r.Delete("/_apis/distributedtask/pools/{pool}/agents/{id}", s.handleRunnerDelete)
 
 	// Custom message-queue path — the URL we return from session
 	// create. The path is opaque to the library; we choose it.

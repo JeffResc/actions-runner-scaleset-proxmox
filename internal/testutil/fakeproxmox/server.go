@@ -120,6 +120,26 @@ func (s *Server) SeedVM(node string, vmid int, name string, running bool, tags [
 // fake's state. Tests use it to assert on the orchestrator's effects.
 func (s *Server) Snapshot() []VMSnapshot { return s.store.snapshot() }
 
+// PowerOff flips a VM's Running flag to false, bypassing the qm stop
+// HTTP path. Used by e2e scenarios that want to model "the in-VM
+// runner finished and powered itself off" without faking a complete
+// task lifecycle on the API side. The orchestrator's power-state
+// poller then sees the stopped VM on its next tick and calls
+// MarkCompleted.
+//
+// Returns an error when the VMID is unknown so a typo in a test
+// surfaces immediately rather than silently no-op'ing.
+func (s *Server) PowerOff(vmid int) error {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		return fmt.Errorf("fakeproxmox: PowerOff: vmid %d not found", vmid)
+	}
+	v.Running = false
+	return nil
+}
+
 // routes builds the chi mux. We strip an optional /api2/json prefix in
 // middleware so both Endpoint = srv.URL and Endpoint = srv.URL +
 // "/api2/json" work — the former is what unit-style tests do, the

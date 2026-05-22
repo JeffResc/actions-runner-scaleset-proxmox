@@ -120,9 +120,9 @@ type sessionState struct {
 	closed atomic.Bool
 
 	// pending feeds the GetMessage handler. Each send unblocks one
-	// long-poll. Tests push synthesized messages via the public
-	// PostJob* helpers (added in a follow-up); P3 only needs the
-	// idle path.
+	// long-poll. Tests push synthesized messages via Server.PostJob*
+	// helpers; the long-poll idle path returns 202 when the channel
+	// stays empty.
 	pending chan json.RawMessage
 }
 
@@ -236,13 +236,14 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, _ *http.Request) {
 		owner:   "fakegithub",
 		pending: make(chan json.RawMessage, 16),
 	}
+	stats := s.statistics
 	writeJSON(w, http.StatusOK, fakeSession{
 		SessionID:               sid,
 		OwnerName:               "fakegithub",
 		RunnerScaleSet:          s.scaleSet,
 		MessageQueueURL:         fmt.Sprintf("%s/_messages/%s", s.URL, sid.String()),
 		MessageQueueAccessToken: s.adminToken,
-		Statistics:              &fakeRunnerScaleSetStatistic{},
+		Statistics:              &stats,
 	})
 }
 
@@ -266,13 +267,14 @@ func (s *Server) handleSessionRefresh(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "no open session", http.StatusGone)
 		return
 	}
+	stats := s.statistics
 	writeJSON(w, http.StatusOK, fakeSession{
 		SessionID:               s.session.id,
 		OwnerName:               s.session.owner,
 		RunnerScaleSet:          s.scaleSet,
 		MessageQueueURL:         fmt.Sprintf("%s/_messages/%s", s.URL, s.session.id.String()),
 		MessageQueueAccessToken: s.adminToken,
-		Statistics:              &fakeRunnerScaleSetStatistic{},
+		Statistics:              &stats,
 	})
 }
 
@@ -386,4 +388,111 @@ func (s *Server) JITMintCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.jitMintCount
+}
+
+// SetStatistics overrides the per-session statistics the fake returns.
+// Tests set TotalAssignedJobs > 0 before starting the harness so the
+// orchestrator's listener fires HandleDesiredRunnerCount on its initial
+// handshake — the only path that drives a clone+JIT-injection pass.
+//
+// Subsequent calls update what every GetMessage envelope and session
+// refresh sees. A test that sets TotalAssignedJobs back to 0 after a
+// job completes models GitHub's view of "no more queued jobs."
+func (s *Server) SetStatistics(stats Statistics) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statistics = fakeRunnerScaleSetStatistic(stats)
+}
+
+// Statistics is the test-facing shape SetStatistics accepts. Mirrors
+// scaleset.RunnerScaleSetStatistic field-for-field, kept separate so
+// the fake doesn't need to import the scaleset library just for the
+// type alias.
+type Statistics struct {
+	TotalAvailableJobs     int
+	TotalAcquiredJobs      int
+	TotalAssignedJobs      int
+	TotalRunningJobs       int
+	TotalRegisteredRunners int
+	TotalBusyRunners       int
+	TotalIdleRunners       int
+}
+
+// PostJobStarted enqueues a JobStarted message on the active session's
+// pending channel. The listener's handleMessage loop will pop it,
+// dispatch to scaler.HandleJobStarted, which calls pool.MarkRunning.
+//
+// Returns an error when no session is open (so test sequencing bugs
+// surface loudly instead of hanging on a wait-Eventually). The
+// non-blocking channel send also surfaces "pending channel full" — the
+// session buffer is 16, far more than any test scenario needs.
+func (s *Server) PostJobStarted(runnerName string, runnerID int) error {
+	return s.postMessage("JobStarted", map[string]any{
+		"messageType":     "JobStarted",
+		"runnerName":      runnerName,
+		"runnerId":        runnerID,
+		"runnerRequestId": int64(runnerID), // any positive int64; the orchestrator doesn't key on it
+	})
+}
+
+// PostJobCompleted enqueues a JobCompleted message. Dispatches via
+// scaler.HandleJobCompleted → pool.MarkCompleted → async destroy.
+// Mirrors PostJobStarted's contract.
+func (s *Server) PostJobCompleted(runnerName string, runnerID int) error {
+	return s.postMessage("JobCompleted", map[string]any{
+		"messageType":     "JobCompleted",
+		"runnerName":      runnerName,
+		"runnerId":        runnerID,
+		"runnerRequestId": int64(runnerID),
+		"result":          "succeeded",
+	})
+}
+
+// postMessage marshals one job message into the outer
+// runnerScaleSetMessageResponse envelope the listener expects and
+// pushes it onto the active session's pending channel.
+//
+// Wire format per github.com/actions/scaleset client.go:
+//
+//	{
+//	  "messageId":   <int>,
+//	  "messageType": "RunnerScaleSetJobMessages",
+//	  "body":        "<JSON-string-encoded array of inner messages>",
+//	  "statistics":  { ... }
+//	}
+func (s *Server) postMessage(label string, inner map[string]any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.session == nil || s.session.closed.Load() {
+		return fmt.Errorf("fakegithub: post %s: no session open", label)
+	}
+	bodyJSON, err := json.Marshal([]map[string]any{inner})
+	if err != nil {
+		// Marshal of a map[string]any with plain JSON-friendly values
+		// cannot fail under any realistic input; the wrap keeps the
+		// failure mode discoverable if a future caller violates that.
+		return fmt.Errorf("fakegithub: marshal %s body: %w", label, err)
+	}
+	s.nextMessageID++
+	stats := s.statistics
+	envelope, err := json.Marshal(struct {
+		MessageID   int                          `json:"messageId"`
+		MessageType string                       `json:"messageType"`
+		Body        string                       `json:"body"`
+		Statistics  *fakeRunnerScaleSetStatistic `json:"statistics"`
+	}{
+		MessageID:   s.nextMessageID,
+		MessageType: "RunnerScaleSetJobMessages",
+		Body:        string(bodyJSON),
+		Statistics:  &stats,
+	})
+	if err != nil {
+		return fmt.Errorf("fakegithub: marshal %s envelope: %w", label, err)
+	}
+	select {
+	case s.session.pending <- envelope:
+		return nil
+	default:
+		return fmt.Errorf("fakegithub: session pending channel full (cap=16) — drop %s", label)
+	}
 }

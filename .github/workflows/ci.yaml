@@ -47,8 +47,10 @@ jobs:
           go install golang.org/x/tools/cmd/deadcode@v0.30.0
           # -test treats test files as call sites, which is required
           # for internal/testutil/ packages whose only consumers are
-          # _test.go files.
-          out=$(deadcode -test ./...)
+          # _test.go files. -tags=e2e is required for testutil helpers
+          # whose only callers are the build-tagged e2e scenarios under
+          # test/e2e (e.g. fakegithub.PostJobStarted, fakeproxmox.PowerOff).
+          out=$(deadcode -test -tags=e2e ./...)
           if [ -n "$out" ]; then
             echo "deadcode found unreachable functions:"
             echo "$out"
