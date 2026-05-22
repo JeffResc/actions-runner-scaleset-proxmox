@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"sort"
 	"testing"
 	"time"
 
@@ -385,4 +386,221 @@ func TestE2E_ClusterTakeoverMidJob(t *testing.T) {
 		return false
 	}, 10*time.Second, 100*time.Millisecond,
 		"new leader did not deregister the JIT-minted runner on destroy")
+}
+
+// TestE2E_StandalonePowerOffCompletes covers the production
+// job-completion signal that the other lifecycle tests skip: the
+// in-VM gh-runner.service runs `ExecStopPost=systemctl poweroff` when
+// the runner exits, and the orchestrator's primary completion signal
+// is the power-state poller observing the stopped VM (the listener's
+// JobCompleted message is a fast-path notification on top, not the
+// authoritative trigger).
+//
+// We simulate that by driving the VM to Running normally, then calling
+// fakeproxmox.PowerOff(vmid) — bypassing the listener entirely. The
+// orchestrator's powerPollOnce loop should observe the stopped VM
+// within PowerPollInterval (100ms in the e2e config) and call
+// MarkCompleted, which queues the destroy.
+func TestE2E_StandalonePowerOffCompletes(t *testing.T) {
+	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+	gh := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{Name: "poweroff-set"},
+	})
+	gh.SetStatistics(fakegithub.Statistics{TotalAssignedJobs: 1})
+
+	h := Start(t, Options{
+		HotSize:              1,
+		MaxConcurrentRunners: 1,
+		ScaleSetName:         "poweroff-set",
+		FakeProxmox:          proxmox,
+		FakeGitHub:           gh,
+	})
+
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "assigned")) >= 1
+	}, 30*time.Second, 100*time.Millisecond,
+		"orchestrator never transitioned a VM to Assigned")
+
+	vmid, vmName := awaitAssignedVM(t, h, "poweroff-set")
+
+	gh.SetRunner(fakegithub.Runner{
+		ID:     firstJITRunnerID,
+		Name:   vmName,
+		Status: "online",
+		Busy:   true,
+	})
+
+	require.NoError(t, gh.PostJobStarted(vmName, firstJITRunnerID))
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "running")) >= 1
+	}, 30*time.Second, 100*time.Millisecond,
+		"orchestrator never transitioned Assigned → Running on JobStarted")
+
+	// Clear desired count so the listener's next HandleDesiredRunnerCount
+	// (fired after every GetMessage, including post-power-off polls)
+	// doesn't acquire a replacement and mint a second JIT mid-assertion.
+	gh.SetStatistics(fakegithub.Statistics{})
+
+	// THE LOAD-BEARING STEP: simulate the in-VM runner powering itself
+	// off. The orchestrator's powerPollOnce sees Running → power state
+	// == "stopped" → fires MarkCompleted on its own (no JobCompleted
+	// message is ever sent).
+	require.NoError(t, proxmox.PowerOff(vmid))
+
+	require.Eventually(t, func() bool {
+		for _, vm := range proxmox.Snapshot() {
+			if vm.VMID == vmid {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, 100*time.Millisecond,
+		"VM %d was never destroyed after power-off (power-poller did not detect stopped state)", vmid)
+
+	require.Eventually(t, func() bool {
+		for _, id := range gh.RunnerDeletions() {
+			if id == int64(firstJITRunnerID) {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 100*time.Millisecond,
+		"orchestrator did not deregister the JIT-minted runner on power-off destroy")
+}
+
+// awaitNAssignedVMs polls until exactly n owner-tagged VMs are in the
+// orchestrator's vmid range, then returns their (vmid, name) tuples
+// sorted by VMID for deterministic indexing.
+func awaitNAssignedVMs(t testing.TB, h *Harness, scaleSetName string, n int) []assignedVM {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return len(taggedOrchestratorVMIDs(h.Proxmox.Snapshot(), scaleSetName)) == n
+	}, 60*time.Second, 100*time.Millisecond,
+		"never observed exactly %d owner-tagged VMs in scaleset %q", n, scaleSetName)
+
+	out := make([]assignedVM, 0, n)
+	for _, vm := range h.Proxmox.Snapshot() {
+		if vm.VMID < 10000 || vm.VMID >= 11000 {
+			continue
+		}
+		if !tags.IsOwnedBy(vm.Tags, scaleSetName) {
+			continue
+		}
+		out = append(out, assignedVM{vmid: vm.VMID, name: vm.Name})
+	}
+	require.Len(t, out, n, "tagged-VM scan returned %d, want %d (race with destroy?)", len(out), n)
+	sort.Slice(out, func(i, j int) bool { return out[i].vmid < out[j].vmid })
+	return out
+}
+
+type assignedVM struct {
+	vmid int
+	name string
+}
+
+// TestE2E_ConcurrentJobs proves the pool's Acquire CAS, the scaler's
+// parallel provisionOne loop, and the per-VM runner deregistration
+// behave correctly when several jobs are dispatched at once.
+//
+// Uses HotSize=3 / MaxConcurrentRunners=5 so the burst path
+// (needBurst > HotSize idle) is exercised when the listener delivers
+// HandleDesiredRunnerCount(3) at startup. Pool concurrency bugs
+// (over-provisioning, runner-id cross-talk) would surface here as
+// either extra clones above MaxConcurrentRunners or a missing
+// deregistration in the final assertion.
+func TestE2E_ConcurrentJobs(t *testing.T) {
+	const jobs = 3
+	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+	gh := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{Name: "concurrent-set"},
+	})
+	gh.SetStatistics(fakegithub.Statistics{TotalAssignedJobs: jobs})
+
+	h := Start(t, Options{
+		HotSize:              jobs,
+		MaxConcurrentRunners: 5,
+		ScaleSetName:         "concurrent-set",
+		FakeProxmox:          proxmox,
+		FakeGitHub:           gh,
+	})
+
+	// Wait for all `jobs` rows to reach Assigned. Pool.Stats counts
+	// Assigned; the metric label "assigned" is what reconcileOnce
+	// publishes after each tick.
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "assigned")) >= jobs
+	}, 60*time.Second, 200*time.Millisecond,
+		"orchestrator never transitioned %d VMs to Assigned (saw %g)",
+		jobs, h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "assigned")))
+
+	vms := awaitNAssignedVMs(t, h, "concurrent-set", jobs)
+
+	// Assign a distinct test runner ID per VM. The IDs are chosen above
+	// the JIT-mint range (100000+counter) to make the deletion
+	// assertion unambiguous — RunnerDeletions returns every ID the
+	// orchestrator DELETEs, and we want to check the post-JobStarted
+	// IDs landed (which is the row's final RunnerID after MarkRunning
+	// overwrites the SetRunnerID-stamped value).
+	runnerIDs := make([]int64, jobs)
+	for i := range vms {
+		runnerIDs[i] = int64(200001 + i)
+		gh.SetRunner(fakegithub.Runner{
+			ID:     runnerIDs[i],
+			Name:   vms[i].name,
+			Status: "online",
+			Busy:   true,
+		})
+	}
+
+	for i, vm := range vms {
+		require.NoError(t, gh.PostJobStarted(vm.name, int(runnerIDs[i])))
+	}
+
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "running")) >= jobs
+	}, 60*time.Second, 200*time.Millisecond,
+		"orchestrator never transitioned %d VMs to Running (saw %g)",
+		jobs, h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "running")))
+
+	gh.SetStatistics(fakegithub.Statistics{})
+
+	for i, vm := range vms {
+		require.NoError(t, gh.PostJobCompleted(vm.name, int(runnerIDs[i])))
+	}
+
+	// Each of the `jobs` original VMs must disappear. The pool will
+	// likely refill Hot up to HotSize after the destroys settle —
+	// that's fine, we assert on the specific inherited VMIDs.
+	require.Eventually(t, func() bool {
+		live := make(map[int]struct{})
+		for _, vm := range proxmox.Snapshot() {
+			live[vm.VMID] = struct{}{}
+		}
+		for _, vm := range vms {
+			if _, alive := live[vm.vmid]; alive {
+				return false
+			}
+		}
+		return true
+	}, 60*time.Second, 200*time.Millisecond,
+		"not all %d original VMs were destroyed after JobCompleted", jobs)
+
+	// Every test-issued runner ID must show up in RunnerDeletions.
+	// OnRunnerOrphaned uses the row's RunnerID — which MarkRunning
+	// overwrote to our test-issued value — so this checks that each
+	// per-VM deregistration round-tripped correctly.
+	require.Eventually(t, func() bool {
+		deleted := make(map[int64]struct{})
+		for _, id := range gh.RunnerDeletions() {
+			deleted[id] = struct{}{}
+		}
+		for _, want := range runnerIDs {
+			if _, ok := deleted[want]; !ok {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 100*time.Millisecond,
+		"not all %d job runner IDs were deregistered (saw deletions %v, wanted %v)",
+		jobs, gh.RunnerDeletions(), runnerIDs)
 }
