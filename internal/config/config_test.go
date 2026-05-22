@@ -134,6 +134,35 @@ func TestParse_PoolSizesExceedMaxConcurrent(t *testing.T) {
 	require.Contains(t, err.Error(), "must not exceed")
 }
 
+func TestParse_ProxmoxEndpointScheme(t *testing.T) {
+	cases := []struct {
+		name      string
+		endpoint  string
+		wantError string // substring; empty means must succeed
+	}{
+		{"https ok", "https://pve.example.com:8006/api2/json", ""},
+		{"https plain host", "https://pve.example.com", ""},
+		{"http rejected", "http://pve.example.com:8006/api2/json", "must use https://"},
+		{"ftp rejected", "ftp://pve.example.com/", "must use https://"},
+		{"scheme-less rejected", "pve.example.com:8006", "must use https://"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+			yamlSrc := strings.Replace(validPATYAML,
+				"endpoint: https://pve.example.com:8006/api2/json",
+				"endpoint: "+tc.endpoint, 1)
+			_, err := config.Parse([]byte(yamlSrc))
+			if tc.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantError)
+		})
+	}
+}
+
 func TestParse_NodesStrategyRequiresMembers(t *testing.T) {
 	bad := strings.Replace(validPATYAML,
 		"  strategy: single\n  single_node: pve1",
