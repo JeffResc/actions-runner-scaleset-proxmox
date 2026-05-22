@@ -86,6 +86,23 @@ func TestServer_SetRunnerLater(t *testing.T) {
 	require.Equal(t, int64(42), runners.Runners[0].GetID())
 }
 
+// TestServer_ScalesetAccessorsSmoke exercises the scaleset-library
+// accessors (ConfigURL, ScaleSetID, JITMintCount) so they don't get
+// flagged as dead code by static analysis. Behavioural coverage of
+// these endpoints lives in test/e2e/ under the `e2e` build tag, which
+// deadcode without -tags=e2e cannot see.
+func TestServer_ScalesetAccessorsSmoke(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{Name: "smoke-set", ID: 99},
+	})
+
+	require.Contains(t, srv.ConfigURL("octocat"), "/octocat")
+	require.Equal(t, 99, srv.ScaleSetID())
+	require.Equal(t, 0, srv.JITMintCount(),
+		"no JIT mints expected without an e2e harness call")
+}
+
 func TestServer_UnsupportedEndpointReturns501(t *testing.T) {
 	t.Parallel()
 	srv := fakegithub.New(t, fakegithub.Options{})

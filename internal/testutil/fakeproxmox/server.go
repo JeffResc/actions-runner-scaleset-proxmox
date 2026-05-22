@@ -141,7 +141,13 @@ func (s *Server) routes() http.Handler {
 	r.Get("/nodes/{node}/status", s.handleNodeStatus)
 	r.Get("/nodes/{node}/qemu", s.handleListVMs)
 	r.Get("/nodes/{node}/qemu/{vmid}/status/current", s.handleVMStatus)
+	r.Get("/nodes/{node}/qemu/{vmid}/config", s.handleVMConfig)
 	r.Post("/nodes/{node}/qemu/{vmid}/clone", s.handleClone)
+	// VM config supports both POST (async, returns UPID) and PUT (sync,
+	// returns null). go-proxmox's VM.Config uses POST; older clients
+	// and our own existing unit tests use PUT. Same handler, response
+	// shape varies by method.
+	r.Post("/nodes/{node}/qemu/{vmid}/config", s.handleSetConfig)
 	r.Put("/nodes/{node}/qemu/{vmid}/config", s.handleSetConfig)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/start", s.handleStart)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/stop", s.handleStop)
@@ -255,6 +261,38 @@ func (s *Server) handleListVMs(w http.ResponseWriter, r *http.Request) {
 	writeData(w, out)
 }
 
+// handleVMConfig returns the VM's qemu config. go-proxmox's
+// node.VirtualMachine() makes two GETs — status/current + config — and
+// fails the whole call if either errors. We return a minimal payload
+// echoing back tags and any config knobs set via PUT.
+func (s *Server) handleVMConfig(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	out := map[string]any{
+		"name": v.Name,
+		"tags": v.Tags,
+	}
+	for k, val := range v.Config {
+		out[k] = val
+	}
+	if v.Template {
+		out["template"] = 1
+	}
+	writeData(w, out)
+}
+
 func (s *Server) handleVMStatus(w http.ResponseWriter, r *http.Request) {
 	vmid, err := vmidParam(r)
 	if err != nil {
@@ -340,6 +378,15 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		v.Config[k] = val
+	}
+	// Real Proxmox returns a UPID for POST (async) and null for PUT
+	// (sync). go-proxmox's VM.Config uses POST and unmarshals data
+	// into a UPID string — an empty "data": null breaks it with
+	// "unexpected end of JSON input".
+	if r.Method == http.MethodPost {
+		task := s.store.newTaskLocked(v.Node, "qmconfig", fmt.Sprintf("%d", vmid))
+		writeData(w, task.UPID)
+		return
 	}
 	writeData(w, nil)
 }
