@@ -82,14 +82,10 @@ func (f *fakeFetcher) Fetch(_ context.Context) (map[string]float64, error) {
 	return out, nil
 }
 
-func newLeastLoaded(f *fakeFetcher, refresh time.Duration, now func() time.Time) *leastLoaded {
-	return &leastLoaded{fetcher: f, refresh: refresh, timeNow: now}
-}
-
 func TestLeastLoaded_PicksMin(t *testing.T) {
 	t.Parallel()
 	f := &fakeFetcher{scores: map[string]float64{"a": 0.9, "b": 0.2, "c": 0.5}}
-	l := newLeastLoaded(f, 30*time.Second, time.Now)
+	l := newLeastLoadedFromFetcher(f, 30*time.Second)
 
 	got, err := l.Select(context.Background(), Hint{})
 	require.NoError(t, err)
@@ -99,19 +95,22 @@ func TestLeastLoaded_PicksMin(t *testing.T) {
 func TestLeastLoaded_HonoursAvoid(t *testing.T) {
 	t.Parallel()
 	f := &fakeFetcher{scores: map[string]float64{"a": 0.1, "b": 0.5, "c": 0.3}}
-	l := newLeastLoaded(f, 30*time.Second, time.Now)
+	l := newLeastLoadedFromFetcher(f, 30*time.Second)
 
 	got, err := l.Select(context.Background(), Hint{Avoid: []string{"a"}})
 	require.NoError(t, err)
 	require.Equal(t, "c", got)
 }
 
+// TestLeastLoaded_CachesWithinRefresh uses a real (short) refresh
+// interval and a real time.Sleep. ttlcache uses time.Now() internally,
+// so the previously-injected clock function no longer applies. The
+// margins (200 ms refresh, 5 selects in a tight loop, then sleep
+// 300 ms) are wide enough to be reliable under load.
 func TestLeastLoaded_CachesWithinRefresh(t *testing.T) {
 	t.Parallel()
 	f := &fakeFetcher{scores: map[string]float64{"a": 0.5, "b": 0.2}}
-	now := time.Now()
-	clk := &now
-	l := newLeastLoaded(f, time.Minute, func() time.Time { return *clk })
+	l := newLeastLoadedFromFetcher(f, 200*time.Millisecond)
 
 	for range 5 {
 		_, err := l.Select(context.Background(), Hint{})
@@ -119,8 +118,8 @@ func TestLeastLoaded_CachesWithinRefresh(t *testing.T) {
 	}
 	require.Equal(t, 1, f.calls, "should only fetch once within the refresh window")
 
-	// Advance past the refresh window.
-	*clk = clk.Add(2 * time.Minute)
+	// Advance past the refresh window with a real sleep.
+	time.Sleep(300 * time.Millisecond)
 	_, err := l.Select(context.Background(), Hint{})
 	require.NoError(t, err)
 	require.Equal(t, 2, f.calls)
@@ -129,18 +128,18 @@ func TestLeastLoaded_CachesWithinRefresh(t *testing.T) {
 func TestLeastLoaded_StaleFallbackOnFetchError(t *testing.T) {
 	t.Parallel()
 	f := &fakeFetcher{scores: map[string]float64{"a": 0.2}}
-	now := time.Now()
-	clk := &now
-	l := newLeastLoaded(f, 10*time.Millisecond, func() time.Time { return *clk })
+	l := newLeastLoadedFromFetcher(f, 50*time.Millisecond)
 
 	// First call seeds the cache.
 	got, err := l.Select(context.Background(), Hint{})
 	require.NoError(t, err)
 	require.Equal(t, "a", got)
 
-	// Subsequent fetch fails; we should still get cached data.
+	// Let the fresh-cache entry expire so the next Select takes the
+	// fetch path; the fetcher will fail, and the stale fallback must
+	// still answer with the previously-good map.
 	f.err = errors.New("api down")
-	*clk = clk.Add(time.Second)
+	time.Sleep(100 * time.Millisecond)
 
 	got, err = l.Select(context.Background(), Hint{})
 	require.NoError(t, err)
@@ -150,7 +149,7 @@ func TestLeastLoaded_StaleFallbackOnFetchError(t *testing.T) {
 func TestLeastLoaded_FetchErrorWithNoCache(t *testing.T) {
 	t.Parallel()
 	f := &fakeFetcher{err: errors.New("boom")}
-	l := newLeastLoaded(f, time.Minute, time.Now)
+	l := newLeastLoadedFromFetcher(f, time.Minute)
 	_, err := l.Select(context.Background(), Hint{})
 	require.Error(t, err)
 }
