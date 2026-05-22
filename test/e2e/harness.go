@@ -74,6 +74,13 @@ type Options struct {
 	FakeProxmox *fakeproxmox.Server
 	// FakeGitHub mirrors FakeProxmox for the GitHub side.
 	FakeGitHub *fakegithub.Server
+
+	// DryRun, when true, wraps the orchestrator's provisioner so all
+	// destructive Proxmox operations log instead of executing. Mirrors
+	// the binary's --dry-run flag. The fake Proxmox should therefore
+	// see no Clone / Start / Destroy traffic — read calls
+	// (template discovery, ping, list) still pass through.
+	DryRun bool
 }
 
 // Start spins up the fakes (if not supplied) and launches app.Run in a
@@ -146,6 +153,7 @@ func Start(t testing.TB, opts Options) *Harness {
 	go func() {
 		errCh <- app.Run(ctx, app.Options{
 			ConfigPath:   configPath,
+			DryRun:       opts.DryRun,
 			Version:      "e2e",
 			AuthOverride: auth,
 		})
