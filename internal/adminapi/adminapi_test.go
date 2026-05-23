@@ -204,8 +204,13 @@ func TestRequireBearerToken_RejectsRawSecretWithoutScheme(t *testing.T) {
 
 // TestRequireBearerToken_RefusesEmptyConfiguredSecret is defense in
 // depth: if a future caller bypasses Serve's empty-secret guard, the
-// middleware must still refuse to authenticate (rather than allowing a
-// blank token to match a blank configured secret).
+// middleware must still refuse to authenticate. We respond 503 rather
+// than 401 because the failure is a server-side misconfiguration, not
+// a missing-credential problem the client can fix — and the louder
+// response surfaces the misconfig in monitoring. The previous 401
+// behavior also worked but bound a precomputed sha256("") into the
+// closure, which would silently authenticate empty bearer tokens if a
+// future refactor removed the empty-secret short-circuit.
 func TestRequireBearerToken_RefusesEmptyConfiguredSecret(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestServer(t, "")
@@ -215,14 +220,23 @@ func TestRequireBearerToken_RefusesEmptyConfiguredSecret(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	h.ServeHTTP(w, r)
-	require.Equal(t, http.StatusUnauthorized, w.Code)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 
-	// "Bearer " with empty token.
+	// "Bearer " with empty token — the dangerous case if sha256("") were
+	// bound to the closure.
 	w = httptest.NewRecorder()
 	r = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "Bearer ")
 	h.ServeHTTP(w, r)
-	require.Equal(t, http.StatusUnauthorized, w.Code)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	// And the matching "Bearer <anything>" must also be refused — the
+	// empty-secret handler must not delegate to ConstantTimeCompare.
+	w = httptest.NewRecorder()
+	r = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
+	r.Header.Set("Authorization", "Bearer guess")
+	h.ServeHTTP(w, r)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
 }
 
 func TestState_ReturnsPoolStats(t *testing.T) {
