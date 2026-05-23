@@ -297,7 +297,14 @@ func newProxmoxClient(cfg config.ProxmoxConfig) *proxmox.Client {
 	retry := retryablehttp.NewClient()
 	retry.HTTPClient = &http.Client{
 		Transport: tr,
-		Timeout:   60 * time.Second,
+		// Per-request hard cap. Must be >= the largest task.WaitFor
+		// budget (600s in Clone) — otherwise a single poll that stalls
+		// past Timeout aborts a still-progressing task and the caller
+		// sees a spurious failure. 15m matches the per-clone ctx
+		// deadline in pool.runClone so this is just a backstop for
+		// callers that forget to pass a bounded ctx; well-behaved
+		// callers' ctx deadlines win long before this fires.
+		Timeout: 15 * time.Minute,
 	}
 	retry.RetryMax = 4
 	retry.RetryWaitMin = 500 * time.Millisecond
