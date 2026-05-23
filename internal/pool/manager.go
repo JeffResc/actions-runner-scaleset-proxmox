@@ -1293,6 +1293,12 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 // counts, per-profile shrink/recycle. Shared resources (semaphores,
 // VMID allocator) remain fleet-wide so total Proxmox concurrency is
 // bounded.
+//
+// The body is intentionally orchestration only — the math lives in
+// computeCloneNeeds, the shrink-to-floor branch in shrinkHotPool, the
+// VM-max-age sweep in recycleOldVMs, and the fleet-wide stuck sweep
+// in sweepStuckRows. Each helper owns one decision; this function is
+// the order they fire in.
 func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	ps := m.profileOf(profile)
 	if ps == nil {
@@ -1310,58 +1316,96 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 		m.log.Warn("reconcile: stats failed", "profile", profile, "err", err)
 		return
 	}
-	// Per-profile Hot/Warm Provisioning counts. Fleet-wide counts here
-	// would let sibling profiles' in-flight clones bleed into this
-	// profile's headroom — under heavy multi-profile load that produces
-	// "X under-dispatched because Y's clones were still landing" misses
-	// that converge after a tick but break single-pass test setups.
-	profileRows, err := m.store.ListByProfile(profile)
+	hotProv, warmProv, err := m.provisioningCounts(profile)
 	if err != nil {
 		m.log.Warn("reconcile: list profile rows failed", "profile", profile, "err", err)
 		return
 	}
-	hotProv, warmProv := 0, 0
+
+	hotSize := int(ps.hotSize.Load())
+	warmSize := int(ps.warmSize.Load())
+	desired := int(ps.desiredCount.Load())
+	needHot, needWarm := computeCloneNeeds(stats, m.prov.InFlightCloneCount(),
+		hotProv, warmProv, hotSize, warmSize, desired, ps.settings.MaxConcurrentRunners)
+
+	// Promote warm -> hot first (cheap).
+	promoteCount := needHot
+	if promoteCount > stats.Warm {
+		promoteCount = stats.Warm
+	}
+	if promoteCount > 0 {
+		m.promoteN(ctx, profile, promoteCount)
+		needHot -= promoteCount
+	}
+	// Clone whatever's left.
+	for range needHot {
+		m.kickClone(ctx, profile, store.PoolKindHot, true)
+	}
+	for range needWarm {
+		m.kickClone(ctx, profile, store.PoolKindWarm, false)
+	}
+
+	m.shrinkHotPool(profile, hotSize, desired, stats.Busy())
+
+	// Stuck-state sweep is fleet-wide (transient-state issues aren't
+	// profile-specific). Pin it to the default profile to avoid N
+	// parallel sweeps doing the same work each tick.
+	if profile == m.defaultProfile() {
+		m.sweepStuckRows()
+	}
+	m.recycleOldVMs(profile, ps.settings.VMMaxAge)
+}
+
+// provisioningCounts returns the per-profile Hot and Warm
+// Provisioning row counts. Fleet-wide counts here would let sibling
+// profiles' in-flight clones bleed into this profile's headroom —
+// under heavy multi-profile load that produces "X under-dispatched
+// because Y's clones were still landing" misses that converge after a
+// tick but break single-pass test setups.
+func (m *manager) provisioningCounts(profile string) (hot, warm int, err error) {
+	profileRows, err := m.store.ListByProfile(profile)
+	if err != nil {
+		return 0, 0, err
+	}
 	for _, r := range profileRows {
 		if r.State != store.StateProvisioning {
 			continue
 		}
 		switch r.PoolKind {
 		case store.PoolKindHot:
-			hotProv++
+			hot++
 		case store.PoolKindWarm:
-			warmProv++
+			warm++
 		}
 	}
+	return hot, warm, nil
+}
+
+// computeCloneNeeds is the pure pool-sizing math: given the profile's
+// snapshot + sizing knobs, return how many fresh Hot and Warm VMs to
+// dispatch this tick. Pulled out as a free function so the clamp
+// invariants (no negatives, respect MaxConcurrentRunners headroom,
+// cover the larger of idle-replacement vs burst-response) are
+// testable in isolation.
+//
+// inflight is the fleet-wide Provisioner.InFlightCloneCount() — using
+// it for a single profile's headroom over-counts when other profiles
+// are cloning concurrently, but only in the safe direction (we
+// under-dispatch this profile's needed clones for one tick).
+func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSize, desired, profileMax int) (needHot, needWarm int) {
+	available := stats.Available() + hotProv + inflight
+	busy := stats.Busy()
+
 	// Two reasons to clone a hot VM:
-	//   (a) Eager replacement: keep `available >= HotSize` so consuming
-	//       a hot VM (Assigned) immediately triggers a refill clone.
+	//   (a) Eager replacement: keep `available >= HotSize` so
+	//       consuming a hot VM (Assigned) immediately triggers a
+	//       refill clone.
 	//   (b) Burst response: when GitHub's desiredCount exceeds the
 	//       current in-flight runner count, scale up immediately.
 	// Effective need is the larger of the two.
-	//
-	// We add Provisioner.InFlightCloneCount() so a tick sees in-flight
-	// clones from PREVIOUS ticks whose store rows haven't landed yet
-	// (the gap between PVE qmclone returning and the manager's
-	// store.Insert call). Without this, two consecutive ticks each
-	// see an empty store and each spawn HotSize clones — producing
-	// the "current_hot=4 target=3" over-provision the production
-	// reproducer captured.
-	// Provisioner.InFlightCloneCount() is fleet-wide; using it for a
-	// single profile's headroom over-counts when other profiles are
-	// cloning concurrently, but only in the safe direction (we under-
-	// dispatch this profile's needed clones for one tick).
-	inflight := m.prov.InFlightCloneCount()
-	available := stats.Available() + hotProv + inflight
-	busy := stats.Busy()
-	desired := int(ps.desiredCount.Load())
-
-	hotSize := int(ps.hotSize.Load())
-	warmSize := int(ps.warmSize.Load())
-	profileMax := ps.settings.MaxConcurrentRunners
-
 	needIdle := hotSize - available
 	needBurst := desired - (available + busy)
-	needHot := needIdle
+	needHot = needIdle
 	if needBurst > needHot {
 		needHot = needBurst
 	}
@@ -1377,33 +1421,18 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	}
 
 	warmInflight := stats.LiveWarm() + warmProv
-	needWarm := warmSize - warmInflight
+	needWarm = warmSize - warmInflight
 	if needWarm < 0 {
 		needWarm = 0
 	}
+	return needHot, needWarm
+}
 
-	// Promote warm -> hot first (cheap).
-	promoteCount := needHot
-	if promoteCount > stats.Warm {
-		promoteCount = stats.Warm
-	}
-	if promoteCount > 0 {
-		m.promoteN(ctx, profile, promoteCount)
-		needHot -= promoteCount
-	}
-
-	// Clone whatever's left.
-	for range needHot {
-		m.kickClone(ctx, profile, store.PoolKindHot, true)
-	}
-	for range needWarm {
-		m.kickClone(ctx, profile, store.PoolKindWarm, false)
-	}
-
-	// Shrink-to-floor: when the hot pool has grown beyond what we
-	// need (typically after a burst completes and demand collapses
-	// back to 0), destroy the excess. Per-profile scope so a quiet
-	// profile shrinks even while a busy sibling stays at cap.
+// shrinkHotPool destroys the oldest Hot rows when the current Hot
+// population exceeds (hotSize, burst-target). Typically fires after a
+// burst completes and demand collapses back to 0. Per-profile scope
+// so a quiet profile shrinks even while a busy sibling stays at cap.
+func (m *manager) shrinkHotPool(profile string, hotSize, desired, busy int) {
 	hotTarget := hotSize
 	if burstTarget := desired - busy; burstTarget > hotTarget {
 		hotTarget = burstTarget
@@ -1411,61 +1440,60 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	freshStats, statsErr := m.statsForProfile(profile)
 	if statsErr != nil {
 		m.log.Warn("reconcile: re-stats failed; skipping shrink this tick", "profile", profile, "err", statsErr)
-	} else if freshStats.Hot > hotTarget {
-		excess := freshStats.Hot - hotTarget
-		hotRows, err := m.store.ListByProfileAndStates(profile, store.StateHot)
-		if err == nil {
-			sort.Slice(hotRows, func(i, j int) bool {
-				return hotRows[i].CreatedAt.Before(hotRows[j].CreatedAt)
-			})
-			killed := 0
-			for _, row := range hotRows {
-				if killed >= excess {
-					break
-				}
-				ok, err := m.store.UpdateState(row.VMID, store.StateHot, store.StateDraining, func(v *store.VM) {
-					v.StateSince = time.Now()
-				})
-				if err != nil || !ok {
-					continue
-				}
-				m.log.Info("shrink: hot pool over target; destroying excess",
-					"vmid", row.VMID, "profile", profile, "hot_size", hotSize, "target", hotTarget, "current_hot", freshStats.Hot)
-				m.destroyAsync(row.VMID, row.Node, profile)
-				killed++
-			}
+		return
+	}
+	if freshStats.Hot <= hotTarget {
+		return
+	}
+	excess := freshStats.Hot - hotTarget
+	hotRows, err := m.store.ListByProfileAndStates(profile, store.StateHot)
+	if err != nil {
+		return
+	}
+	sort.Slice(hotRows, func(i, j int) bool {
+		return hotRows[i].CreatedAt.Before(hotRows[j].CreatedAt)
+	})
+	killed := 0
+	for _, row := range hotRows {
+		if killed >= excess {
+			break
 		}
+		ok, err := m.store.UpdateState(row.VMID, store.StateHot, store.StateDraining, func(v *store.VM) {
+			v.StateSince = time.Now()
+		})
+		if err != nil || !ok {
+			continue
+		}
+		m.log.Info("shrink: hot pool over target; destroying excess",
+			"vmid", row.VMID, "profile", profile, "hot_size", hotSize, "target", hotTarget, "current_hot", freshStats.Hot)
+		m.destroyAsync(row.VMID, row.Node, profile)
+		killed++
 	}
+}
 
-	// Stuck-state sweep is fleet-wide (transient-state issues aren't
-	// profile-specific). Only one profile's loop needs to run it
-	// each tick — pin it to the default profile to avoid N parallel
-	// sweeps doing the same work.
-	if profile == m.defaultProfile() {
-		m.sweepStuckRows()
+// recycleOldVMs destroys idle Hot/Warm VMs in profile whose age
+// exceeds maxAge. Per-profile because the profile setting can
+// override the global default. maxAge == 0 disables the sweep.
+func (m *manager) recycleOldVMs(profile string, maxAge time.Duration) {
+	if maxAge <= 0 {
+		return
 	}
-
-	// VM-max-age recycle: destroy idle Hot/Warm VMs in THIS profile
-	// older than the profile's max-age. Per-profile because the
-	// profile setting can override the global default.
-	maxAge := ps.settings.VMMaxAge
-	if maxAge > 0 {
-		cutoff := time.Now().Add(-maxAge)
-		olds, err := m.store.ListByProfileAndStates(profile, store.StateHot, store.StateWarm)
-		if err == nil {
-			for _, o := range olds {
-				if !o.CreatedAt.Before(cutoff) {
-					continue
-				}
-				m.log.Info("recycle: vm exceeded max age",
-					"vmid", o.VMID, "profile", profile, "age", time.Since(o.CreatedAt))
-				if _, err := m.store.Update(o.VMID, func(v *store.VM) {
-					v.State = store.StateDraining
-					v.StateSince = time.Now()
-				}); err == nil {
-					m.destroyAsync(o.VMID, o.Node, profile)
-				}
-			}
+	cutoff := time.Now().Add(-maxAge)
+	olds, err := m.store.ListByProfileAndStates(profile, store.StateHot, store.StateWarm)
+	if err != nil {
+		return
+	}
+	for _, o := range olds {
+		if !o.CreatedAt.Before(cutoff) {
+			continue
+		}
+		m.log.Info("recycle: vm exceeded max age",
+			"vmid", o.VMID, "profile", profile, "age", time.Since(o.CreatedAt))
+		if _, err := m.store.Update(o.VMID, func(v *store.VM) {
+			v.State = store.StateDraining
+			v.StateSince = time.Now()
+		}); err == nil {
+			m.destroyAsync(o.VMID, o.Node, profile)
 		}
 	}
 }
