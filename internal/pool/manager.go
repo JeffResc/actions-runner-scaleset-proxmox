@@ -996,7 +996,7 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 	for _, row := range rows {
 		vmCtx, cancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
 		state, err := m.prov.PowerState(vmCtx, &provisioner.VM{
-			VMID: row.VMID, Node: row.Node, Name: row.Name,
+			VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile,
 		})
 		cancel()
 		if err != nil {
@@ -1461,7 +1461,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 func (m *manager) runBoot(row *store.VM) {
 	ctx, cancel := context.WithTimeout(m.workerCtx, 5*time.Minute)
 	defer cancel()
-	pv := &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name}
+	pv := &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}
 	if err := m.prov.Start(ctx, pv); err != nil {
 		m.log.Warn("boot: start failed", "vmid", row.VMID, "err", err)
 		m.markPoisonOrDestroy(row)
@@ -1500,7 +1500,11 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 
 // markPoisonOrDestroy increments boot_attempts; if past the threshold,
 // tags the VM as poison and stops touching it; otherwise schedules
-// destruction so the next reconcile can clone a fresh one.
+// destruction so the next reconcile can clone a fresh one. The
+// threshold is read from the row's profile so per-profile overrides
+// (e.g. a flaky GPU image that needs 5 retries) actually take effect;
+// rows whose profile no longer exists in config fall back to the
+// fleet-wide cfg value.
 func (m *manager) markPoisonOrDestroy(row *store.VM) {
 	updated, err := m.store.Update(row.VMID, func(v *store.VM) {
 		v.BootAttempts++
@@ -1509,7 +1513,11 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 		m.log.Warn("poison: inc attempts failed", "vmid", row.VMID, "err", err)
 		return
 	}
-	if updated.BootAttempts >= m.cfg.BootMaxAttempts {
+	threshold := m.cfg.BootMaxAttempts
+	if ps := m.profileOf(row.Profile); ps != nil {
+		threshold = ps.settings.BootMaxAttempts
+	}
+	if updated.BootAttempts >= threshold {
 		if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
 			v.State = store.StatePoison
 			v.StateSince = time.Now()
