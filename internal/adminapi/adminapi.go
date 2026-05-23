@@ -166,28 +166,35 @@ func remoteIP(remoteAddr string) string {
 // standalone deployments use [AlwaysLeader] (or any LeaderGate whose
 // IsLeader always returns true). poolFn returns the current
 // pool.Manager — nil when not leader.
-func New(cfg Config, poolFn PoolAccessor, prov provisioner.Provisioner, gate LeaderGate, drain func(), log *slog.Logger) *Server {
+//
+// Returns an error when any TrustedProxies entry fails netip.ParsePrefix.
+// The config validator already rejects malformed CIDRs, but the
+// consumer-side parse used to silently drop bad entries — a silent drop
+// meant operator-listed front-end proxies were not trusted, so the
+// admin API's per-IP rate limiter keyed on the proxy's IP instead of
+// the real client and X-Forwarded-For was ignored. Fail loudly here
+// so any future drift between config validator and consumer surfaces
+// at startup, not as degraded behaviour that looks like a network bug.
+func New(cfg Config, poolFn PoolAccessor, prov provisioner.Provisioner, gate LeaderGate, drain func(), log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	if gate == nil {
 		gate = AlwaysLeader{}
 	}
-	// Pre-parse the trusted-proxy CIDRs once at startup; the config
-	// validator has already rejected malformed entries, but defensively
-	// skip any that fail to parse here so a broken entry can't
-	// short-circuit the middleware.
 	prefixes := make([]netip.Prefix, 0, len(cfg.TrustedProxies))
-	for _, cidr := range cfg.TrustedProxies {
-		if p, err := netip.ParsePrefix(cidr); err == nil {
-			prefixes = append(prefixes, p)
+	for i, cidr := range cfg.TrustedProxies {
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("adminapi: trusted_proxies[%d] %q: %w", i, cidr, err)
 		}
+		prefixes = append(prefixes, p)
 	}
 	return &Server{
 		cfg: cfg, pool: poolFn, prov: prov, gate: gate, drain: drain, log: log,
 		authFailLimiter: newPerIPLimiter(rate.Limit(authFailRPS), authFailBurst, authFailIdle),
 		trustedProxies:  prefixes,
-	}
+	}, nil
 }
 
 // SetMetrics attaches the orchestrator's Prometheus metric set so

@@ -373,10 +373,13 @@ func Run(ctx context.Context, opts Options) error {
 		adminAPIConfig.TLSCertFile = cfg.AdminAPI.TLS.CertFile
 		adminAPIConfig.TLSKeyFile = cfg.AdminAPI.TLS.KeyFile
 	}
-	admin := adminapi.New(adminAPIConfig, poolFn, prov, buildAdminGate(cfg, coord, adminClientTLS), func() {
+	admin, err := adminapi.New(adminAPIConfig, poolFn, prov, buildAdminGate(cfg, coord, adminClientTLS), func() {
 		log.Warn("admin drain triggered; cancelling root context")
 		cancel()
 	}, log)
+	if err != nil {
+		return fmt.Errorf("admin api: build server: %w", err)
+	}
 	// Surface the preempt counter from the admin endpoint —
 	// adminapi.Server doesn't take metrics in its constructor to
 	// keep the signature stable for callers that don't care.
