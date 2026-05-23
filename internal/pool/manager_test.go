@@ -625,6 +625,85 @@ func TestListRows_ExcludesTerminal(t *testing.T) {
 	require.False(t, rows[0].StateSince.IsZero())
 }
 
+// TestComputeCloneNeeds is the table-driven coverage for the pure
+// pool-sizing math extracted from reconcileProfileOnce. Each row
+// exercises one clamp or invariant.
+func TestComputeCloneNeeds(t *testing.T) {
+	t.Parallel()
+	mkStats := func(hot, warm, assigned int) Stats {
+		return Stats{Hot: hot, Warm: warm, Assigned: assigned}
+	}
+	cases := []struct {
+		name                                   string
+		stats                                  Stats
+		inflight, hotProv, warmProv            int
+		hotSize, warmSize, desired, profileMax int
+		wantHot, wantWarm                      int
+	}{
+		{
+			name:    "cold start: no inflight, no rows, hotSize=2",
+			stats:   mkStats(0, 0, 0),
+			hotSize: 2, warmSize: 0, desired: 0, profileMax: 10,
+			wantHot: 2, wantWarm: 0,
+		},
+		{
+			name:    "burst response wins when desired > hotSize",
+			stats:   mkStats(0, 0, 0),
+			hotSize: 2, warmSize: 0, desired: 5, profileMax: 10,
+			wantHot: 5, wantWarm: 0,
+		},
+		{
+			name:    "profileMax caps the dispatch",
+			stats:   mkStats(0, 0, 0),
+			hotSize: 2, warmSize: 0, desired: 50, profileMax: 4,
+			wantHot: 4, wantWarm: 0,
+		},
+		{
+			name:     "inflight counts toward available — under-dispatch one tick",
+			stats:    mkStats(0, 0, 0),
+			inflight: 2,
+			hotSize:  2, warmSize: 0, desired: 0, profileMax: 10,
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			name:    "warm fill: hotSize satisfied, only warm needed",
+			stats:   mkStats(2, 0, 0),
+			hotSize: 2, warmSize: 3, desired: 0, profileMax: 10,
+			wantHot: 0, wantWarm: 3,
+		},
+		{
+			name:     "warmProv satisfies warm need",
+			stats:    mkStats(2, 0, 0),
+			warmProv: 3,
+			hotSize:  2, warmSize: 3, desired: 0, profileMax: 10,
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			name:    "negative needs clamp to zero (over-provisioned)",
+			stats:   mkStats(5, 0, 0),
+			hotSize: 2, warmSize: 0, desired: 0, profileMax: 10,
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			name:    "profileMax floor doesn't go negative when no room",
+			stats:   mkStats(0, 0, 10),
+			hotSize: 2, warmSize: 0, desired: 0, profileMax: 10,
+			wantHot: 0, wantWarm: 0,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			needHot, needWarm := computeCloneNeeds(c.stats,
+				c.inflight, c.hotProv, c.warmProv,
+				c.hotSize, c.warmSize, c.desired, c.profileMax)
+			require.Equal(t, c.wantHot, needHot, "needHot")
+			require.Equal(t, c.wantWarm, needWarm, "needWarm")
+		})
+	}
+}
+
 func TestAllocateVMID_AvoidsCollisions(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
