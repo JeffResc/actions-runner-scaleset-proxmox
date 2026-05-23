@@ -161,6 +161,39 @@ func TestInjectJITConfig_RejectsNilOrEmpty(t *testing.T) {
 	require.Error(t, p.InjectJITConfig(context.Background(), &VM{VMID: 1, Node: "pve1"}, ""))
 }
 
+// TestJITConfigPattern_AcceptsBothBase64Alphabets locks in #156: the
+// pattern must accept both RFC 4648 standard (+/) and URL-safe (-_)
+// base64 so a future GitHub API change to URL-safe JIT configs doesn't
+// silently break runner registration. Either alphabet is safe because
+// the injection guard is about quote / newline / shell metachars, none
+// of which appear in either alphabet.
+//
+// Direct regex test rather than driving InjectJITConfig end-to-end:
+// the full path requires a multi-endpoint mock (file-write + exec +
+// exec-status) and the regex is the single load-bearing assertion
+// here. Reject-path coverage already lives in
+// TestInjectJITConfig_RejectsNonBase64.
+func TestJITConfigPattern_AcceptsBothBase64Alphabets(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"standard alphabet", "ZW5jb2RlZGppdGNvbmZpZ2Jsb2I="},
+		{"url-safe alphabet", "abc-def_ghi=="},
+		{"mixed alphabets", "abc+def-ghi/jkl_mno=="},
+		{"trailing padding only", "AAAA="},
+		{"no padding", "ZWFzeQ"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.True(t, jitConfigPattern.MatchString(tc.input),
+				"expected pattern to accept %q", tc.input)
+		})
+	}
+}
+
 // TestInjectJITConfig_RejectsNonBase64 guards the syntax check that
 // blocks a non-base64 payload (anything that could carry an embedded
 // single quote, newline, or shell metachar) from being written into
