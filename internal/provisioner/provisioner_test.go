@@ -863,3 +863,47 @@ func TestListOwnedVMs_StillWarnsOnRealUntaggedOrphan(t *testing.T) {
 	require.Contains(t, logBuf.String(), "untagged orphan detected",
 		"genuine crash-mid-clone orphans must still warn")
 }
+
+// ---------------------------------------------------------------------------
+// encodeNIC (PR 3 — issue #6)
+// ---------------------------------------------------------------------------
+
+func TestEncodeNIC_DefaultsModelToVirtio(t *testing.T) {
+	t.Parallel()
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0"})
+	require.Equal(t, "virtio,bridge=vmbr0", got)
+}
+
+func TestEncodeNIC_TaggedVLANAddsTagAttr(t *testing.T) {
+	t.Parallel()
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 42})
+	require.Equal(t, "virtio,bridge=vmbr0,tag=42", got)
+}
+
+func TestEncodeNIC_UntaggedSkipsTagEvenIfTagNumberSet(t *testing.T) {
+	t.Parallel()
+	// VLANUntagged=true is the operator's explicit "no tag" — the
+	// VLANTag field is ignored when this is set.
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 42, VLANUntagged: true})
+	require.Equal(t, "virtio,bridge=vmbr0", got)
+}
+
+func TestEncodeNIC_ZeroVLANTagSkipsAttribute(t *testing.T) {
+	t.Parallel()
+	// Tag=0 (without VLANUntagged) skips the tag= attribute so the
+	// bridge's VLAN-aware default applies.
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 0})
+	require.Equal(t, "virtio,bridge=vmbr0", got)
+}
+
+func TestEncodeNIC_MTUJumboFrames(t *testing.T) {
+	t.Parallel()
+	got := encodeNIC(CloneNIC{Bridge: "vmbr1", VLANTag: 100, MTU: 9000})
+	require.Equal(t, "virtio,bridge=vmbr1,tag=100,mtu=9000", got)
+}
+
+func TestEncodeNIC_CustomModel(t *testing.T) {
+	t.Parallel()
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", Model: "e1000"})
+	require.Equal(t, "e1000,bridge=vmbr0", got)
+}

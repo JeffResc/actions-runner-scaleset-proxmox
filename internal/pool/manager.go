@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/ipam"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
@@ -72,6 +73,17 @@ type ProfileSettings struct {
 	MemoryMB     int
 	DiskGB       int
 	Storage      string
+
+	// NICs sets the cloned VM's network interfaces. Empty leaves
+	// the template's NICs in place — production typically lists
+	// at least net0 even for the default profile to disambiguate
+	// the "use template default" path.
+	NICs []provisioner.CloneNIC
+
+	// IPAM allocates a static IP for each clone (and releases it
+	// on destroy). Nil falls back to ipam.Noop — clones boot via
+	// DHCP.
+	IPAM ipam.Allocator
 }
 
 // Config bundles everything the manager needs at construction time.
@@ -1546,6 +1558,36 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		attribute.String("vm.node", node),
 		attribute.String("pool.profile", profileName),
 	)
+
+	// Allocate a static IP (if the profile's IPAM is non-noop)
+	// BEFORE the Clone call so the IPConfig can be stamped into
+	// the same Config request the provisioner makes for tags +
+	// hardware. Allocation failures fail the clone — the
+	// orchestrator's "skip and let the next reconcile tick retry"
+	// behaviour applies via the standard runClone exit path.
+	allocator := ps.settings.IPAM
+	if allocator == nil {
+		allocator = ipam.Noop{}
+	}
+	ipAssignment, err := allocator.Allocate(ctx, vmid)
+	if err != nil {
+		m.log.Warn("clone: ipam allocate failed", "vmid", vmid, "profile", profileName, "err", err)
+		// Treat as a clone failure — destroy the freshly-inserted
+		// row so the next reconcile pass can retry.
+		if _, updErr := m.store.Update(vmid, func(v *store.VM) {
+			v.State = store.StateDestroying
+			v.StateSince = time.Now()
+		}); updErr != nil {
+			m.log.Warn("clone: ipam-fail mark destroying failed", "vmid", vmid, "err", updErr)
+		}
+		m.destroyOrSyncFallback(vmid, node, profileName)
+		return
+	}
+	ipConfig := ""
+	if ipAssignment != "" {
+		ipConfig = "ip=" + ipAssignment
+	}
+
 	cloneStart := time.Now()
 	pv, err := m.prov.Clone(ctx, provisioner.CloneOptions{
 		NewVMID:      vmid,
@@ -1559,6 +1601,8 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		MemoryMB:     ps.settings.MemoryMB,
 		DiskGB:       ps.settings.DiskGB,
 		Storage:      ps.settings.Storage,
+		NICs:         ps.settings.NICs,
+		IPConfig:     ipConfig,
 	})
 	if err != nil {
 		span.RecordError(err)
@@ -1860,6 +1904,24 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	}
 	if m.metrics != nil {
 		m.metrics.VMsTotal.WithLabelValues(destroyedProfile, "destroyed").Inc()
+	}
+
+	// Release the IPAM allocation BEFORE the runner-orphan
+	// cleanup so a slow GitHub round-trip doesn't hold the IP.
+	// Best-effort — a release failure is logged but doesn't
+	// block destroy completion; the orphan-IP gets reclaimed by
+	// the operator's IPAM (or the static allocator's next
+	// process restart).
+	if ps := m.profileOf(destroyedProfile); ps != nil && ps.settings.IPAM != nil {
+		// Use a fresh context: dctx may have been cancelled by
+		// drain. The release is idempotent so re-running on the
+		// next reconcile pass is safe, but losing the release
+		// here leaks the IP until process restart.
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := ps.settings.IPAM.Release(releaseCtx, vmid); err != nil { //nolint:contextcheck // deliberately detached; see comment above
+			m.log.Warn("destroy: ipam release failed", "vmid", vmid, "profile", destroyedProfile, "err", err)
+		}
+		releaseCancel()
 	}
 
 	if runnerID != 0 && m.cfg.OnRunnerOrphaned != nil {

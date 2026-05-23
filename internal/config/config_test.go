@@ -1274,3 +1274,120 @@ func writeSelfSignedKeypair(t *testing.T) (certPath, keyPath string) {
 
 	return certPath, keyPath
 }
+
+// ---------------------------------------------------------------------------
+// Per-profile network + IPAM (PR 3 — issue #6)
+// ---------------------------------------------------------------------------
+
+func TestProfileNetwork_ParsedFromYAML(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	withNet := strings.Replace(validProfileYAML,
+		"    template_vmid: 9100",
+		`    template_vmid: 9100
+    network:
+      bridge: vmbr1
+      vlan_tag: 30
+      mtu: 9000
+      extra_nics:
+        - bridge: vmbr-storage
+          vlan_tag: 100
+          mtu: 9000
+      ipam:
+        backend: static
+        pool:
+          - 10.0.0.10/24
+          - 10.0.0.11/24`, 1)
+	cfg, err := config.Parse([]byte(withNet))
+	require.NoError(t, err)
+	require.Len(t, cfg.Profiles, 2)
+
+	gpu := cfg.Profiles[1]
+	require.NotNil(t, gpu.Network)
+	require.Equal(t, "vmbr1", gpu.Network.Bridge)
+	require.Equal(t, 30, gpu.Network.VLANTag)
+	require.Equal(t, 9000, gpu.Network.MTU)
+	require.Len(t, gpu.Network.ExtraNICs, 1)
+	require.Equal(t, "vmbr-storage", gpu.Network.ExtraNICs[0].Bridge)
+	require.NotNil(t, gpu.Network.IPAM)
+	require.Equal(t, "static", gpu.Network.IPAM.Backend)
+	require.Equal(t, []string{"10.0.0.10/24", "10.0.0.11/24"}, gpu.Network.IPAM.Pool)
+}
+
+func TestProfileNetwork_StaticBackendRequiresPool(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"    template_vmid: 9100",
+		`    template_vmid: 9100
+    network:
+      ipam:
+        backend: static`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ipam.pool is required when backend=static")
+}
+
+func TestProfileNetwork_NoopBackendRejectsPool(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"    template_vmid: 9100",
+		`    template_vmid: 9100
+    network:
+      ipam:
+        backend: noop
+        pool: ["10.0.0.10/24"]`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ipam.pool must be empty when backend=noop")
+}
+
+func TestProfileNetwork_RejectsInvalidBackend(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"    template_vmid: 9100",
+		`    template_vmid: 9100
+    network:
+      ipam:
+        backend: netbox`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err, "backend not in oneof must fail validation")
+}
+
+func TestProfileNetwork_RejectsOutOfRangeVLAN(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"    template_vmid: 9100",
+		`    template_vmid: 9100
+    network:
+      bridge: vmbr0
+      vlan_tag: 5000`, 1) // > 4094
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+}
+
+func TestProfileNetwork_OmittedIsValid(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	// validProfileYAML doesn't set network anywhere; back-compat.
+	cfg, err := config.Parse([]byte(validProfileYAML))
+	require.NoError(t, err)
+	for _, p := range cfg.Profiles {
+		require.Nil(t, p.Network, "no network block: profile.Network must remain nil")
+	}
+}

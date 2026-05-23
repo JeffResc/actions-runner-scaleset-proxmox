@@ -411,6 +411,73 @@ type ProfileConfig struct {
 
 	// VMMaxAgeD is the resolved duration (populated by Resolve).
 	VMMaxAgeD time.Duration `yaml:"-"`
+
+	// Network, when non-nil, overrides the global proxmox.network
+	// block for clones of this profile (bridge, VLAN tag, MTU,
+	// optional extra NICs) and selects the IPAM backend. Nil =
+	// inherit the global network unchanged + use the noop IPAM
+	// allocator (cloud-init falls back to DHCP).
+	Network *ProfileNetworkConfig `yaml:"network,omitempty"`
+}
+
+// ProfileNetworkConfig overrides the global Proxmox network for
+// one runner profile. Every field is optional — empty inherits the
+// global proxmox.network.* value the corresponding field maps to.
+type ProfileNetworkConfig struct {
+	// Bridge overrides proxmox.network.bridge for net0. Empty
+	// inherits.
+	Bridge string `yaml:"bridge"`
+
+	// VLANTag overrides proxmox.network.vlan_tag for net0. 0 ==
+	// "use the global default" (which is itself 0 == untagged).
+	// To force untagged on a profile while the global default is
+	// tagged, use the explicit `vlan_untagged: true` knob below.
+	VLANTag int `yaml:"vlan_tag" validate:"gte=0,lte=4094"`
+
+	// VLANUntagged forces net0 untagged regardless of the global
+	// default. Needed because a literal 0 on VLANTag is
+	// indistinguishable from "field omitted".
+	VLANUntagged bool `yaml:"vlan_untagged"`
+
+	// MTU sets the net0 MTU. 0 inherits the bridge default
+	// (usually 1500). Useful for storage VLANs running jumbo
+	// frames (9000).
+	MTU int `yaml:"mtu" validate:"gte=0,lte=9216"`
+
+	// ExtraNICs declares additional NICs beyond net0. Each entry
+	// becomes a net1, net2, ... Proxmox config line. Use case
+	// from issue #6: a storage VLAN or a registry-mirror VLAN
+	// the runner needs to reach in addition to the primary
+	// network.
+	ExtraNICs []ProfileNICConfig `yaml:"extra_nics"`
+
+	// IPAM selects the IP allocator for this profile. Nil/omitted
+	// = noop (DHCP via Proxmox cloud-init). See ipam.Backend for
+	// the values.
+	IPAM *ProfileIPAMConfig `yaml:"ipam,omitempty"`
+}
+
+// ProfileNICConfig describes one additional NIC (net1, net2, ...).
+type ProfileNICConfig struct {
+	Bridge       string `yaml:"bridge" validate:"required"`
+	VLANTag      int    `yaml:"vlan_tag" validate:"gte=0,lte=4094"`
+	VLANUntagged bool   `yaml:"vlan_untagged"`
+	MTU          int    `yaml:"mtu" validate:"gte=0,lte=9216"`
+}
+
+// ProfileIPAMConfig selects the IPAM backend for a profile.
+type ProfileIPAMConfig struct {
+	// Backend is "noop" (default; DHCP fallback) or "static"
+	// (in-memory pool fed by Pool). External-IPAM backends
+	// (NetBox, Infoblox, etc.) are out of scope for this iteration
+	// — add them as separate backends behind the same Allocator
+	// interface.
+	Backend string `yaml:"backend" validate:"required,oneof=noop static"`
+
+	// Pool is the list of CIDR-suffixed IPs the `static` backend
+	// hands out. e.g. ["10.0.0.10/24", "10.0.0.11/24"]. Required
+	// for backend=static; ignored for backend=noop.
+	Pool []string `yaml:"pool,omitempty"`
 }
 
 // HotSizeOrDefault returns the effective hot pool size for the
@@ -1013,6 +1080,62 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateNodeAffinity(); err != nil {
 		return err
+	}
+	if err := c.validateProfileNetworks(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateProfileNetworks enforces internal consistency on each
+// profile's optional network block: an IPAM backend of "static"
+// must declare a non-empty pool, and IP entries must parse. The
+// detailed format validation is intentionally lightweight — the
+// orchestrator stamps the value into Proxmox's ipconfig0 field
+// verbatim, so a malformed entry surfaces as a Proxmox API error
+// at clone time. We just catch the obvious "static backend with
+// no pool" case where the operator clearly forgot a field.
+func (c *Config) validateProfileNetworks() error {
+	for i, p := range c.Profiles {
+		if p.Network == nil {
+			continue
+		}
+		// VLAN range checks — the struct-tag validator doesn't
+		// recurse through *ProfileNetworkConfig pointers, so do
+		// it manually.
+		if p.Network.VLANTag < 0 || p.Network.VLANTag > 4094 {
+			return fmt.Errorf("profiles[%d] %q: network.vlan_tag must be in [0, 4094]", i, p.Name)
+		}
+		if p.Network.MTU < 0 || p.Network.MTU > 9216 {
+			return fmt.Errorf("profiles[%d] %q: network.mtu must be in [0, 9216]", i, p.Name)
+		}
+		for j, nic := range p.Network.ExtraNICs {
+			if nic.Bridge == "" {
+				return fmt.Errorf("profiles[%d] %q: network.extra_nics[%d].bridge is required", i, p.Name, j)
+			}
+			if nic.VLANTag < 0 || nic.VLANTag > 4094 {
+				return fmt.Errorf("profiles[%d] %q: network.extra_nics[%d].vlan_tag must be in [0, 4094]", i, p.Name, j)
+			}
+			if nic.MTU < 0 || nic.MTU > 9216 {
+				return fmt.Errorf("profiles[%d] %q: network.extra_nics[%d].mtu must be in [0, 9216]", i, p.Name, j)
+			}
+		}
+		if p.Network.IPAM == nil {
+			continue
+		}
+		ip := p.Network.IPAM
+		switch ip.Backend {
+		case "", "noop":
+			if len(ip.Pool) > 0 {
+				return fmt.Errorf("profiles[%d] %q: ipam.pool must be empty when backend=noop", i, p.Name)
+			}
+		case "static":
+			if len(ip.Pool) == 0 {
+				return fmt.Errorf("profiles[%d] %q: ipam.pool is required when backend=static", i, p.Name)
+			}
+		default:
+			return fmt.Errorf("profiles[%d] %q: ipam.backend %q is not supported (must be one of: noop, static)", i, p.Name, ip.Backend)
+		}
 	}
 	return nil
 }
