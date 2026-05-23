@@ -216,9 +216,9 @@ func Start(t testing.TB, opts Options) *Harness {
 	const adminSecret = "fake-admin-secret"
 	const proxmoxTokenSecret = "fake-proxmox-secret"
 	const ghToken = "ghp_fake"
-	t.Setenv("GITHUB_PAT", ghToken)
-	t.Setenv("PROXMOX_TOKEN_SECRET", proxmoxTokenSecret)
-	t.Setenv("SCALESET_ADMIN_SECRET", adminSecret)
+	t.Setenv("SCALESET_GITHUB_PAT_TOKEN", ghToken)
+	t.Setenv("SCALESET_PROXMOX_AUTH_TOKEN_SECRET", proxmoxTokenSecret)
+	t.Setenv("SCALESET_ADMIN_API_SHARED_SECRET", adminSecret)
 
 	cv := configValues{
 		ProxmoxURL:           proxmox.URL,
@@ -473,7 +473,6 @@ observability:
   log_format: text
 admin_api:
   http_addr: "{{.AdminAddr}}"
-  shared_secret_env: SCALESET_ADMIN_SECRET
 cluster:
   mode: {{if .ClusterMode}}{{.ClusterMode}}{{else}}standalone{{end}}
 {{- if eq .ClusterMode "raft" }}
