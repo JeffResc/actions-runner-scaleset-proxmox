@@ -2288,14 +2288,18 @@ func TestProfiles_PerProfileReconcileClonesOnlyToProfileTarget(t *testing.T) {
 	// for its own hot target. linux-x64 wants 3 hot, gpu wants 1.
 	mgr.reconcileOnce(context.Background())
 
-	require.Eventually(t, func() bool {
-		fp.mu.Lock()
-		defer fp.mu.Unlock()
-		return len(fp.clones) == 4
-	}, 2*time.Second, 10*time.Millisecond, "expected 3 x64 + 1 gpu clone")
+	// kickClone spawns one goroutine per clone and increments mgr.wg
+	// at spawn time. Wait on the wg rather than polling fp.clones
+	// against a wall-clock budget — the latter raced the goroutine
+	// scheduler under -race in CI and flaked at the 2s timeout. A
+	// bounded wait keeps the failsafe but the trigger is goroutine
+	// completion, not elapsed time.
+	require.True(t, waitForWG(&mgr.wg, 10*time.Second),
+		"kickClone goroutines did not complete in 10s")
 
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
+	require.Len(t, fp.clones, 4, "expected 3 x64 + 1 gpu clone")
 	byProfile := map[string]int{}
 	for _, c := range fp.clones {
 		byProfile[c.Profile]++
@@ -2307,6 +2311,25 @@ func TestProfiles_PerProfileReconcileClonesOnlyToProfileTarget(t *testing.T) {
 	}
 	require.Equal(t, 3, byProfile["linux-x64"])
 	require.Equal(t, 1, byProfile["gpu"])
+}
+
+// waitForWG blocks until wg drains or d elapses; returns true if drained.
+// Used to wait deterministically for kickClone / destroyAsync / runBoot
+// goroutines (all of which Add to manager.wg before spawning) instead of
+// polling a fake-state slice against a wall-clock budget that races the
+// goroutine scheduler under -race.
+func waitForWG(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 func TestProfiles_AcquireForProfileScopesByName(t *testing.T) {
