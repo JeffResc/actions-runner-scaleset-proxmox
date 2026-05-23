@@ -218,7 +218,8 @@ func TestRaft_TLSTransport_ElectsLeader(t *testing.T) {
 	}
 
 	// Reserve an ephemeral port for the raft bind.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
@@ -569,7 +570,8 @@ func TestRaft_PersistentStateSurvivesRestart(t *testing.T) {
 	// will re-open it. There's a tiny race here (the port could be
 	// stolen between Close and raft binding) but it's vanishingly
 	// rare on a developer machine and zero-cost on CI.
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	l, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	bindAddr := l.Addr().String()
 	require.NoError(t, l.Close())
@@ -728,7 +730,7 @@ func TestForwarder_RoutesToLeader(t *testing.T) {
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/admin/state", strings.NewReader(`{"q":1}`))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+"/admin/state", strings.NewReader(`{"q":1}`))
 	require.NoError(t, err)
 	// Simulate a hostile client attempting to spoof the source IP via
 	// each of the three commonly-trusted forwarded-for header variants.
@@ -763,7 +765,9 @@ func TestForwarder_NoLeaderReturns503(t *testing.T) {
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/admin/state")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/admin/state", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -779,7 +783,9 @@ func TestForwarder_LeaderUnreachableReturns502(t *testing.T) {
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/admin/state")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/admin/state", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -793,7 +799,9 @@ func TestForwarder_LookupErrorTreatedAsNoLeader(t *testing.T) {
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
@@ -822,7 +830,9 @@ func TestForwarder_TLSDialsHTTPS(t *testing.T) {
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/admin/state")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/admin/state", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -848,7 +858,9 @@ func TestForwarder_TLSRefusesPlainUpstream(t *testing.T) {
 	srv := httptest.NewServer(fwd)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/admin/state")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/admin/state", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusBadGateway, resp.StatusCode,

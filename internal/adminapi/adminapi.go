@@ -270,9 +270,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	}()
 	select {
 	case <-ctx.Done():
+		// Shutdown intentionally uses a fresh context: ctx is already
+		// cancelled, so deriving from it would short-circuit Shutdown
+		// before in-flight handlers finish their drain budget.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		return srv.Shutdown(shutdownCtx) //nolint:contextcheck // see comment above
 	case err := <-errCh:
 		return err
 	}

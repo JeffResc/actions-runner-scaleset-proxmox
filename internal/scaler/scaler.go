@@ -221,7 +221,7 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	// repeated retries against the same VMID accumulate orphan runner
 	// registrations and every subsequent GenerateJitRunnerConfig call
 	// returns 409 "runner already exists", permanently breaking the pool.
-	s.cleanupStaleRunnerByName(vmObj.Name)
+	s.cleanupStaleRunnerByName(vmObj.Name) //nolint:contextcheck // deliberately detached; see function comment
 
 	jitCfg, err := s.gh.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{
 		Name:       vmObj.Name,
@@ -272,7 +272,7 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		s.metrics.RecordProxmoxError("inject_jit", vmObj.Node)
 		// Also deregister the runner we just minted; otherwise the
 		// next clone of this VMID will hit a 409.
-		s.cleanupStaleRunnerByName(vmObj.Name)
+		s.cleanupStaleRunnerByName(vmObj.Name) //nolint:contextcheck // deliberately detached; see function comment
 		if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
 			s.log.Warn("mark completed failed after jit injection error", "vmid", vmObj.VMID, "err", mcErr)
 		}

@@ -161,7 +161,7 @@ func (s *stubProv) Destroy(_ context.Context, v *provisioner.VM) error {
 	return s.destroyErr
 }
 func (s *stubProv) Clone(context.Context, provisioner.CloneOptions) (*provisioner.VM, error) {
-	return nil, nil
+	return nil, nil //nolint:nilnil // test stub: Clone is unused in reconciler tests
 }
 func (s *stubProv) Start(context.Context, *provisioner.VM) error                    { return nil }
 func (s *stubProv) Stop(context.Context, *provisioner.VM) error                     { return nil }

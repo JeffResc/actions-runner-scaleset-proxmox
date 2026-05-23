@@ -256,7 +256,7 @@ func (s *Store) DeleteAndReturn(vmid int) (*VM, error) {
 		return nil, fmt.Errorf("store: delete-and-return: lookup %d: %w", vmid, err)
 	}
 	if existing == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil // documented "double-delete is a no-op" contract
 	}
 	row := existing.(*VM)
 	if err := txn.Delete(tableVM, existing); err != nil {

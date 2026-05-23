@@ -113,13 +113,9 @@ func (s *Server) handleDestroyVMTest(w http.ResponseWriter, r *http.Request, vmi
 		http.Error(w, "missing vmid", http.StatusBadRequest)
 		return
 	}
-	// reuse parsing logic by delegating to the production handler with
-	// the URL path-param injected.
-	r2 := r.Clone(r.Context())
-	r2.URL.Path = "/admin/destroy/" + vmidStr
 	// chi looks up params from the request context; without a chi router
 	// it returns "". Test instead exercises the destruction shortcut.
-	s.testDestroy(r2.Context(), w, vmidStr)
+	s.testDestroy(r.Context(), w, vmidStr)
 }
 
 func (s *Server) testDestroy(ctx context.Context, w http.ResponseWriter, vmidStr string) {
@@ -161,13 +157,13 @@ func TestRequireBearerToken_RejectsMissingAndWrong(t *testing.T) {
 
 	// No header.
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 
 	// Wrong token.
 	w = httptest.NewRecorder()
-	r = httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "Bearer wrong")
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
@@ -183,7 +179,7 @@ func TestRequireBearerToken_RejectsRawSecretWithoutScheme(t *testing.T) {
 	h := mountHandler(s)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "topsecret") // no "Bearer " prefix
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
@@ -200,13 +196,13 @@ func TestRequireBearerToken_RefusesEmptyConfiguredSecret(t *testing.T) {
 
 	// Empty Authorization.
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 
 	// "Bearer " with empty token.
 	w = httptest.NewRecorder()
-	r = httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "Bearer ")
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
@@ -218,7 +214,7 @@ func TestState_ReturnsPoolStats(t *testing.T) {
 	h := mountHandler(s)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	h.ServeHTTP(w, r)
 
@@ -293,7 +289,7 @@ func TestLeaderGate_NonLeaderForwardsBeforeAuth(t *testing.T) {
 	// No Authorization header — a leader would 401, but the standby
 	// forwards before the token check runs.
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("X-Forwarded-For", "203.0.113.42")
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusTeapot, w.Code,
@@ -326,7 +322,7 @@ func TestLeaderGate_LeaderServesLocally(t *testing.T) {
 	h := chiHandler(s)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusOK, w.Code)
@@ -349,7 +345,7 @@ func TestLeaderGate_LeaderWithoutPoolReturns503(t *testing.T) {
 	h := chiHandler(s)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusServiceUnavailable, w.Code)
@@ -368,7 +364,7 @@ func TestAuth_RateLimitsBadTokens(t *testing.T) {
 	var seen401, seen429 int
 	for range 50 {
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 		r.Header.Set("Authorization", "Bearer wrong")
 		r.RemoteAddr = "1.2.3.4:5678"
 		h.ServeHTTP(w, r)
@@ -394,14 +390,14 @@ func TestAuth_GoodTokenNotMetered(t *testing.T) {
 	// Exhaust the bucket with bad tokens from a known IP.
 	for range 30 {
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 		r.Header.Set("Authorization", "Bearer wrong")
 		r.RemoteAddr = "5.6.7.8:1234"
 		h.ServeHTTP(w, r)
 	}
 	// Now hit with the correct bearer from the same IP: must succeed.
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	r.RemoteAddr = "5.6.7.8:1234"
 	h.ServeHTTP(w, r)
@@ -420,7 +416,7 @@ func TestHandleDestroyVM_UsesForceDestroyForHotRow(t *testing.T) {
 	h := chiHandler(s)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/admin/destroy/10042", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/destroy/10042", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusAccepted, w.Code)
@@ -438,7 +434,7 @@ func TestDestroyVM_QueuesAndReturns202(t *testing.T) {
 	h := chiHandler(s)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/admin/destroy/10042", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/destroy/10042", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	h.ServeHTTP(w, r)
 	require.Equal(t, http.StatusAccepted, w.Code)
@@ -462,7 +458,7 @@ func TestDrain_TriggersCallback(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/admin/drain", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/drain", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	s.handleDrain(w, r)
 	require.Equal(t, http.StatusAccepted, w.Code)
@@ -477,7 +473,7 @@ func TestDrain_TriggersCallback(t *testing.T) {
 func TestDrain_NoCallbackReturns501(t *testing.T) {
 	s, _ := newTestServer(t, "topsecret")
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/admin/drain", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/drain", nil)
 	r.Header.Set("Authorization", "Bearer topsecret")
 	s.handleDrain(w, r)
 	require.Equal(t, http.StatusNotImplemented, w.Code)
@@ -522,7 +518,7 @@ func TestRealIP_IgnoresHeadersFromUntrustedPeer(t *testing.T) {
 		seenRemote = r.RemoteAddr
 	}))
 
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.RemoteAddr = "203.0.113.50:5555" // untrusted peer
 	r.Header.Set("X-Forwarded-For", "1.2.3.4")
 	r.Header.Set("X-Real-IP", "5.6.7.8")
@@ -545,7 +541,7 @@ func TestRealIP_HonorsHeadersFromTrustedPeer(t *testing.T) {
 		seenRemote = r.RemoteAddr
 	}))
 
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.RemoteAddr = "127.0.0.1:5555" // trusted loopback
 	r.Header.Set("X-Forwarded-For", "203.0.113.10")
 	h.ServeHTTP(httptest.NewRecorder(), r)
@@ -566,7 +562,7 @@ func TestRealIP_XFFPrecedence(t *testing.T) {
 		seenRemote = r.RemoteAddr
 	}))
 
-	r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	r.RemoteAddr = "127.0.0.1:5555"
 	r.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.1")
 	r.Header.Set("X-Real-IP", "203.0.113.11")
@@ -594,7 +590,8 @@ func TestServe_TLS_RoundTripsBearer(t *testing.T) {
 
 	// Reserve an ephemeral port: Serve binds to cfg.HTTPAddr, so we
 	// resolve a free port first.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
@@ -623,7 +620,7 @@ func TestServe_TLS_RoundTripsBearer(t *testing.T) {
 	url := "https://" + addr + "/admin/state"
 	var resp *http.Response
 	require.Eventually(t, func() bool {
-		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		req.Header.Set("Authorization", "Bearer topsecret")
 		r, err := client.Do(req)
 		if err != nil {
@@ -691,7 +688,7 @@ func TestAuth_RateLimit_CannotBeSpoofedViaXFF(t *testing.T) {
 	var seen401, seen429 int
 	for i := range 50 {
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodGet, "/admin/state", nil)
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 		r.Header.Set("Authorization", "Bearer wrong")
 		r.RemoteAddr = "203.0.113.99:5555" // single attacker IP
 		// Try to spoof a different "origin" per request.

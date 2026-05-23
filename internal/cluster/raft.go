@@ -563,9 +563,14 @@ func (s *tlsStreamLayer) Addr() net.Addr { return s.advertise }
 // Dial opens an outbound TLS connection. The timeout caps the whole
 // TCP + TLS handshake budget — without it a hung peer would block
 // raft's call for the OS-level connect timeout (~75s).
+//
+// raft.StreamLayer.Dial is context-free, so we synthesize one from the
+// timeout for the modern tls.Dialer.DialContext path.
 func (s *tlsStreamLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
-	d := &net.Dialer{Timeout: timeout}
-	return tls.DialWithDialer(d, "tcp", string(address), s.tlsCfg)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	d := tls.Dialer{NetDialer: &net.Dialer{}, Config: s.tlsCfg}
+	return d.DialContext(ctx, "tcp", string(address))
 }
 
 // slogHclog implements hclog.Logger by dispatching to slog at the
