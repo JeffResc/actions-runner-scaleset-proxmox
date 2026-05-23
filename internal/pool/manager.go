@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/canary"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/ipam"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
@@ -101,6 +102,12 @@ type Config struct {
 	// fields above so existing single-profile callers (and tests)
 	// continue to work unchanged.
 	Profiles []ProfileSettings
+
+	// Canary, when non-nil, drives the canary template selection
+	// for new clones and tracks boot failures by template class.
+	// Nil = every clone uses the profile's TemplateVMID (no
+	// canary).
+	Canary *canary.Controller
 
 	// PowerPollInterval is the cadence at which the manager polls
 	// Proxmox for the power state of Assigned/Running VMs. When a row's
@@ -1538,11 +1545,26 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		*vmidRef = vmid
 	}
 	name := fmt.Sprintf("%s%d", m.cfg.VMNamePrefix, vmid)
+	// Canary template selection. Pre-computed before the row
+	// Insert so the Template field is set in one atomic write —
+	// avoiding a second Update between Insert and Clone that
+	// could race with reconcile-loop accounting.
+	templateVMID := ps.settings.TemplateVMID
+	templateClass := string(canary.Stable)
+	if m.cfg.Canary != nil {
+		if pr, perr := m.cfg.Canary.Pick(profileName, vmid); perr == nil {
+			if pr.TemplateVMID > 0 {
+				templateVMID = pr.TemplateVMID
+			}
+			templateClass = string(pr.Template)
+		}
+	}
 	row := &store.VM{
 		VMID:     vmid,
 		Node:     node,
 		Name:     name,
 		Profile:  profileName,
+		Template: templateClass,
 		PoolKind: kind,
 		State:    store.StateProvisioning,
 	}
@@ -1590,19 +1612,20 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 
 	cloneStart := time.Now()
 	pv, err := m.prov.Clone(ctx, provisioner.CloneOptions{
-		NewVMID:      vmid,
-		Node:         node,
-		Name:         name,
-		Linked:       m.cfg.LinkedClones,
-		PoweredOn:    poweredOn,
-		Profile:      profileName,
-		TemplateVMID: ps.settings.TemplateVMID,
-		CPUCores:     ps.settings.CPUCores,
-		MemoryMB:     ps.settings.MemoryMB,
-		DiskGB:       ps.settings.DiskGB,
-		Storage:      ps.settings.Storage,
-		NICs:         ps.settings.NICs,
-		IPConfig:     ipConfig,
+		NewVMID:       vmid,
+		Node:          node,
+		Name:          name,
+		Linked:        m.cfg.LinkedClones,
+		PoweredOn:     poweredOn,
+		Profile:       profileName,
+		TemplateVMID:  templateVMID,
+		TemplateClass: templateClass,
+		CPUCores:      ps.settings.CPUCores,
+		MemoryMB:      ps.settings.MemoryMB,
+		DiskGB:        ps.settings.DiskGB,
+		Storage:       ps.settings.Storage,
+		NICs:          ps.settings.NICs,
+		IPConfig:      ipConfig,
 	})
 	if err != nil {
 		span.RecordError(err)
@@ -1624,6 +1647,12 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	if m.metrics != nil {
 		m.metrics.CloneDuration.WithLabelValues(profileName, fmt.Sprintf("%t", m.cfg.LinkedClones), node).Observe(time.Since(cloneStart).Seconds())
 		m.metrics.VMsTotal.WithLabelValues(profileName, "clone-success").Inc()
+	}
+	// Feed the canary controller's clone counter (only the
+	// candidate class actually counts; the controller ignores
+	// stable for failure-rate purposes).
+	if m.cfg.Canary != nil {
+		m.cfg.Canary.RecordClone(profileName, canary.Template(templateClass))
 	}
 
 	// Transition row to warm (if not powered on) or booting (if powered on).
@@ -1712,6 +1741,20 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 	if err != nil {
 		m.log.Warn("poison: inc attempts failed", "vmid", row.VMID, "err", err)
 		return
+	}
+	// Feed the canary controller's failure counter — only fires
+	// when Template was stamped as "candidate" at clone time.
+	// When the cumulative rate trips the operator's threshold the
+	// controller returns true and we emit the
+	// scaleset_canary_reverted_total counter.
+	if m.cfg.Canary != nil && row.Template != "" {
+		if reverted := m.cfg.Canary.RecordFailure(row.Profile, canary.Template(row.Template)); reverted {
+			m.log.Warn("canary: auto-reverted percent to 0; investigate canary template",
+				"profile", row.Profile, "vmid", row.VMID)
+			if m.metrics != nil {
+				m.metrics.CanaryReverts.WithLabelValues(row.Profile).Inc()
+			}
+		}
 	}
 	threshold := m.cfg.BootMaxAttempts
 	if ps := m.profileOf(row.Profile); ps != nil {

@@ -33,6 +33,21 @@ const (
 	// has not declared an explicit `profiles:` block. Keeps the
 	// single-profile config shape working unchanged.
 	DefaultProfile = "default"
+
+	// templatePrefix is followed by "stable" or "candidate" so
+	// crash recovery can attribute boot failures to the right
+	// template-version bucket (issue #5). VMs cloned before the
+	// canary controller landed have no template tag; consumers
+	// treat that as TemplateStable.
+	templatePrefix = "gh-scaleset-template-"
+
+	// TemplateStable is the template-class value for clones that
+	// used the current production template.
+	TemplateStable = "stable"
+
+	// TemplateCandidate is the template-class value for clones
+	// that used the staging template during a canary rollout.
+	TemplateCandidate = "candidate"
 )
 
 // scaleSetNameRE is what we accept for an unsanitized scale set name.
@@ -63,13 +78,48 @@ func ProfileTag(profileName string) string {
 // Initial returns the canonical initial tag set for a newly-created VM.
 // The slice is sorted so it produces a stable on-the-wire representation.
 // profileName is the runner profile the VM was cloned for; an empty name
-// is treated as DefaultProfile.
-func Initial(scaleSetName, profileName string) ([]string, error) {
+// is treated as DefaultProfile. templateClass is "stable" or "candidate"
+// for canary attribution — empty is also treated as "stable" so callers
+// that don't run a canary controller skip the cost.
+func Initial(scaleSetName, profileName, templateClass string) ([]string, error) {
 	owner, err := OwnerTag(scaleSetName)
 	if err != nil {
 		return nil, err
 	}
-	return []string{Marker, owner, ProfileTag(profileName)}, nil
+	if templateClass == "" {
+		templateClass = TemplateStable
+	}
+	out := make([]string, 0, 4)
+	out = append(out, Marker, owner, ProfileTag(profileName), TemplateTag(templateClass))
+	return out, nil
+}
+
+// TemplateTag returns the template-class tag string. Empty class
+// defaults to TemplateStable so the no-canary code path doesn't
+// special-case the empty value.
+func TemplateTag(class string) string {
+	if class == "" {
+		class = TemplateStable
+	}
+	return templatePrefix + sanitize(class)
+}
+
+// TemplateOf returns the template class encoded in a VM's wire tag
+// string, or TemplateStable when no template tag is present
+// (covers VMs cloned before canary tagging was introduced — they
+// were all on the only template that existed).
+func TemplateOf(wireTags string) string {
+	for _, t := range Decode(wireTags) {
+		class, ok := strings.CutPrefix(t, templatePrefix)
+		if !ok {
+			continue
+		}
+		if class == "" {
+			return TemplateStable
+		}
+		return class
+	}
+	return TemplateStable
 }
 
 // ProfileOf returns the profile name encoded in a VM's wire tag string,

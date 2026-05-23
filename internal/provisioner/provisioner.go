@@ -101,6 +101,12 @@ type CloneOptions struct {
 	DiskGB       int
 	Storage      string
 
+	// TemplateClass is "stable" or "candidate" — stamped onto
+	// the VM's Proxmox tag for canary attribution. Empty
+	// defaults to "stable" via tags.Initial so callers without
+	// a canary controller pay nothing.
+	TemplateClass string
+
 	// NICs, when non-empty, sets the cloned VM's network
 	// interfaces post-clone (net0 is the first entry, net1 the
 	// second, ...). Nil leaves the template's NICs in place. The
@@ -549,7 +555,7 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	// tag-apply atomic with the resource override — otherwise an
 	// orchestrator crash between the two leaves the VM with our owner
 	// tag but the template's default resources.
-	initial, err := tags.Initial(p.scaleSetName, opts.Profile)
+	initial, err := tags.Initial(p.scaleSetName, opts.Profile, opts.TemplateClass)
 	if err != nil {
 		return nil, fmt.Errorf("compute initial tags: %w", err)
 	}

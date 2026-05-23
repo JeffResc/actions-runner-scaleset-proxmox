@@ -28,6 +28,10 @@ Job-to-profile routing is _best-match by labels_: a profile satisfies a job when
 
 Each profile can declare its own `network:` block to override `proxmox.network` defaults — useful for putting GPU runners on VLAN 30, untrusted-PR runners on VLAN 99, or build-cache runners on a separate storage VLAN. Multi-NIC setups are supported via `extra_nics: [...]`. An optional `ipam:` selector picks the IP allocator: `noop` (default; DHCP via Proxmox cloud-init) or `static` (in-memory pool fed by `ipam.pool: [...]`). External IPAM backends (NetBox, Infoblox, phpIPAM, etc.) plug in behind the same `ipam.Allocator` interface — none ship in-tree yet because they need a live IPAM to verify. The pool manager calls `Allocate` before each clone and `Release` on destroy so allocations don't leak across recycles.
 
+## Template canary rollouts
+
+Each profile can stage a new template image via `canary_template_vmid` + `canary_percent`: ~N% of new clones use the candidate template, the rest stay on the stable `template_vmid`. The dice is deterministic (hash of the allocated VMID), so retries of the same VMID always pick the same template — the orchestrator never accidentally rolls back to stable mid-clone. Boot failures on canary VMs feed a cumulative failure-rate counter; once the rate exceeds `canary_max_failure_rate` (with at least a small statistical sample) the orchestrator auto-reverts `canary_percent` to 0 in-process and increments `scaleset_canary_reverted_total{profile}`. Operators investigate before re-enabling. When confident in the candidate, `POST /admin/template/promote/{profile}` atomically swaps it into the stable slot. Both the auto-revert and the promotion are **in-process only** — to persist across a restart, also update `template_vmid` in the YAML.
+
 ## Multi-tenancy: quotas + priority
 
 Optional `quotas:` and `priority:` blocks cap concurrent VMs per org or per repo, and classify jobs into priority lanes for visibility. Both are **observational today** — the `actions/scaleset` listener interface surfaces per-job metadata (`OwnerName`, `RepositoryName`, `RequestLabels`, `JobWorkflowRef`) only AFTER GitHub has paired a job with a VM, so at-acquire-time admission control needs a deeper listener-integration extension (deferred to a future PR). What ships today:
@@ -73,6 +77,7 @@ Optional escape-hatch HTTP API enabled by setting `admin_api.http_addr` and `adm
 | `GET` | `/admin/state` | Current pool stats (counts per lifecycle state) |
 | `POST` | `/admin/drain` | Trigger a graceful drain (bounded by `pool.drain_timeout`) |
 | `POST` | `/admin/preempt/{vmid}` | Preempt an Assigned VM (refuses Running; 409 when not preempt-eligible) |
+| `POST` | `/admin/template/promote/{profile}` | Atomically swap a profile's canary candidate template into stable (409 when no candidate; 503 during leader transition) |
 | `POST` | `/admin/destroy/{vmid}` | Force-destroy a specific VM regardless of its state |
 
 In Kubernetes multi-replica deployments the admin API is bound on every replica. Non-leader replicas reverse-proxy requests to the leader (whose endpoint is published in a Lease annotation), so callers don't need to know which pod holds the lease.

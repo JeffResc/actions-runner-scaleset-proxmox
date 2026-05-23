@@ -63,26 +63,53 @@ func TestIsOwnedBy(t *testing.T) {
 func TestInitial(t *testing.T) {
 	t.Parallel()
 
-	t.Run("empty profile maps to default", func(t *testing.T) {
+	t.Run("empty profile + empty template default to defaults", func(t *testing.T) {
 		t.Parallel()
-		got, err := tags.Initial("proxmox-ubuntu", "")
+		got, err := tags.Initial("proxmox-ubuntu", "", "")
 		require.NoError(t, err)
 		require.Equal(t, []string{
 			tags.Marker,
 			"gh-scaleset-owner-proxmox-ubuntu",
 			"gh-scaleset-profile-default",
+			"gh-scaleset-template-stable",
 		}, got)
 	})
 
 	t.Run("named profile is sanitized", func(t *testing.T) {
 		t.Parallel()
-		got, err := tags.Initial("proxmox-ubuntu", "Linux.GPU")
+		got, err := tags.Initial("proxmox-ubuntu", "Linux.GPU", "candidate")
 		require.NoError(t, err)
 		require.Equal(t, []string{
 			tags.Marker,
 			"gh-scaleset-owner-proxmox-ubuntu",
 			"gh-scaleset-profile-linux-gpu",
+			"gh-scaleset-template-candidate",
 		}, got)
+	})
+}
+
+func TestTemplateTag(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "gh-scaleset-template-stable", tags.TemplateTag(""))
+	require.Equal(t, "gh-scaleset-template-stable", tags.TemplateTag("stable"))
+	require.Equal(t, "gh-scaleset-template-candidate", tags.TemplateTag("candidate"))
+}
+
+func TestTemplateOf(t *testing.T) {
+	t.Parallel()
+	owner, err := tags.OwnerTag("scaleset-1")
+	require.NoError(t, err)
+
+	t.Run("encoded template returned verbatim", func(t *testing.T) {
+		t.Parallel()
+		wire := tags.Encode([]string{tags.Marker, owner, tags.TemplateTag(tags.TemplateCandidate)})
+		require.Equal(t, "candidate", tags.TemplateOf(wire))
+	})
+
+	t.Run("missing template tag falls back to stable", func(t *testing.T) {
+		t.Parallel()
+		wire := tags.Encode([]string{tags.Marker, owner})
+		require.Equal(t, tags.TemplateStable, tags.TemplateOf(wire))
 	})
 }
 

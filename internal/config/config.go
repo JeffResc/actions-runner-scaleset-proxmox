@@ -418,6 +418,26 @@ type ProfileConfig struct {
 	// inherit the global network unchanged + use the noop IPAM
 	// allocator (cloud-init falls back to DHCP).
 	Network *ProfileNetworkConfig `yaml:"network,omitempty"`
+
+	// CanaryTemplateVMID, when > 0, declares a staging template
+	// for this profile. CanaryPercent% of new clones use it; the
+	// rest use TemplateVMID (the stable template). Boot failures
+	// on canary clones feed a running failure rate; when the
+	// rate exceeds CanaryMaxFailureRate the orchestrator
+	// auto-reverts CanaryPercent to 0 in-process and emits
+	// scaleset_canary_reverted_total. Operators investigate
+	// before re-enabling. See internal/canary for the matching
+	// semantics.
+	CanaryTemplateVMID int `yaml:"canary_template_vmid"`
+
+	// CanaryPercent is the operator's requested canary share,
+	// 0-100. Defaults to 0 (canary disabled).
+	CanaryPercent int `yaml:"canary_percent" validate:"gte=0,lte=100"`
+
+	// CanaryMaxFailureRate is the canary-only failure ratio at
+	// which the auto-revert fires. 0.0 disables the auto-revert
+	// (operator opts for manual control). Range [0.0, 1.0].
+	CanaryMaxFailureRate float64 `yaml:"canary_max_failure_rate" validate:"gte=0,lte=1"`
 }
 
 // ProfileNetworkConfig overrides the global Proxmox network for
@@ -1084,6 +1104,9 @@ func (c *Config) Validate() error {
 	if err := c.validateProfileNetworks(); err != nil {
 		return err
 	}
+	if err := c.validateProfileCanaries(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1135,6 +1158,28 @@ func (c *Config) validateProfileNetworks() error {
 			}
 		default:
 			return fmt.Errorf("profiles[%d] %q: ipam.backend %q is not supported (must be one of: noop, static)", i, p.Name, ip.Backend)
+		}
+	}
+	return nil
+}
+
+// validateProfileCanaries catches the canonical canary
+// misconfigurations:
+//   - canary_percent > 0 with no canary_template_vmid (the
+//     orchestrator would always pick stable, masking the operator's
+//     intent).
+//   - canary_max_failure_rate > 0 with no candidate (the
+//     auto-revert path can never fire — operator probably meant
+//     to set canary_template_vmid too).
+func (c *Config) validateProfileCanaries() error {
+	for i, p := range c.Profiles {
+		if p.CanaryTemplateVMID == 0 {
+			if p.CanaryPercent > 0 {
+				return fmt.Errorf("profiles[%d] %q: canary_percent > 0 requires canary_template_vmid", i, p.Name)
+			}
+			if p.CanaryMaxFailureRate > 0 {
+				return fmt.Errorf("profiles[%d] %q: canary_max_failure_rate > 0 requires canary_template_vmid", i, p.Name)
+			}
 		}
 	}
 	return nil
