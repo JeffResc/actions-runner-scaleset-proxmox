@@ -180,16 +180,15 @@ func TestPAT_NewRESTClient_HitsBaseURL(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	a, err := githubauth.NewPAT("ghp_secret123")
+	a, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:       "ghp_secret123",
+		RESTBaseURL: srv.URL + "/",
+	})
 	require.NoError(t, err)
 
 	obs := &fakeObserver{}
 	cli, err := a.NewRESTClient(context.Background(), githubauth.WithRateLimitMetrics(obs))
 	require.NoError(t, err)
-
-	base, err := cli.BaseURL.Parse(srv.URL + "/")
-	require.NoError(t, err)
-	cli.BaseURL = base
 
 	_, _, err = cli.Actions.ListRunners(context.Background(), "octocat", "repo", nil)
 	require.NoError(t, err)
@@ -249,7 +248,7 @@ func TestPAT_RESTBaseURLOverride(t *testing.T) {
 
 	cli, err := a.NewRESTClient(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, srv.URL+"/", cli.BaseURL.String())
+	require.Equal(t, srv.URL+"/", cli.BaseURL())
 
 	_, _, err = cli.Actions.ListRunners(context.Background(), "octocat", "repo", nil)
 	require.NoError(t, err)

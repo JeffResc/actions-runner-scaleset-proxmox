@@ -16,7 +16,7 @@ import (
 
 	"github.com/actions/scaleset"
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/google/go-github/v84/github"
+	"github.com/google/go-github/v88/github"
 )
 
 // Scope identifies the GitHub registration target. Exactly one of Org or
@@ -159,13 +159,21 @@ func (p *patAuth) NewScaleSetClient(
 
 func (p *patAuth) NewRESTClient(_ context.Context, transportWraps ...TransportWrap) (*github.Client, error) {
 	httpClient := &http.Client{Transport: applyWraps(http.DefaultTransport, transportWraps)}
-	cli := github.NewClient(httpClient).WithAuthToken(p.token)
+	opts := []github.ClientOptionsFunc{
+		github.WithHTTPClient(httpClient),
+		github.WithAuthToken(p.token),
+	}
 	if p.restBaseURL != "" {
-		base, err := url.Parse(p.restBaseURL)
-		if err != nil {
-			return nil, fmt.Errorf("githubauth: rest base url %q: %w", p.restBaseURL, err)
-		}
-		cli.BaseURL = base
+		// go-github v88 dropped direct BaseURL assignment. Use WithURLs
+		// (raw) rather than WithEnterpriseURLs — the latter silently
+		// appends /api/v3/ and /api/uploads/ to non-".api."/non-"api."
+		// hosts, which corrupts loopback and proxy URLs used in tests.
+		base := p.restBaseURL
+		opts = append(opts, github.WithURLs(&base, &base))
+	}
+	cli, err := github.NewClient(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("githubauth: build rest client: %w", err)
 	}
 	return cli, nil
 }
@@ -269,7 +277,11 @@ func (a *appAuth) NewRESTClient(_ context.Context, transportWraps ...TransportWr
 		return nil, fmt.Errorf("githubauth: app installation transport: %w", err)
 	}
 	httpClient := &http.Client{Transport: applyWraps(itr, transportWraps)}
-	return github.NewClient(httpClient), nil
+	cli, err := github.NewClient(github.WithHTTPClient(httpClient))
+	if err != nil {
+		return nil, fmt.Errorf("githubauth: build app rest client: %w", err)
+	}
+	return cli, nil
 }
 
 // ---------------------------------------------------------------------------
