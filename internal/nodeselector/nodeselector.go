@@ -33,8 +33,26 @@ import (
 // Hint lets callers influence the selection without coupling each
 // implementation to specifics. Avoid lists nodes that must not be
 // returned (e.g. the source node when migrating).
+//
+// Profile and ExistingVMs feed the affinity wrapper (issue #8):
+// Profile is the runner profile the new clone belongs to, used to
+// look up the matching affinity rule; ExistingVMs is the snapshot
+// of currently-tracked VMs (excluding the row about to be created)
+// used to compute anti-affinity exclusions. Both are optional —
+// the underlying single / round_robin / least_loaded selectors
+// ignore them.
 type Hint struct {
-	Avoid []string
+	Avoid       []string
+	Profile     string
+	ExistingVMs []ExistingVM
+}
+
+// ExistingVM is the affinity wrapper's projection of a tracked VM
+// row. Only the fields anti-affinity actually consults are
+// reproduced — the wrapper stays decoupled from the store package.
+type ExistingVM struct {
+	Node    string
+	Profile string
 }
 
 // Selector picks a node name for a new VM.
@@ -242,4 +260,189 @@ func (l *leastLoaded) scores(ctx context.Context) (map[string]float64, error) {
 		return nil, err
 	}
 	return maps.Clone(v.(map[string]float64)), nil
+}
+
+// ---------------------------------------------------------------------------
+// Affinity wrapper (issue #8)
+// ---------------------------------------------------------------------------
+
+// AffinityRule pins or excludes nodes for a given runner profile.
+// Rules are matched in declaration order; the first rule whose
+// Match.Profile equals the hint's Profile applies.
+type AffinityRule struct {
+	// Match selects which jobs this rule applies to. Empty Profile
+	// matches anything (a default rule).
+	Match AffinitySelector
+
+	// PreferNodes, when non-empty, restricts candidate nodes to
+	// this list. With Require=true the wrapper fails the clone
+	// when no preferred node is eligible; with Require=false the
+	// wrapper falls back to the full eligible set.
+	PreferNodes []string
+
+	// Require turns PreferNodes into a hard pin. Operators set
+	// this for use cases like "GPU profile MUST land on a
+	// GPU-equipped node — failing the clone is correct if none
+	// are available, the alternative is silently running GPU jobs
+	// on CPU-only hardware".
+	Require bool
+
+	// AntiAffinityWith excludes nodes that already host a tracked
+	// VM whose attributes match this selector. Use case from the
+	// issue: untrusted-PR runners must NEVER co-schedule with
+	// prod runners on the same node.
+	AntiAffinityWith AffinitySelector
+}
+
+// AffinitySelector is the projection on which a rule matches jobs
+// (Match) or existing VMs (AntiAffinityWith). Today only Profile is
+// supported; the type is left as a struct so future selectors
+// (repo / org once the listener-integration extension lands) can
+// be added without breaking the rule list shape.
+type AffinitySelector struct {
+	Profile string
+}
+
+// affinityWrapper composes affinity-based filtering over an
+// underlying selector. The wrapper computes the eligible candidate
+// set, communicates the inverse via Hint.Avoid, and delegates the
+// final pick to the underlying selector — so existing strategies
+// (single / round_robin / least_loaded) keep all their semantics
+// (rotation, load balancing) within the eligible set.
+type affinityWrapper struct {
+	underlying Selector
+	rules      []AffinityRule
+	allNodes   []string // operator-declared node universe (NodesConfig.Members or [SingleNode])
+}
+
+// NewAffinity returns a Selector that applies the operator's
+// affinity rules before delegating to the underlying selector. An
+// empty rules slice returns the underlying selector unchanged so
+// the affinity wrapper is zero-cost when not configured.
+func NewAffinity(underlying Selector, rules []AffinityRule, allNodes []string) (Selector, error) {
+	if underlying == nil {
+		return nil, errors.New("nodeselector: affinity requires a non-nil underlying selector")
+	}
+	if len(rules) == 0 {
+		return underlying, nil
+	}
+	if len(allNodes) == 0 {
+		return nil, errors.New("nodeselector: affinity requires the operator node universe to compute eligibility")
+	}
+	cp := make([]string, len(allNodes))
+	copy(cp, allNodes)
+	return &affinityWrapper{
+		underlying: underlying,
+		rules:      append([]AffinityRule(nil), rules...),
+		allNodes:   cp,
+	}, nil
+}
+
+// ErrAffinityRequireUnsatisfiable is returned by Select when an
+// AffinityRule with Require=true matches the hint but no preferred
+// node is eligible (every preferred node is either in the avoid
+// list or hosts an anti-affinity violator). Distinct from the
+// underlying selector's "no eligible nodes" so callers / metrics
+// can distinguish "hard-pin couldn't be satisfied" from "load
+// balancer ran out of nodes for some other reason".
+var ErrAffinityRequireUnsatisfiable = errors.New("nodeselector: affinity require=true unsatisfiable")
+
+func (a *affinityWrapper) Select(ctx context.Context, hint Hint) (string, error) {
+	rule := a.matchingRule(hint.Profile)
+	if rule == nil {
+		// No matching rule — pass through unchanged.
+		return a.underlying.Select(ctx, hint)
+	}
+
+	// Compute anti-affinity exclusions: nodes hosting a tracked
+	// VM whose Profile matches AntiAffinityWith.Profile.
+	excluded := make(map[string]struct{})
+	if rule.AntiAffinityWith.Profile != "" {
+		for _, vm := range hint.ExistingVMs {
+			if vm.Profile == rule.AntiAffinityWith.Profile {
+				excluded[vm.Node] = struct{}{}
+			}
+		}
+	}
+
+	// Build the eligible set. Without prefer_nodes, eligibility
+	// is the full node universe minus anti-affinity exclusions
+	// minus the caller's pre-existing Avoid.
+	preExistingAvoid := make(map[string]struct{}, len(hint.Avoid))
+	for _, n := range hint.Avoid {
+		preExistingAvoid[n] = struct{}{}
+	}
+
+	eligible := make(map[string]struct{})
+	if len(rule.PreferNodes) > 0 {
+		// prefer_nodes scopes the candidate set.
+		for _, n := range rule.PreferNodes {
+			if _, ex := excluded[n]; ex {
+				continue
+			}
+			if _, av := preExistingAvoid[n]; av {
+				continue
+			}
+			eligible[n] = struct{}{}
+		}
+	} else {
+		// No prefer_nodes — eligibility is the full universe
+		// minus exclusions.
+		for _, n := range a.allNodes {
+			if _, ex := excluded[n]; ex {
+				continue
+			}
+			if _, av := preExistingAvoid[n]; av {
+				continue
+			}
+			eligible[n] = struct{}{}
+		}
+	}
+
+	if len(eligible) == 0 {
+		if rule.Require {
+			return "", fmt.Errorf("%w: profile %q has no eligible preferred node (anti_affinity_with=%q removed %d, avoid=%d)",
+				ErrAffinityRequireUnsatisfiable, hint.Profile, rule.AntiAffinityWith.Profile, len(excluded), len(hint.Avoid))
+		}
+		// Soft pin: fall back to the full universe minus
+		// exclusions and Avoid.
+		for _, n := range a.allNodes {
+			if _, ex := excluded[n]; ex {
+				continue
+			}
+			if _, av := preExistingAvoid[n]; av {
+				continue
+			}
+			eligible[n] = struct{}{}
+		}
+		if len(eligible) == 0 {
+			return "", errors.New("nodeselector: affinity rules left no eligible node")
+		}
+	}
+
+	// Translate eligibility into the existing Hint.Avoid surface so
+	// the underlying selector retains its rotation / load
+	// semantics within the eligible set.
+	newAvoid := append([]string(nil), hint.Avoid...)
+	for _, n := range a.allNodes {
+		if _, ok := eligible[n]; !ok {
+			newAvoid = append(newAvoid, n)
+		}
+	}
+	newHint := hint
+	newHint.Avoid = newAvoid
+	return a.underlying.Select(ctx, newHint)
+}
+
+// matchingRule returns the first rule whose Match.Profile equals
+// profile, or nil when no rule matches. An empty Match.Profile is
+// treated as a wildcard so operators can declare a catch-all rule.
+func (a *affinityWrapper) matchingRule(profile string) *AffinityRule {
+	for i := range a.rules {
+		r := &a.rules[i]
+		if r.Match.Profile == "" || r.Match.Profile == profile {
+			return r
+		}
+	}
+	return nil
 }

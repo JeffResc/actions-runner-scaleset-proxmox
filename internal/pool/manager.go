@@ -721,6 +721,27 @@ func (m *manager) Preempt(_ context.Context, vmid int, reason string) error {
 // ListRows returns a snapshot of every non-terminal VM row for the
 // GitHub reconciler. Terminal rows (Draining, Destroying) are excluded
 // because the reconciler shouldn't second-guess in-flight destruction.
+// snapshotExistingVMsForAffinity returns the live VM rows projected
+// down to the (Node, Profile) tuples the nodeselector's affinity
+// wrapper needs. Excludes terminal states (Draining, Destroying):
+// a row on its way out shouldn't keep its node off the candidate
+// list for an anti-affinity rule. Errors are swallowed — the
+// affinity wrapper degrades to "no exclusions" if the store
+// momentarily misbehaves, which is preferable to failing every
+// clone over a transient list error.
+func (m *manager) snapshotExistingVMsForAffinity() []nodeselector.ExistingVM {
+	rows, err := m.store.ListExcludingStates(store.StateDraining, store.StateDestroying)
+	if err != nil {
+		m.log.Warn("affinity: snapshot list failed; selector will see empty existing set", "err", err)
+		return nil
+	}
+	out := make([]nodeselector.ExistingVM, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, nodeselector.ExistingVM{Node: r.Node, Profile: r.Profile})
+	}
+	return out
+}
+
 func (m *manager) ListRows(_ context.Context) ([]RowSnapshot, error) {
 	rows, err := m.store.ListExcludingStates(store.StateDraining, store.StateDestroying)
 	if err != nil {
@@ -1424,10 +1445,18 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	))
 	defer span.End()
 
-	hint := nodeselector.Hint{}
+	// Build the Hint with profile + existing-row context so the
+	// affinity wrapper (issue #8) can apply prefer_nodes /
+	// anti_affinity_with rules. The non-affinity selectors ignore
+	// these fields; the snapshot is small (bounded by
+	// MaxConcurrentRunners) so building it on every clone is cheap.
+	hint := nodeselector.Hint{
+		Profile:     profileName,
+		ExistingVMs: m.snapshotExistingVMsForAffinity(),
+	}
 	node, err := m.sel.Select(ctx, hint)
 	if err != nil {
-		m.log.Warn("clone: node selection failed", "err", err)
+		m.log.Warn("clone: node selection failed", "profile", profileName, "err", err)
 		return
 	}
 	if m.cfg.LinkedClones {

@@ -598,8 +598,22 @@ func buildAdminGate(cfg *config.Config, coord cluster.Coordinator, tlsClient *tl
 }
 
 // buildNodeSelector translates config into a Selector. Pass the
-// provisioner so least_loaded can borrow its Proxmox client.
+// provisioner so least_loaded can borrow its Proxmox client. When
+// nodes.affinity rules are declared, the underlying strategy is
+// wrapped in nodeselector.NewAffinity so prefer_nodes /
+// anti_affinity_with rules apply before rotation / load balancing.
 func buildNodeSelector(cfg *config.Config, prov provisioner.Provisioner) (nodeselector.Selector, error) {
+	underlying, err := buildUnderlyingSelector(cfg, prov)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.Nodes.Affinity) == 0 {
+		return underlying, nil
+	}
+	return nodeselector.NewAffinity(underlying, affinityRulesFromConfig(cfg), affinityNodeUniverse(cfg))
+}
+
+func buildUnderlyingSelector(cfg *config.Config, prov provisioner.Provisioner) (nodeselector.Selector, error) {
 	switch cfg.Nodes.Strategy {
 	case "single":
 		return nodeselector.NewSingle(cfg.Nodes.SingleNode)
@@ -609,6 +623,32 @@ func buildNodeSelector(cfg *config.Config, prov provisioner.Provisioner) (nodese
 		return nodeselector.NewLeastLoaded(prov.Client(), cfg.Nodes.Members, 30*time.Second)
 	}
 	return nil, fmt.Errorf("unknown nodes.strategy %q", cfg.Nodes.Strategy)
+}
+
+// affinityRulesFromConfig projects YAML-level rules into the
+// nodeselector shape.
+func affinityRulesFromConfig(cfg *config.Config) []nodeselector.AffinityRule {
+	out := make([]nodeselector.AffinityRule, 0, len(cfg.Nodes.Affinity))
+	for _, r := range cfg.Nodes.Affinity {
+		out = append(out, nodeselector.AffinityRule{
+			Match:            nodeselector.AffinitySelector{Profile: r.Match.Profile},
+			PreferNodes:      append([]string(nil), r.PreferNodes...),
+			Require:          r.Require,
+			AntiAffinityWith: nodeselector.AffinitySelector{Profile: r.AntiAffinityWith.Profile},
+		})
+	}
+	return out
+}
+
+// affinityNodeUniverse returns the operator-declared node list the
+// affinity wrapper uses to compute "eligible = universe minus
+// exclusions". Single-node deployments collapse to a one-element
+// slice.
+func affinityNodeUniverse(cfg *config.Config) []string {
+	if cfg.Nodes.Strategy == "single" {
+		return []string{cfg.Nodes.SingleNode}
+	}
+	return cfg.Nodes.Members
 }
 
 // buildGitHubAuth translates config into a githubauth.Auth. When

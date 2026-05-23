@@ -66,6 +66,26 @@ nodes:
   members: [pve1, pve2, pve3]     # ignored for "single"
   single_node: pve1               # only used when strategy = single
 
+  # Optional profile-keyed placement rules. Each rule is evaluated
+  # against the cloning row's profile in declaration order; the
+  # first match wins. An empty match.profile is a wildcard.
+  # Validation rejects rules referencing undeclared profiles or
+  # nodes — typos fail at load time, not silently at runtime.
+  #
+  # prefer_nodes restricts candidate nodes; require=true makes that
+  # a hard pin (clone fails with ErrAffinityRequireUnsatisfiable
+  # when no preferred node is eligible). anti_affinity_with
+  # excludes nodes already hosting a tracked VM with the matching
+  # profile. Both filters apply BEFORE the underlying strategy
+  # rotates / load-balances among the surviving nodes.
+  #
+  # affinity:
+  #   - match: { profile: gpu }
+  #     prefer_nodes: [pve-gpu-1, pve-gpu-2]
+  #     require: true             # hard pin — clone fails if neither has capacity
+  #   - match: { profile: untrusted-pr }
+  #     anti_affinity_with: { profile: prod }
+
 pool:
   hot_size: 2                     # always-booted idle runners (default; profiles can override)
   warm_size: 3                    # pre-cloned, powered-off runners (default; profiles can override)

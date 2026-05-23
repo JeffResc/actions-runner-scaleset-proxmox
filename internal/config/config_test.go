@@ -1122,6 +1122,117 @@ priority:
 	require.Contains(t, err.Error(), "duplicate")
 }
 
+// ---------------------------------------------------------------------------
+// Node affinity (PR 6 — issue #8)
+// ---------------------------------------------------------------------------
+
+func TestNodeAffinity_ParsedFromYAML(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	withAffinity := validProfileYAML + `
+nodes:
+  strategy: round_robin
+  members: [pve1, pve2, pve-gpu-1]
+  affinity:
+    - match: { profile: gpu }
+      prefer_nodes: [pve-gpu-1]
+      require: true
+    - match: { profile: linux-x64 }
+      anti_affinity_with: { profile: gpu }
+`
+	// validProfileYAML already sets nodes.strategy: single — strip
+	// it so the appended block doesn't duplicate the key.
+	withAffinity = strings.Replace(withAffinity,
+		"nodes:\n  strategy: single\n  single_node: pve1\n",
+		"", 1)
+	cfg, err := config.Parse([]byte(withAffinity))
+	require.NoError(t, err)
+	require.Len(t, cfg.Nodes.Affinity, 2)
+
+	gpu := cfg.Nodes.Affinity[0]
+	require.Equal(t, "gpu", gpu.Match.Profile)
+	require.Equal(t, []string{"pve-gpu-1"}, gpu.PreferNodes)
+	require.True(t, gpu.Require)
+
+	x64 := cfg.Nodes.Affinity[1]
+	require.Equal(t, "linux-x64", x64.Match.Profile)
+	require.Equal(t, "gpu", x64.AntiAffinityWith.Profile)
+}
+
+func TestNodeAffinity_RejectsUnknownProfileInMatch(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := validPATYAML + `
+nodes:
+  strategy: round_robin
+  members: [pve1]
+  affinity:
+    - match: { profile: not-a-real-profile }
+      prefer_nodes: [pve1]
+      require: true
+`
+	bad = strings.Replace(bad, "nodes:\n  strategy: single\n  single_node: pve1\n", "", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not-a-real-profile")
+	require.Contains(t, err.Error(), "not a declared profile")
+}
+
+func TestNodeAffinity_RejectsUnknownNodeInPreferNodes(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	// Use validProfileYAML so "gpu" is a declared profile, then
+	// reference a node that isn't in members.
+	bad := validProfileYAML + `
+nodes:
+  strategy: round_robin
+  members: [pve1, pve2]
+  affinity:
+    - match: { profile: gpu }
+      prefer_nodes: [pve-nonexistent]
+      require: true
+`
+	bad = strings.Replace(bad, "nodes:\n  strategy: single\n  single_node: pve1\n", "", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "pve-nonexistent")
+}
+
+func TestNodeAffinity_RequireTrueWithoutPreferNodesRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := validProfileYAML + `
+nodes:
+  strategy: round_robin
+  members: [pve1, pve2]
+  affinity:
+    - match: { profile: gpu }
+      require: true
+`
+	bad = strings.Replace(bad, "nodes:\n  strategy: single\n  single_node: pve1\n", "", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "require=true is only meaningful with prefer_nodes")
+}
+
+func TestNodeAffinity_EmptyAffinityIsValid(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	// Pre-PR-6 configs (no affinity block) must keep loading.
+	_, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+}
+
 // writeSelfSignedKeypair generates a fresh self-signed cert + key on
 // disk and returns their paths. The cert is valid for "localhost" only
 // — enough for our admin-API tests, which dial loopback.
