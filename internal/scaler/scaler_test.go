@@ -9,11 +9,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/actions/scaleset"
 	"github.com/luthermonson/go-proxmox"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
 )
 
 func TestVMIDFromRunnerName(t *testing.T) {
@@ -357,4 +362,106 @@ func TestHandleDesiredRunnerCount_BusyRaceClampsViaMaxBusy(t *testing.T) {
 	delivered, err = s.HandleDesiredRunnerCount(context.Background(), 3)
 	require.NoError(t, err)
 	require.Equal(t, 0, delivered, "desired already satisfied; no further acquires")
+}
+
+// ---------------------------------------------------------------------------
+// Routing observability (PR 2 — issue #7)
+// ---------------------------------------------------------------------------
+
+// scalerWithRouter wires a Scaler + metrics + router so the routing
+// tests can assert on counter increments. The fakePool is unused by
+// HandleJobStarted apart from MarkRunning, which we don't care about
+// here.
+func scalerWithRouter(t *testing.T, profiles []router.Profile) (*Scaler, *observability.Metrics) {
+	t.Helper()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	r, err := router.New(profiles)
+	require.NoError(t, err)
+	s.SetRouter(r)
+	return s, metrics
+}
+
+// counterValue reads the current value of a CounterVec sample with
+// the given label values. Returns 0 when no matching sample exists.
+// Wraps prometheus/testutil so the routing tests don't have to deal
+// with the dto.Metric protobuf surface.
+func counterValue(t *testing.T, cv *prometheus.CounterVec, labelValues ...string) float64 {
+	t.Helper()
+	return testutil.ToFloat64(cv.WithLabelValues(labelValues...))
+}
+
+func TestHandleJobStarted_RoutedJobDoesNotIncrementUnrouted(t *testing.T) {
+	t.Parallel()
+	s, metrics := scalerWithRouter(t, []router.Profile{
+		{Name: "linux-x64", Labels: []string{"self-hosted", "linux", "x64"}},
+	})
+
+	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			RequestLabels: []string{"self-hosted", "linux", "x64"},
+		},
+		RunnerName: "gh-runner-test-10042",
+		RunnerID:   42,
+	})
+	require.NoError(t, err)
+
+	// Joined label key the recorder would have used IF this were a miss.
+	require.Equal(t, 0.0,
+		counterValue(t, metrics.UnroutedJobs, "linux|self-hosted|x64"),
+		"a matched job must not increment unrouted_jobs_total")
+}
+
+func TestHandleJobStarted_UnroutedJobIncrementsCounter(t *testing.T) {
+	t.Parallel()
+	s, metrics := scalerWithRouter(t, []router.Profile{
+		{Name: "linux-x64", Labels: []string{"self-hosted", "linux", "x64"}},
+	})
+
+	// Job requests `windows` — no profile satisfies it.
+	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			RequestLabels: []string{"self-hosted", "windows"},
+		},
+		RunnerName: "gh-runner-test-10043",
+		RunnerID:   43,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, 1.0,
+		counterValue(t, metrics.UnroutedJobs, "self-hosted|windows"),
+		"unrouted job must increment scaleset_unrouted_jobs_total with sorted|joined labels")
+}
+
+func TestHandleJobStarted_NoRouterAttachedIsNoop(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	// No SetRouter call — routing is disabled.
+
+	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			RequestLabels: []string{"never", "matches"},
+		},
+		RunnerName: "gh-runner-test-10044",
+		RunnerID:   44,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0.0,
+		counterValue(t, metrics.UnroutedJobs, "matches|never"),
+		"nil router must NOT touch the unrouted counter")
+}
+
+func TestJoinLabelsForMetric_StableAcrossOrdering(t *testing.T) {
+	t.Parallel()
+	// Same logical label set in different orders MUST hash to the
+	// same Prometheus label value — otherwise repeated occurrences
+	// land in different series and bloat cardinality.
+	a := joinLabelsForMetric([]string{"self-hosted", "linux", "x64"})
+	b := joinLabelsForMetric([]string{"x64", "self-hosted", "linux"})
+	require.Equal(t, a, b)
+	require.Equal(t, "linux|self-hosted|x64", a)
+	require.Equal(t, "", joinLabelsForMetric(nil))
 }

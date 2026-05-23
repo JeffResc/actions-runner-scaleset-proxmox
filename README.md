@@ -22,6 +22,8 @@ Proxmox node placement is pluggable via `nodes.strategy`: **`single`** (always t
 
 A scale set can declare one or more **profiles** — named bundles of `{labels, template VMID, CPU / memory / disk shape, hot/warm/max sizing}`. Each profile gets its own reconcile loop and pool state; VMs are tagged with their profile name so crash recovery routes them back into the right pool on restart. Configs without a `profiles:` block keep working unchanged — the orchestrator synthesises a single `default` profile from the global `pool:` / `scaleset:` blocks. See `profiles:` in [config.example.yaml](config.example.yaml) for the full schema. Prometheus metrics are partitioned by `profile=` so dashboards can slice by hardware shape.
 
+Job-to-profile routing is _best-match by labels_: a profile satisfies a job when its labels are a superset of the job's `RequestLabels`, and the profile with the smallest extra-label count wins (ties resolve by declaration order). When no profile satisfies a job, `scaleset_unrouted_jobs_total{labels="..."}` increments so operators can spot the coverage gap. Config validation rejects scale sets whose declared labels aren't collectively covered by some profile — that misconfiguration is caught at load time rather than per-job at runtime.
+
 ## Components
 
 | Package | Purpose |

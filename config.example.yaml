@@ -117,9 +117,17 @@ pool:
 # leave them off entirely to inherit the global pool / scaleset
 # default.
 #
+# Label routing: when JobStarted fires, the scaler picks the profile
+# whose labels are the smallest superset of the job's RequestLabels
+# (ties resolve by declaration order). Unrouted jobs increment
+# scaleset_unrouted_jobs_total{labels="..."}. Config validation
+# rejects scale sets whose declared labels aren't collectively
+# covered by some profile, so a missing label is a load-time error
+# rather than a per-job runtime miss.
+#
 # profiles:
 #   - name: linux-x64
-#     labels: [self-hosted, linux, x64]
+#     labels: [self-hosted, linux, proxmox, x64]
 #     template_vmid: 9000           # optional override of the global proxmox.template_vmid
 #     cpu: 4                        # cores; 0 inherits the template default
 #     memory_mb: 8192               # 0 inherits the template default
@@ -131,7 +139,7 @@ pool:
 #     boot_max_attempts: 3
 #     vm_max_age: 12h               # per-profile recycle window
 #   - name: gpu
-#     labels: [self-hosted, linux, gpu]
+#     labels: [self-hosted, linux, proxmox, gpu]
 #     template_vmid: 9100
 #     cpu: 8
 #     memory_mb: 32768
