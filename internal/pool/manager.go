@@ -890,31 +890,32 @@ func (m *manager) promoteN(_ context.Context, n int) {
 		warms = warms[:n]
 	}
 	for _, w := range warms {
-		// CAS warm -> booting; if lost, skip.
+		// Reserve the boot-concurrency slot BEFORE flipping the row to
+		// Booting. TryAcquire is non-blocking so promoteN (called from
+		// reconcileOnce) doesn't stall the whole reconcile pass when the
+		// semaphore is saturated. If we can't reserve, leave the row at
+		// Warm — the next reconcile tick will retry. Previously the
+		// acquire was inside the goroutine and on cancellation we
+		// rolled the CAS back, which left a brief window where the row
+		// was visibly Booting (and PoolKindHot) and counted toward
+		// Available — under-provisioning by one for that tick.
+		if !m.bootSem.TryAcquire(1) {
+			m.log.Debug("promote: bootSem saturated, deferring to next tick", "vmid", w.VMID)
+			continue
+		}
+		// CAS warm -> booting; if lost, release the slot we just took.
 		ok, err := m.store.UpdateState(w.VMID, store.StateWarm, store.StateBooting, func(v *store.VM) {
 			v.PoolKind = store.PoolKindHot // promoted to hot budget
 		})
 		if err != nil || !ok {
+			m.bootSem.Release(1)
 			continue
 		}
 		row := w
-		// Bound concurrent boots via bootSem — Acquire inside the
-		// goroutine so promoteN (called from reconcileOnce) doesn't
-		// stall the whole reconcile pass under a burst.
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
 			defer func() { m.logRecoveredPanic("promote", row.VMID, recover()) }()
-			if err := m.bootSem.Acquire(m.workerCtx, 1); err != nil {
-				m.log.Debug("promote: cancelled before sem acquired", "vmid", row.VMID, "err", err)
-				// Roll the CAS back so the next pass can try again.
-				if _, rbErr := m.store.UpdateState(row.VMID, store.StateBooting, store.StateWarm, func(v *store.VM) {
-					v.PoolKind = store.PoolKindWarm
-				}); rbErr != nil {
-					m.log.Warn("promote: cas rollback failed", "vmid", row.VMID, "err", rbErr)
-				}
-				return
-			}
 			defer m.bootSem.Release(1)
 			m.runBoot(row)
 		}()

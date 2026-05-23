@@ -276,6 +276,20 @@ func seedHot(t *testing.T, st *store.Store, count int) {
 	}
 }
 
+func seedWarm(t *testing.T, st *store.Store, count int) {
+	t.Helper()
+	for i := range count {
+		err := st.Insert(&store.VM{
+			VMID:     30000 + i,
+			Node:     "pve1",
+			Name:     "seed-warm",
+			PoolKind: store.PoolKindWarm,
+			State:    store.StateWarm,
+		})
+		require.NoError(t, err)
+	}
+}
+
 // ---------- Tests ----------
 
 func TestAcquire_PromotesHotToAssigned(t *testing.T) {
@@ -549,6 +563,37 @@ func TestForceDestroy_ConcurrentCallsDedupe(t *testing.T) {
 	defer fp.mu.Unlock()
 	require.Equal(t, 1, len(fp.destroys),
 		"ForceDestroy must dedupe concurrent callers via CAS; saw %d destroys", len(fp.destroys))
+}
+
+// TestPromoteN_SaturatedBootSemLeavesRowsWarm locks in the #68 fix:
+// when bootSem is fully reserved, promoteN must leave Warm rows alone
+// instead of CAS'ing them to Booting and then rolling back. The old
+// behavior briefly flipped rows to (Booting, PoolKindHot) — which the
+// reconciler counts as Available — and rolled them back in a goroutine,
+// under-provisioning by one for the racing tick.
+func TestPromoteN_SaturatedBootSemLeavesRowsWarm(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedWarm(t, st, 3)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 3})
+
+	// Pre-saturate bootSem (capacity 16) so TryAcquire fails for every
+	// candidate. Real semaphore.Weighted, real reservation — no mock.
+	require.True(t, mgr.bootSem.TryAcquire(16),
+		"test setup: must be able to drain the entire bootSem budget")
+	defer mgr.bootSem.Release(16)
+
+	mgr.promoteN(context.Background(), 3)
+
+	// No goroutines were spawned, so nothing to wait for.
+	for vmid := 30000; vmid < 30003; vmid++ {
+		row, err := st.Get(vmid)
+		require.NoError(t, err)
+		require.Equal(t, store.StateWarm, row.State,
+			"vmid %d must remain Warm when bootSem is saturated", vmid)
+		require.Equal(t, store.PoolKindWarm, row.PoolKind,
+			"vmid %d must remain PoolKindWarm (not transiently Hot)", vmid)
+	}
 }
 
 // TestListRows_ExcludesTerminal: the reconciler must not waste a GH API
