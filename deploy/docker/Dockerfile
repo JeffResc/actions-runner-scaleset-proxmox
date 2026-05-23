@@ -3,7 +3,14 @@
 # ---------- builder ----------
 FROM golang:1.26.3-alpine AS builder
 WORKDIR /src
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache ca-certificates
+
+# VERSION is stamped into the binary via -ldflags. Production CI passes
+# the release tag; local builds should pass
+# `--build-arg VERSION=$(git describe --tags --always)` for a meaningful
+# `scaleset version` output. Defaults to "dev" so a plain `docker build`
+# still produces a runnable image.
+ARG VERSION=dev
 
 # Cache go modules.
 COPY go.mod go.sum ./
@@ -14,7 +21,7 @@ COPY . .
 # held in-process via hashicorp/go-memdb (pure Go); no on-disk DB driver
 # is involved. Static binary keeps the distroless runtime image minimal.
 ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w -X main.version=$(git describe --tags --always 2>/dev/null || echo dev)" \
+RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
     -o /out/scaleset ./cmd/scaleset
 
 # ---------- runtime ----------
