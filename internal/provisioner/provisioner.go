@@ -374,8 +374,10 @@ func (p *pmox) Client() *proxmox.Client { return p.cli }
 // IsRecentlyDestroyed returns true iff a qmdestroy for vmid completed
 // within the cooldown window. The caller-supplied cooldown is checked
 // against the entry's insertion timestamp; this is distinct from the
-// cache TTL, which is a longer memory-ceiling. Entries that fall past
-// cooldown are evicted eagerly so the cache reflects ground truth.
+// cache TTL, which is a longer memory-ceiling. Entries are
+// checked-and-evicted on access — an entry past its cooldown is
+// removed the next time the same VMID is looked up — so the cache is
+// lazily cleared but always returns ground truth on read.
 func (p *pmox) IsRecentlyDestroyed(vmid int, cooldown time.Duration) bool {
 	item := p.recentlyDestroyed.Get(vmid)
 	if item == nil {
@@ -870,36 +872,71 @@ func (p *pmox) getVM(ctx context.Context, vm *VM) (*proxmox.VirtualMachine, erro
 	return pVM, nil
 }
 
+// errorClassifier inspects err and returns a wrapped form with our
+// typed sentinel when it recognises the underlying go-proxmox / HTTP
+// pattern. The bool reports recognition; on false the dispatcher moves
+// on to the next classifier. Splitting the detection layers (typed
+// errors → HTTP status → body text) into independent classifiers
+// makes each one testable in isolation and keeps the priority order
+// explicit at the table site below.
+type errorClassifier func(err error) (ok bool, wrapped error)
+
+// classifyTypedError catches the library-supplied sentinels (the most
+// stable detection layer).
+func classifyTypedError(err error) (bool, error) {
+	if errors.Is(err, proxmox.ErrNotFound) {
+		return true, fmt.Errorf("%w: %w", ErrVMNotFound, err)
+	}
+	return false, nil
+}
+
+// classifyByHTTPStatus matches the HTTP status code embedded in the
+// canonical "NNN Status Text" error format the library uses for
+// unhandled 5xx responses (proxmox.go handleResponse).
+func classifyByHTTPStatus(err error) (bool, error) {
+	if httpStatusFromError(err) == http.StatusNotFound {
+		return true, fmt.Errorf("%w: %w", ErrVMNotFound, err)
+	}
+	return false, nil
+}
+
+// classifyByMessage falls back to substring matches on the error body.
+// Least preferred — kept because Proxmox returns 500s with the real
+// failure encoded in the body and go-proxmox passes the body through.
+func classifyByMessage(err error) (bool, error) {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "does not exist"):
+		return true, fmt.Errorf("%w: %w", ErrVMNotFound, err)
+	case strings.Contains(s, "already running"):
+		return true, fmt.Errorf("%w: %w", ErrVMAlreadyRunning, err)
+	}
+	return false, nil
+}
+
+// proxmoxErrorClassifiers is the ordered list of detection strategies.
+// classifyProxmoxError walks the list and returns the first hit; the
+// order encodes the priority documented on each classifier. Add a new
+// detection layer by inserting a new entry — no rewrite of the
+// dispatcher required.
+var proxmoxErrorClassifiers = []errorClassifier{
+	classifyTypedError,
+	classifyByHTTPStatus,
+	classifyByMessage,
+}
+
 // classifyProxmoxError wraps err with our typed sentinels when the
 // underlying go-proxmox / HTTP error matches a known operational
-// condition. Detection priority:
-//
-//  1. Library-typed sentinels (proxmox.ErrNotFound, ErrNotAuthorized,
-//     ErrTimeout) — the most stable layer.
-//  2. HTTP status codes parsed from the standard "%d Status Text"
-//     format the library uses for unhandled 5xx (proxmox.go handleResponse).
-//  3. Response-body text patterns ("does not exist", "already running")
-//     — least preferred, but kept because Proxmox returns 500s with the
-//     real failure in the body and the library passes the body through.
-//
-// The function returns the (possibly wrapped) error unchanged when no
-// known pattern matches — callers still see the original.
+// condition. Returns the original error unchanged when no classifier
+// recognises it — callers still see the original.
 func classifyProxmoxError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, proxmox.ErrNotFound) {
-		return fmt.Errorf("%w: %w", ErrVMNotFound, err)
-	}
-	if httpStatusFromError(err) == http.StatusNotFound {
-		return fmt.Errorf("%w: %w", ErrVMNotFound, err)
-	}
-	s := err.Error()
-	switch {
-	case strings.Contains(s, "does not exist"):
-		return fmt.Errorf("%w: %w", ErrVMNotFound, err)
-	case strings.Contains(s, "already running"):
-		return fmt.Errorf("%w: %w", ErrVMAlreadyRunning, err)
+	for _, c := range proxmoxErrorClassifiers {
+		if ok, wrapped := c(err); ok {
+			return wrapped
+		}
 	}
 	return err
 }

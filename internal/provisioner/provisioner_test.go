@@ -403,6 +403,52 @@ func TestClassifyProxmoxError(t *testing.T) {
 	}
 }
 
+// TestClassifiers_Isolated exercises each detection strategy on its
+// own so a regression in one layer surfaces independently from the
+// others. The full-pipeline coverage stays in TestClassifyProxmoxError.
+func TestClassifiers_Isolated(t *testing.T) {
+	t.Parallel()
+	t.Run("typed sentinel hit", func(t *testing.T) {
+		t.Parallel()
+		ok, got := classifyTypedError(proxmox.ErrNotFound)
+		require.True(t, ok)
+		require.ErrorIs(t, got, ErrVMNotFound)
+	})
+	t.Run("typed sentinel miss leaves error untouched", func(t *testing.T) {
+		t.Parallel()
+		ok, _ := classifyTypedError(&stringError{"404 Not Found"})
+		require.False(t, ok, "typed classifier must not recognise stringly-typed errors")
+	})
+	t.Run("http status hit", func(t *testing.T) {
+		t.Parallel()
+		ok, got := classifyByHTTPStatus(&stringError{"404 Not Found"})
+		require.True(t, ok)
+		require.ErrorIs(t, got, ErrVMNotFound)
+	})
+	t.Run("http status non-404 miss", func(t *testing.T) {
+		t.Parallel()
+		ok, _ := classifyByHTTPStatus(&stringError{"500 Internal Server Error"})
+		require.False(t, ok)
+	})
+	t.Run("body text hit (not-found)", func(t *testing.T) {
+		t.Parallel()
+		ok, got := classifyByMessage(&stringError{"vm config does not exist"})
+		require.True(t, ok)
+		require.ErrorIs(t, got, ErrVMNotFound)
+	})
+	t.Run("body text hit (already-running)", func(t *testing.T) {
+		t.Parallel()
+		ok, got := classifyByMessage(&stringError{"VM 10042 already running"})
+		require.True(t, ok)
+		require.ErrorIs(t, got, ErrVMAlreadyRunning)
+	})
+	t.Run("body text miss", func(t *testing.T) {
+		t.Parallel()
+		ok, _ := classifyByMessage(&stringError{"something else entirely"})
+		require.False(t, ok)
+	})
+}
+
 // TestHttpStatusFromError exercises the leading-NNN parser used as a
 // fallback detection layer.
 func TestHttpStatusFromError(t *testing.T) {
