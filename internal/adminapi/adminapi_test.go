@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -10,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -577,6 +579,89 @@ func TestDrain_TriggersCallback(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("drain callback was never invoked")
 	}
+}
+
+// errOnWriteResponseWriter is a minimal http.ResponseWriter that
+// captures the status and returns an error on every Write. Used by
+// the post-header-write-failure tests below to simulate a client
+// disconnect or broken-pipe mid-body.
+type errOnWriteResponseWriter struct {
+	header http.Header
+	code   int
+	werr   error
+}
+
+func newErrOnWriteResponseWriter(werr error) *errOnWriteResponseWriter {
+	return &errOnWriteResponseWriter{header: http.Header{}, werr: werr}
+}
+func (e *errOnWriteResponseWriter) Header() http.Header { return e.header }
+func (e *errOnWriteResponseWriter) Write([]byte) (int, error) {
+	return 0, e.werr
+}
+func (e *errOnWriteResponseWriter) WriteHeader(code int) { e.code = code }
+
+// TestHandleDrain_PostHeaderWriteFailureLogsWarn pins that a body-
+// write failure on the state-changing /admin/drain endpoint is
+// logged at Warn (not Debug) so the line survives production log
+// levels. The operator's tooling shows "no response" while a drain
+// IS in flight — Debug would have made the only signal of that
+// invisible.
+func TestHandleDrain_PostHeaderWriteFailureLogsWarn(t *testing.T) {
+	t.Parallel()
+	var logBuf bytes.Buffer
+	fp := &fakePool{}
+	s, err := New(
+		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
+		func() pool.Manager { return fp },
+		nil,
+		AlwaysLeader{},
+		func() {},
+		slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	)
+	require.NoError(t, err)
+
+	w := newErrOnWriteResponseWriter(errors.New("broken pipe"))
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/drain", nil)
+	r.RemoteAddr = "203.0.113.42:54321"
+	s.handleDrain(w, r)
+	require.Equal(t, http.StatusAccepted, w.code)
+
+	out := logBuf.String()
+	require.Contains(t, out, "level=WARN")
+	require.Contains(t, out, "admin drain: response write failed")
+	require.Contains(t, out, "remote_addr=203.0.113.42:54321")
+}
+
+// TestHandleDestroyVM_PostHeaderWriteFailureLogsWarn is the same
+// shape as the drain test for the other state-changing endpoint.
+func TestHandleDestroyVM_PostHeaderWriteFailureLogsWarn(t *testing.T) {
+	t.Parallel()
+	var logBuf bytes.Buffer
+	fp := &fakePool{}
+	s, err := New(
+		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
+		func() pool.Manager { return fp },
+		nil,
+		AlwaysLeader{},
+		nil,
+		slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	)
+	require.NoError(t, err)
+
+	w := newErrOnWriteResponseWriter(errors.New("broken pipe"))
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/destroy/10042", nil)
+	r.RemoteAddr = "203.0.113.42:54321"
+	// Route via chi so URLParam("vmid") resolves.
+	router := chi.NewRouter()
+	router.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
+	router.ServeHTTP(w, r)
+	require.Equal(t, http.StatusAccepted, w.code)
+
+	out := logBuf.String()
+	require.Contains(t, out, "level=WARN")
+	require.Contains(t, out, "admin destroy: response write failed")
+	require.Contains(t, out, "vmid=10042")
+	require.Contains(t, out, "remote_addr=203.0.113.42:54321")
 }
 
 func TestDrain_NoCallbackReturns501(t *testing.T) {
