@@ -366,6 +366,14 @@ type ClusterRaftConfig struct {
 	ElectionTimeout  string `yaml:"election_timeout"`  // default 1s
 	CommitTimeout    string `yaml:"commit_timeout"`    // default 50ms
 
+	// TLS, when set, enables a TLS stream layer on the raft TCP
+	// transport so peer-to-peer raft RPCs (AppendEntries, etc.) are
+	// encrypted. Set CAFile to enable mTLS — each peer presents its
+	// own cert and verifies the other against the bundle. Without
+	// TLS the raft transport is plain TCP — only safe on a private
+	// network operators trust end-to-end.
+	TLS *TLSConfig `yaml:"tls"`
+
 	// Resolved durations (populated by Resolve).
 	HeartbeatTimeoutD time.Duration `yaml:"-"`
 	ElectionTimeoutD  time.Duration `yaml:"-"`
@@ -696,6 +704,11 @@ func (c *Config) Validate() error {
 	}
 	if c.AdminAPI.TLS != nil {
 		if err := c.AdminAPI.TLS.validate("admin_api.tls"); err != nil {
+			return err
+		}
+	}
+	if c.Cluster.Raft.TLS != nil {
+		if err := c.Cluster.Raft.TLS.validate("cluster.raft.tls"); err != nil {
 			return err
 		}
 	}
