@@ -513,6 +513,45 @@ func TestDestroyVM_QueuesAndReturns202(t *testing.T) {
 	require.Contains(t, fp.forceDestroyed, 10042)
 }
 
+// TestHandleDestroyVM_RejectsBadVMID locks in the parse/bounds branch
+// of handleDestroyVM: non-numeric, zero, negative, and overflow VMID
+// path segments must all return 400 without ever reaching ForceDestroy.
+// Previously the rejection branch was untested (#137); this is the
+// admin escape-hatch endpoint and a silent regression would forward a
+// nonsense vmid into the pool layer.
+func TestHandleDestroyVM_RejectsBadVMID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"non-numeric", "/admin/destroy/abc"},
+		{"zero", "/admin/destroy/0"},
+		{"negative", "/admin/destroy/-1"},
+		{"overflow", "/admin/destroy/9999999999999999999"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, fp := newTestServer(t, "topsecret")
+			h := chiHandler(s)
+
+			w := httptest.NewRecorder()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, nil)
+			r.Header.Set("Authorization", "Bearer topsecret")
+			h.ServeHTTP(w, r)
+
+			require.Equal(t, http.StatusBadRequest, w.Code)
+			require.Contains(t, w.Body.String(), "invalid vmid")
+
+			fp.mu.Lock()
+			defer fp.mu.Unlock()
+			require.Empty(t, fp.forceDestroyed,
+				"bad-vmid request must NOT reach ForceDestroy")
+		})
+	}
+}
+
 func TestDrain_TriggersCallback(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{}
