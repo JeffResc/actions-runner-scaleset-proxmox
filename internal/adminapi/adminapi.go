@@ -414,8 +414,21 @@ func (s *Server) leaderOrForward(next http.Handler) http.Handler {
 // metered — operators with the correct secret pass straight through.
 func (s *Server) requireBearerToken(next http.Handler) http.Handler {
 	const scheme = "Bearer "
+	// Refuse to mount the middleware against an empty secret. Serve()
+	// already rejects this at startup, but a future caller (someone
+	// splitting requireBearerToken to share with a non-admin path,
+	// for example) could bypass that gate. Returning a 503-only
+	// handler here means the dangerous precomputed sha256("") is
+	// never bound to the closure and a misconfigured deployment fails
+	// loudly on every request instead of silently accepting an empty
+	// bearer token via ConstantTimeCompare(sha256(""), sha256("")) = 1.
+	if s.cfg.SharedSecret == "" {
+		s.log.Error("admin: requireBearerToken constructed against empty secret; refusing all requests")
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "admin api misconfigured: empty shared secret", http.StatusServiceUnavailable)
+		})
+	}
 	wantHash := sha256.Sum256([]byte(s.cfg.SharedSecret))
-	secretEmpty := s.cfg.SharedSecret == ""
 	denyUnauthorized := func(w http.ResponseWriter, r *http.Request) {
 		// Apply the rate limiter only on the failure path so a valid
 		// token from the same IP isn't throttled by prior typos.
@@ -429,13 +442,6 @@ func (s *Server) requireBearerToken(next http.Handler) http.Handler {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Defense in depth: refuse to authenticate against an empty
-		// configured secret even if Serve's startup check is bypassed
-		// by a future caller — ConstantTimeCompare("","") returns 1.
-		if secretEmpty {
-			denyUnauthorized(w, r)
-			return
-		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, scheme) {
 			denyUnauthorized(w, r)

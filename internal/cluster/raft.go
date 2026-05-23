@@ -18,6 +18,8 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
 )
 
 // RaftConfig configures the embedded-raft coordinator.
@@ -166,6 +168,9 @@ func newRaftStores(persistent bool, dataDir string, log *slog.Logger) (raft.LogS
 	if !persistent {
 		return raft.NewInmemStore(), raft.NewInmemStore(), raft.NewInmemSnapshotStore(), func() {}, nil
 	}
+	if err := validateDataDir(dataDir); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	snapDir := filepath.Join(dataDir, "snapshots")
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("cluster: create raft snapshot dir %s: %w", snapDir, err)
@@ -196,6 +201,42 @@ func newRaftStores(persistent bool, dataDir string, log *slog.Logger) (raft.LogS
 		}
 	}
 	return logStore, stableStore, snapStore, closer, nil
+}
+
+// validateDataDir enforces that the raft data directory exists with
+// strict perms and is owned by the orchestrator's user. Raft's
+// authority over leader election, FSM state, and peer membership all
+// flows through logs.bolt / stable.bolt / snapshots in this directory;
+// a world-writable or other-user-owned data_dir lets a local attacker
+// forge cluster state.
+//
+// First-run behavior: if the directory doesn't exist, it's created
+// with 0700 explicitly (not via MkdirAll, which would silently no-op
+// against a pre-existing world-writable parent). If it exists, the
+// mode + ownership checks from internal/fileperm are reused so the
+// raft check follows the same contract as the config-file and PEM
+// checks.
+func validateDataDir(dataDir string) error {
+	info, err := os.Stat(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if mkErr := os.Mkdir(dataDir, 0o700); mkErr != nil {
+			return fmt.Errorf("cluster: create raft data_dir %s: %w", dataDir, mkErr)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cluster: stat raft data_dir %s: %w", dataDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("cluster: raft data_dir %s exists but is not a directory", dataDir)
+	}
+	if err := fileperm.CheckMode(info, dataDir, 0o700); err != nil {
+		return fmt.Errorf("cluster: raft data_dir: %w", err)
+	}
+	if err := fileperm.CheckOwnership(info, dataDir); err != nil {
+		return fmt.Errorf("cluster: raft data_dir: %w", err)
+	}
+	return nil
 }
 
 // raftCoord is a Coordinator backed by hashicorp/raft. The FSM is a

@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,16 @@ import (
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// tightTempDir is t.TempDir() chmodded to 0700 so validateDataDir
+// accepts it. t.TempDir() inherits the OS default (typically 0755);
+// the raft data_dir security check demands strict perms.
+func tightTempDir(t *testing.T) string {
+	t.Helper()
+	d := t.TempDir()
+	require.NoError(t, os.Chmod(d, 0o700))
+	return d
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +242,7 @@ func TestRaft_TLSTransport_ElectsLeader(t *testing.T) {
 		},
 		BindAddr:         addr,
 		AdvertiseAddr:    addr,
-		DataDir:          t.TempDir(),
+		DataDir:          tightTempDir(t),
 		Bootstrap:        true,
 		HeartbeatTimeout: 50 * time.Millisecond,
 		ElectionTimeout:  50 * time.Millisecond,
@@ -564,7 +575,7 @@ func TestRaft_LeadershipTransferFiresOnElectedOnNewLeader(t *testing.T) {
 func TestRaft_PersistentStateSurvivesRestart(t *testing.T) {
 	t.Parallel()
 
-	dataDir := t.TempDir()
+	dataDir := tightTempDir(t)
 
 	// Reserve a real ephemeral port and immediately release it; raft
 	// will re-open it. There's a tiny race here (the port could be
