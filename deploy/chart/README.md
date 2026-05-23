@@ -23,7 +23,7 @@ For anything beyond a dev cluster, use a `values.yaml` file. See [values.yaml](v
 
 ## Production secrets
 
-Set `secrets.existingSecret` to a Secret name you provision separately (SealedSecrets, external-secrets, etc.). The chart will then skip its convenience Secret. Required keys: `GITHUB_PAT`, `PROXMOX_TOKEN_SECRET`, and (when `admin_api` is enabled) `SCALESET_ADMIN_SECRET`.
+Set `secrets.existingSecret` to a Secret name you provision separately (SealedSecrets, external-secrets, etc.). The chart will then skip its convenience Secret. Required keys: `SCALESET_GITHUB_PAT_TOKEN`, `SCALESET_PROXMOX_AUTH_TOKEN_SECRET`, and (when `admin_api` is enabled) `SCALESET_ADMIN_API_SHARED_SECRET`. These are the canonical koanf env-override names — the orchestrator picks them up automatically from the matching `SCALESET_<yaml.path.uppercased>` env var, no yaml change needed.
 
 ## How leader election interacts with rollouts
 

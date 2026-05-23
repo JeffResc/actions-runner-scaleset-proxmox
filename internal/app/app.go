@@ -93,6 +93,15 @@ func Run(ctx context.Context, opts Options) error {
 	slog.SetDefault(log)
 	log.Info("scaleset starting", "version", opts.Version, "config", opts.ConfigPath, "dry_run", opts.DryRun)
 
+	// Warn about SCALESET_*-prefixed env vars that look like overrides
+	// but don't map to any schema key — the canonical operator-typo
+	// signal (e.g. SCALESET_POOL_HOTSIZE instead of SCALESET_POOL_HOT_SIZE).
+	// Without this, the override silently no-ops and the operator is
+	// left wondering why their change didn't take.
+	for _, name := range cfg.UnknownEnvOverrides() {
+		log.Warn("unknown SCALESET_* env var; ignored (typo?)", "name", name)
+	}
+
 	// Derive a cancellable child so leader-plane failures and admin
 	// drain can force the whole process down; SIGTERM cancellation
 	// arrives via the parent ctx.

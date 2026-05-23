@@ -4,10 +4,11 @@ file copied from the standalone example still ends up doing leader
 election. Everything else from .Values.scalesetConfig is passed
 through verbatim — see ../../config.example.yaml for the schema.
 
-Guardrail: secrets must flow through the Secret + *_env indirection,
-never as plaintext in scalesetConfig (which lands in this ConfigMap
-in clear). Reject any deployment that puts literal secret values
-in the YAML before they leak.
+Guardrail: secrets must flow through the Secret + canonical
+SCALESET_*-prefixed env vars (delivered to the pod by the
+deployment template), never as plaintext in scalesetConfig (which
+lands in this ConfigMap in clear). Reject any deployment that puts
+literal secret values in the YAML before they leak.
 */ -}}
 {{- $cfg := deepCopy .Values.scalesetConfig -}}
 {{- $cluster := dict "mode" "kubernetes" -}}
@@ -18,17 +19,17 @@ in the YAML before they leak.
 {{- $_ := set $cfg "cluster" $cluster -}}
 {{- if and (hasKey $cfg "proxmox") (hasKey $cfg.proxmox "auth") -}}
 {{-   if hasKey $cfg.proxmox.auth "token_secret" -}}
-{{-     fail "scalesetConfig.proxmox.auth.token_secret must NOT be set in plaintext; use token_secret_env to reference the Secret instead" -}}
+{{-     fail "scalesetConfig.proxmox.auth.token_secret must NOT be set in plaintext; supply it via the SCALESET_PROXMOX_AUTH_TOKEN_SECRET env var (the chart's Secret + Deployment templates already wire this) instead" -}}
 {{-   end -}}
 {{- end -}}
 {{- if and (hasKey $cfg "github") (hasKey $cfg.github "pat") -}}
 {{-   if hasKey $cfg.github.pat "token" -}}
-{{-     fail "scalesetConfig.github.pat.token must NOT be set in plaintext; use token_env to reference the Secret instead" -}}
+{{-     fail "scalesetConfig.github.pat.token must NOT be set in plaintext; supply it via the SCALESET_GITHUB_PAT_TOKEN env var (the chart's Secret + Deployment templates already wire this) instead" -}}
 {{-   end -}}
 {{- end -}}
 {{- if hasKey $cfg "admin_api" -}}
 {{-   if hasKey $cfg.admin_api "shared_secret" -}}
-{{-     fail "scalesetConfig.admin_api.shared_secret must NOT be set in plaintext; use shared_secret_env to reference the Secret instead" -}}
+{{-     fail "scalesetConfig.admin_api.shared_secret must NOT be set in plaintext; supply it via the SCALESET_ADMIN_API_SHARED_SECRET env var (the chart's Secret + Deployment templates already wire this) instead" -}}
 {{-   end -}}
 {{- end -}}
 apiVersion: v1

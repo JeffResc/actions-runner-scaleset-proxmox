@@ -32,7 +32,7 @@ spec:
           valueFrom:
             secretKeyRef:
               name: {{ include "scaleset.secretName" . }}
-              key: SCALESET_ADMIN_SECRET
+              key: SCALESET_ADMIN_API_SHARED_SECRET
       args:
         - |
           host={{ include "scaleset.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local

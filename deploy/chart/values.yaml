@@ -111,9 +111,13 @@ topologySpreadConstraints: []
 # the chart will create a Secret for you (dev / quick start).
 secrets:
   # When set, the chart skips creating a Secret and consumes this one.
-  # The referenced Secret must expose keys GITHUB_PAT,
-  # PROXMOX_TOKEN_SECRET, and (when adminApi enabled)
-  # SCALESET_ADMIN_SECRET.
+  # The referenced Secret must expose keys
+  # SCALESET_GITHUB_PAT_TOKEN, SCALESET_PROXMOX_AUTH_TOKEN_SECRET,
+  # and (when adminApi enabled) SCALESET_ADMIN_API_SHARED_SECRET.
+  # These are the canonical koanf env-override names — the
+  # orchestrator picks them up automatically because they match the
+  # SCALESET_<yaml.key.path uppercased, dots-to-underscores>
+  # convention.
   existingSecret: ""
 
   github:
@@ -134,8 +138,10 @@ secrets:
 scalesetConfig:
   github:
     auth_mode: pat
-    pat:
-      token_env: GITHUB_PAT
+    # The PAT token must come from env, supplied by the Secret
+    # below as SCALESET_GITHUB_PAT_TOKEN. Don't put secrets in
+    # this yaml — it lands in a ConfigMap.
+    pat: {}
     scope:
       org: my-org
 
@@ -149,7 +155,8 @@ scalesetConfig:
     endpoint: https://pve.example.com:8006/api2/json
     auth:
       token_id: scaleset@pve!automation
-      token_secret_env: PROXMOX_TOKEN_SECRET
+      # token_secret comes from env (SCALESET_PROXMOX_AUTH_TOKEN_SECRET)
+      # via the Secret below — not written here.
     template_vmid: 9000
     vmid_range:
       min: 10000
@@ -180,7 +187,8 @@ scalesetConfig:
 
   admin_api:
     http_addr: ":9101"
-    shared_secret_env: SCALESET_ADMIN_SECRET
+    # shared_secret comes from env (SCALESET_ADMIN_API_SHARED_SECRET)
+    # via the Secret below — not written here.
 
 # ServiceMonitor for Prometheus-Operator users. Disabled by default
 # so the chart doesn't require the CRD; enable when the CRD is

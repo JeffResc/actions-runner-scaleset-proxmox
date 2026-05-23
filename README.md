@@ -70,7 +70,7 @@ OTLP/HTTP tracing is opt-in via `observability.tracing.endpoint`. When empty, in
 
 ## Admin API
 
-Optional escape-hatch HTTP API enabled by setting `admin_api.http_addr` and `admin_api.shared_secret_env`. Every endpoint requires `Authorization: Bearer <shared-secret>`; failed auth attempts are rate-limited per source IP.
+Optional escape-hatch HTTP API enabled by setting `admin_api.http_addr` and supplying the bearer secret via the `SCALESET_ADMIN_API_SHARED_SECRET` env var. Every endpoint requires `Authorization: Bearer <shared-secret>`; failed auth attempts are rate-limited per source IP.
 
 | Method | Path | Purpose |
 | --- | --- | --- |

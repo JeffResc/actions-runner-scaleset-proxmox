@@ -426,8 +426,7 @@ type configValues struct {
 const configTmpl = `
 github:
   auth_mode: pat
-  pat:
-    token_env: GITHUB_PAT
+  pat: {}
   scope:
     org: {{.Org}}
   poll_interval: 200ms
@@ -444,7 +443,6 @@ proxmox:
   insecure_skip_verify: true
   auth:
     token_id: scaleset@pve!automation
-    token_secret_env: PROXMOX_TOKEN_SECRET
   template_vmid: 9000
   vmid_range: { min: 10000, max: 10999 }
   storage:

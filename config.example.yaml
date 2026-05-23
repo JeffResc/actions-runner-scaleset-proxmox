@@ -1,12 +1,26 @@
 # actions-runner-scaleset-proxmox — example configuration.
 #
-# Secrets are NEVER stored in this file. Fields ending in `*_env` name an
-# environment variable from which the secret is read at startup.
+# Every key in this file is overridable via an env var named with the
+# yaml key path uppercased, dots replaced by underscores, and prefixed
+# with `SCALESET_`. snake_case yaml keys are preserved as single tokens
+# (e.g. `pool.hot_size` is one key, not nested under hot.size). Examples:
 #
-# Required env vars (when corresponding fields are used):
-#   - GITHUB_PAT             (when github.auth_mode = pat)
-#   - PROXMOX_TOKEN_SECRET   (Proxmox API token secret)
-#   - SCALESET_ADMIN_SECRET  (admin HTTP API bearer token; optional)
+#   github.pat.token          → SCALESET_GITHUB_PAT_TOKEN
+#   proxmox.auth.token_secret → SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+#   admin_api.shared_secret   → SCALESET_ADMIN_API_SHARED_SECRET
+#   pool.hot_size             → SCALESET_POOL_HOT_SIZE
+#
+# Secrets MUST come from env (or another secure config-loader source);
+# writing them into yaml is not recommended. Required env vars for a
+# typical PAT deployment:
+#
+#   - SCALESET_GITHUB_PAT_TOKEN
+#   - SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+#   - SCALESET_ADMIN_API_SHARED_SECRET  (optional; required when admin_api.http_addr is set)
+#
+# Unknown SCALESET_*-prefixed env vars (typos like
+# SCALESET_POOL_HOTSIZE without the second underscore) are logged at
+# startup so the misconfiguration is loud.
 
 github:
   # "app" or "pat".
@@ -20,9 +34,9 @@ github:
   #   installation_id: 789012
   #   private_key_path: /etc/scaleset/github-app.pem
 
-  # Used when auth_mode = pat.
-  pat:
-    token_env: GITHUB_PAT
+  # Used when auth_mode = pat. The token must be supplied via
+  # SCALESET_GITHUB_PAT_TOKEN (not written into yaml).
+  pat: {}
 
   # Exactly one of org or repo.
   scope:
@@ -49,7 +63,8 @@ proxmox:
   insecure_skip_verify: false
   auth:
     token_id: scaleset@pve!automation
-    token_secret_env: PROXMOX_TOKEN_SECRET
+    # token_secret must be supplied via SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+    # (not written into yaml).
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage:
@@ -268,7 +283,7 @@ observability:
 
 admin_api:                        # optional escape hatch HTTP API
   # http_addr: "127.0.0.1:9101"
-  # shared_secret_env: SCALESET_ADMIN_SECRET
+  # shared_secret comes from SCALESET_ADMIN_API_SHARED_SECRET env var.
 
 # Multi-replica deployment via Kubernetes leader election. Leave at the
 # default "standalone" for single-process / Docker / systemd. The
