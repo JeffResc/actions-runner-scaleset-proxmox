@@ -163,6 +163,90 @@ func TestUpdateState_StampsStateSince(t *testing.T) {
 	require.True(t, got.StateSince.After(initial), "state_since must advance on transition")
 }
 
+// TestUpdate_RejectsImmutableFieldMutations locks in the invariant that
+// VMID / Profile / CreatedAt are set-once. A mutator that tries to
+// change any of them gets rejected with ErrImmutableFieldChanged and
+// the row is NOT written. Today's internal callers don't do this, but
+// the contract has to be loud: silently re-keying a row would corrupt
+// the primary index and the profile-scoped secondary indexes.
+func TestUpdate_RejectsImmutableFieldMutations(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		mutate func(*store.VM)
+	}{
+		{"changes VMID", func(v *store.VM) { v.VMID = 99999 }},
+		{"changes Profile", func(v *store.VM) { v.Profile = "different-profile" }},
+		{"changes CreatedAt", func(v *store.VM) { v.CreatedAt = time.Unix(0, 0) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := store.New()
+			require.NoError(t, err)
+			vm := newVM(60100, store.StateHot)
+			vm.Profile = "original-profile"
+			require.NoError(t, s.Insert(vm))
+
+			_, err = s.Update(60100, tc.mutate)
+			require.ErrorIs(t, err, store.ErrImmutableFieldChanged)
+
+			// Row must still be readable under its original VMID and
+			// must carry the original immutable values.
+			got, err := s.Get(60100)
+			require.NoError(t, err)
+			require.Equal(t, 60100, got.VMID)
+			require.Equal(t, "original-profile", got.Profile)
+		})
+	}
+}
+
+// TestUpdateState_RejectsImmutableFieldMutations is the CAS twin of
+// TestUpdate_*: UpdateState's mutate callback is subject to the same
+// immutability guard.
+func TestUpdateState_RejectsImmutableFieldMutations(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	vm := newVM(60200, store.StateHot)
+	vm.Profile = "original"
+	require.NoError(t, s.Insert(vm))
+
+	ok, err := s.UpdateState(60200, store.StateHot, store.StateAssigned, func(v *store.VM) {
+		v.Profile = "evil"
+	})
+	require.ErrorIs(t, err, store.ErrImmutableFieldChanged)
+	require.False(t, ok)
+
+	// State change must NOT have been committed (transaction aborts on error).
+	got, err := s.Get(60200)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, got.State, "failed mutator must not commit the state transition")
+	require.Equal(t, "original", got.Profile)
+}
+
+// TestUpdateStateIn_RejectsImmutableFieldMutations is the multi-state
+// CAS twin of the above.
+func TestUpdateStateIn_RejectsImmutableFieldMutations(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	require.NoError(t, s.Insert(newVM(60300, store.StateAssigned)))
+
+	ok, err := s.UpdateStateIn(60300,
+		[]store.State{store.StateAssigned, store.StateHot},
+		store.StateRunning,
+		func(v *store.VM) { v.VMID = 1 },
+	)
+	require.ErrorIs(t, err, store.ErrImmutableFieldChanged)
+	require.False(t, ok)
+
+	got, err := s.Get(60300)
+	require.NoError(t, err)
+	require.Equal(t, store.StateAssigned, got.State, "failed mutator must not commit the state transition")
+}
+
 // TestUpdate_DoesNotTouchStateSince verifies that the non-CAS Update helper
 // leaves state_since alone (a non-state mutation should not reset the timer).
 func TestUpdate_DoesNotTouchStateSince(t *testing.T) {
