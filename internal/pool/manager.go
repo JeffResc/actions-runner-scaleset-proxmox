@@ -1006,6 +1006,46 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 	}
 }
 
+// adoptionKey is the explicit state matrix axis: each cell maps a
+// (Proxmox-running, runner-present, runner-busy) combination to one
+// adoptionClass. classifyAdoption walks the inputs into this key and
+// looks up the result — the matrix is the documentation.
+type adoptionKey struct {
+	powerRunning  bool
+	runnerPresent bool
+	runnerBusy    bool
+}
+
+// adoptionClass is the per-cell outcome. withRunnerID selects whether
+// the GitHub runner's ID is preserved on the inherited row; for Hot /
+// Warm cells the row carries no runner association so we explicitly
+// zero it.
+type adoptionClass struct {
+	state        store.State
+	kind         store.PoolKind
+	withRunnerID bool
+}
+
+// adoptionMatrix exhaustively enumerates every (powerRunning,
+// runnerPresent, runnerBusy) triple. Listing all eight cells (over an
+// "any" sentinel) keeps the table grep-friendly and forces a new
+// classification to be a single-line addition.
+var adoptionMatrix = map[adoptionKey]adoptionClass{
+	// power != "running" → Warm regardless of runner snapshot.
+	{powerRunning: false, runnerPresent: false, runnerBusy: false}: {store.StateWarm, store.PoolKindWarm, false},
+	{powerRunning: false, runnerPresent: false, runnerBusy: true}:  {store.StateWarm, store.PoolKindWarm, false},
+	{powerRunning: false, runnerPresent: true, runnerBusy: false}:  {store.StateWarm, store.PoolKindWarm, false},
+	{powerRunning: false, runnerPresent: true, runnerBusy: true}:   {store.StateWarm, store.PoolKindWarm, false},
+	// powerRunning && !runnerPresent → Hot (no registered runner).
+	{powerRunning: true, runnerPresent: false, runnerBusy: false}: {store.StateHot, store.PoolKindHot, false},
+	{powerRunning: true, runnerPresent: false, runnerBusy: true}:  {store.StateHot, store.PoolKindHot, false}, // logically unreachable; included for completeness
+	// powerRunning && runnerPresent && !busy → Assigned (online-idle
+	// or offline-registered). Reconciler's grace timers will recycle.
+	{powerRunning: true, runnerPresent: true, runnerBusy: false}: {store.StateAssigned, store.PoolKindHot, true},
+	// powerRunning && runnerPresent && busy → Running (in flight).
+	{powerRunning: true, runnerPresent: true, runnerBusy: true}: {store.StateRunning, store.PoolKindHot, true},
+}
+
 // classifyAdoption picks (State, PoolKind, RunnerID) for one inherited
 // VM from observable Proxmox power state and the GitHub runner snapshot
 // (which may be nil when GitHub was unreachable).
@@ -1026,20 +1066,18 @@ func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runn
 			"vmid", pv.VMID, "node", pv.Node, "err", err)
 		return store.StateHot, store.PoolKindHot, 0
 	}
-	if power != "running" {
-		return store.StateWarm, store.PoolKindWarm, 0
-	}
 	gr, present := runners[pv.Name]
-	if !present {
-		return store.StateHot, store.PoolKindHot, 0
+	key := adoptionKey{
+		powerRunning:  power == "running",
+		runnerPresent: present,
+		runnerBusy:    present && gr.Busy,
 	}
-	if gr.Busy {
-		return store.StateRunning, store.PoolKindHot, gr.ID
+	class := adoptionMatrix[key]
+	var runnerID int64
+	if class.withRunnerID {
+		runnerID = gr.ID
 	}
-	// Online-idle or offline registered runner: Assigned is the safe
-	// middle. The reconciler's AssignedGrace / AssignedOfflineGrace
-	// will recycle the row if no job arrives or the runner stays down.
-	return store.StateAssigned, store.PoolKindHot, gr.ID
+	return class.state, class.kind, runnerID
 }
 
 // Run is the reconcile loop.
@@ -1800,7 +1838,7 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 		v.BootAttempts++
 	})
 	if err != nil {
-		m.log.Warn("poison: inc attempts failed", "vmid", row.VMID, "err", err)
+		m.log.Warn("poison: inc attempts failed", "vmid", row.VMID, "profile", row.Profile, "err", err)
 		return
 	}
 	// Feed the canary controller's failure counter — only fires
@@ -1826,16 +1864,20 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 			v.State = store.StatePoison
 			v.StateSince = time.Now()
 		}); updErr != nil {
-			m.log.Warn("poison: mark poison failed", "vmid", row.VMID, "err", updErr)
+			m.log.Warn("poison: mark poison failed", "vmid", row.VMID, "profile", row.Profile, "err", updErr)
 		}
-		m.log.Warn("vm marked poison; manual intervention required", "vmid", row.VMID, "attempts", updated.BootAttempts)
+		// Page-worthy: a VM has exhausted its boot-retry budget and is
+		// quarantined until an operator triages the underlying failure
+		// (template image regression, networking misconfig, etc.).
+		m.log.Error("vm marked poison; manual intervention required",
+			"vmid", row.VMID, "profile", row.Profile, "attempts", updated.BootAttempts)
 		return
 	}
 	if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
 		v.State = store.StateDestroying
 		v.StateSince = time.Now()
 	}); updErr != nil {
-		m.log.Warn("poison: mark destroying failed", "vmid", row.VMID, "err", updErr)
+		m.log.Warn("poison: mark destroying failed", "vmid", row.VMID, "profile", row.Profile, "err", updErr)
 	}
 	m.destroyAsync(updated.VMID, updated.Node, updated.Profile)
 }
@@ -2056,12 +2098,22 @@ var orphanCleanupTimeout = 15 * time.Second
 // fresh clone colliding with PVE's still-settling qmdestroy task on
 // the same ID (manifests as "VM N is running - destroy failed" and
 // lock-file timeouts).
-func (m *manager) allocateVMID(_ context.Context) (int, error) {
+//
+// Honours ctx — a cancelled drain (or any other ctx cancellation) is
+// observed at the start of each iteration so a wide range with many
+// recently-destroyed VMIDs can't pin a draining caller.
+func (m *manager) allocateVMID(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	used, err := m.store.UsedVMIDs(m.cfg.VMIDRange.Min, m.cfg.VMIDRange.Max)
 	if err != nil {
 		return 0, err
 	}
 	for id := m.cfg.VMIDRange.Min; id <= m.cfg.VMIDRange.Max; id++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		if _, taken := used[id]; taken {
 			continue
 		}
