@@ -1965,6 +1965,35 @@ func TestDrain_CompletesNaturallyWhenWorkersFinish(t *testing.T) {
 		"drain should complete immediately when workers finish on their own")
 }
 
+// TestStats_ReturnsErrManagerDeposedAfterWorkerCancel locks in the
+// pool side of the leader-handover race fix: once the manager's
+// workerCtx has been cancelled (which drain() does on every exit),
+// Stats must return ErrManagerDeposed so the admin handler can
+// translate the result into a 503 + Retry-After instead of a 500.
+func TestStats_ReturnsErrManagerDeposedAfterWorkerCancel(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{})
+
+	mgr.workerCancel()
+
+	_, err := mgr.Stats(context.Background())
+	require.ErrorIs(t, err, ErrManagerDeposed)
+}
+
+// TestForceDestroy_ReturnsErrManagerDeposedAfterWorkerCancel is the
+// ForceDestroy twin of TestStats_*: same race shape, same sentinel.
+func TestForceDestroy_ReturnsErrManagerDeposedAfterWorkerCancel(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{})
+
+	mgr.workerCancel()
+
+	err := mgr.ForceDestroy(context.Background(), 12345, "test")
+	require.ErrorIs(t, err, ErrManagerDeposed)
+}
+
 // TestAllocateVMID_RespectsRecentlyDestroyedCooldown locks in the
 // post-destroy cooldown: after a destroy completes, PVE's qmdestroy
 // task and lock-file cleanup may still be settling, so reissuing the

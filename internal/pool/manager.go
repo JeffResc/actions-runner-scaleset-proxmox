@@ -407,6 +407,9 @@ func (m *manager) SetDesiredCount(n int) {
 // Stats keeps the previous shape for backwards-compatible callers
 // (admin API, tests).
 func (m *manager) Stats(_ context.Context) (Stats, error) {
+	if m.workerCtx.Err() != nil {
+		return Stats{}, ErrManagerDeposed
+	}
 	raw, err := m.store.Stats()
 	if err != nil {
 		return Stats{}, fmt.Errorf("stats: %w", err)
@@ -621,6 +624,9 @@ func (m *manager) PromoteToRunning(_ context.Context, vmid int, runnerID, jobID 
 // so we don't double-call prov.Destroy or burn duplicate Proxmox /
 // GitHub API budget.
 func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error {
+	if m.workerCtx.Err() != nil {
+		return ErrManagerDeposed
+	}
 	from := []store.State{
 		store.StateProvisioning,
 		store.StateWarm,

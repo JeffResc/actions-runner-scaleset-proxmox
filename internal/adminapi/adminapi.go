@@ -450,6 +450,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	stats, err := p.Stats(r.Context())
 	if err != nil {
+		// Leader handover race: the pool was non-nil at the gate but
+		// got torn down by the deposed callback before Stats ran. Same
+		// "retry shortly" response shape as the nil-pool gate above so
+		// the operator metric stays clean (no spurious 500s during
+		// leader flap).
+		if errors.Is(err, pool.ErrManagerDeposed) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+			return
+		}
 		s.log.Error("admin state: pool stats failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -499,6 +509,14 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 	// effect. ForceDestroy is the unconditional drop the endpoint
 	// promises.
 	if err := p.ForceDestroy(r.Context(), vmid, "admin destroy endpoint"); err != nil {
+		// Same leader-handover race shape as handleState — see comment
+		// there. Convert to 503 + Retry-After so an operator's
+		// destroy-during-flap retries against the new leader.
+		if errors.Is(err, pool.ErrManagerDeposed) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+			return
+		}
 		s.log.Error("admin destroy: force destroy failed", "vmid", vmid, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
