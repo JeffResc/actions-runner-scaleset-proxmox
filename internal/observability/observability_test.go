@@ -239,6 +239,60 @@ func TestHealth_ClearGatesOnDeposal(t *testing.T) {
 	require.False(t, h.Ready())
 }
 
+// TestRecordProxmoxError_ClampsUnknownOp locks in the #72 fix:
+// off-list `op` values become "unknown" so a future caller passing
+// per-VMID or per-task-id strings can't blow up Prometheus
+// cardinality. Returns the substituted value so callers can observe.
+func TestRecordProxmoxError_ClampsUnknownOp(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := observability.NewMetrics(reg)
+
+	// Known op passes through.
+	require.Equal(t, "inject_jit", m.RecordProxmoxError("inject_jit", "pve1"))
+
+	// Unknown op is clamped to "unknown".
+	require.Equal(t, "unknown", m.RecordProxmoxError("destroy-vmid-12345", "pve1"))
+
+	// Assert the metric output only contains known + unknown label values.
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	var ops []string
+	for _, f := range families {
+		if *f.Name != "scaleset_proxmox_api_errors_total" {
+			continue
+		}
+		for _, mt := range f.Metric {
+			for _, l := range mt.Label {
+				if *l.Name == "operation" {
+					ops = append(ops, *l.Value)
+				}
+			}
+		}
+	}
+	require.ElementsMatch(t, []string{"inject_jit", "unknown"}, ops,
+		"unbounded op string must be clamped to unknown, not emitted verbatim")
+}
+
+// TestRecordGHStateMismatch_ClampsUnknownLabels guarantees the same
+// closed-enum protection for ghState and action; db_state is left
+// alone because callers pass it as a typed store.State value.
+func TestRecordGHStateMismatch_ClampsUnknownLabels(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := observability.NewMetrics(reg)
+
+	// Known values pass through.
+	gh, ac := m.RecordGHStateMismatch("assigned", "busy", "promote_running")
+	require.Equal(t, "busy", gh)
+	require.Equal(t, "promote_running", ac)
+
+	// Unknown ghState and action both clamp to "unknown".
+	gh, ac = m.RecordGHStateMismatch("assigned", "stale-gh-runner-id-9999", "retry-7")
+	require.Equal(t, "unknown", gh)
+	require.Equal(t, "unknown", ac)
+}
+
 func TestServe_RespondsToProbes(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

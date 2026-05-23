@@ -90,6 +90,87 @@ type Metrics struct {
 	Leader               prometheus.Gauge
 }
 
+// ProxmoxOpUnknown is the fallback for off-list values of the
+// ProxmoxErrors.operation label. Adding a new value to validProxmoxOps
+// (rather than passing a fresh string at the call site) is
+// intentional friction — every new entry adds a Prometheus time
+// series, and RecordProxmoxError substitutes ProxmoxOpUnknown for
+// anything off-list so a typo or new caller never blows up
+// cardinality silently.
+const ProxmoxOpUnknown = "unknown"
+
+var validProxmoxOps = map[string]struct{}{
+	"inject_jit":     {},
+	"clone":          {},
+	"destroy":        {},
+	"start":          {},
+	"stop":           {},
+	"power_state":    {},
+	"list_vms":       {},
+	"wait_ready":     {},
+	ProxmoxOpUnknown: {},
+}
+
+// GHStateUnknown is the fallback for off-list values of the
+// GHStateMismatch.gh_state label. Kept in sync with gh.ghStateLabel —
+// every value that function can emit must appear in validGHStates.
+const GHStateUnknown = "unknown"
+
+var validGHStates = map[string]struct{}{
+	"missing":      {},
+	"offline":      {},
+	"busy":         {},
+	"idle":         {},
+	GHStateUnknown: {},
+}
+
+// GHActionUnknown is the fallback for off-list values of the
+// GHStateMismatch.action label. Same closed-enum guarantee as
+// validGHStates.
+const GHActionUnknown = "unknown"
+
+var validGHActions = map[string]struct{}{
+	"promote_running": {},
+	"destroy":         {},
+	GHActionUnknown:   {},
+}
+
+// RecordProxmoxError increments ProxmoxErrors with the op clamped to
+// validProxmoxOps. Off-list values become "unknown" so a future
+// caller passing an unbounded string (per-VMID, per-task-id, etc.)
+// can't blow up Prometheus cardinality silently. Returns the op the
+// counter was incremented with so callers (typically tests) can
+// observe the substitution.
+func (m *Metrics) RecordProxmoxError(op, node string) string {
+	if m == nil {
+		return op
+	}
+	if _, ok := validProxmoxOps[op]; !ok {
+		op = ProxmoxOpUnknown
+	}
+	m.ProxmoxErrors.WithLabelValues(op, node).Inc()
+	return op
+}
+
+// RecordGHStateMismatch increments GHStateMismatch with ghState and
+// action clamped to their respective closed enums. db_state is
+// expected to be a store.State value; we leave it unchanged because
+// store.State is a typed enum at the call site (no risk of unbounded
+// input). Off-list ghState / action become "unknown".
+func (m *Metrics) RecordGHStateMismatch(dbState, ghState, action string) (string, string) {
+	if m == nil {
+		return ghState, action
+	}
+	if _, ok := validGHStates[ghState]; !ok {
+		ghState = GHStateUnknown
+	}
+	if _, ok := validGHActions[action]; !ok {
+		action = GHActionUnknown
+	}
+	m.GHStateMismatch.WithLabelValues(dbState, ghState, action).Inc()
+	return ghState, action
+}
+
 // NewMetrics creates and registers the orchestrator's metric set on reg.
 // Panics on duplicate registration; pass a fresh registry per process.
 func NewMetrics(reg prometheus.Registerer) *Metrics {

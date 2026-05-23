@@ -267,9 +267,9 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		VMID: vmObj.VMID, Node: vmObj.Node, Name: vmObj.Name,
 	}, jitCfg.EncodedJITConfig); err != nil {
 		s.log.Error("jit injection failed (after retries); releasing vm", "vmid", vmObj.VMID, "err", err)
-		if s.metrics != nil {
-			s.metrics.ProxmoxErrors.WithLabelValues("inject_jit", vmObj.Node).Inc()
-		}
+		// Helper enforces the closed enum on `op` so a future caller
+		// can't blow up Prometheus cardinality silently.
+		s.metrics.RecordProxmoxError("inject_jit", vmObj.Node)
 		// Also deregister the runner we just minted; otherwise the
 		// next clone of this VMID will hit a 409.
 		s.cleanupStaleRunnerByName(vmObj.Name)

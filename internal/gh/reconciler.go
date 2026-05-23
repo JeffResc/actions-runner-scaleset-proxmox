@@ -560,9 +560,9 @@ func (r *Reconciler) forceDestroy(ctx context.Context, vmid int, reason, dbState
 }
 
 func (r *Reconciler) recordMismatch(dbState, ghState, action string) {
-	if r.metrics != nil {
-		r.metrics.GHStateMismatch.WithLabelValues(dbState, ghState, action).Inc()
-	}
+	// Helper enforces the closed enum on ghState/action so a typo or
+	// future caller can't blow up Prometheus cardinality silently.
+	r.metrics.RecordGHStateMismatch(dbState, ghState, action)
 }
 
 // ghStateLabel collapses the (present, online, busy) tuple into a single
