@@ -566,6 +566,57 @@ func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T
 		"orphan first-seen timestamp must NOT be reset by an empty-runners tick")
 }
 
+// TestCleanupOrphanRunners_PerCallTimeout locks in the #67 fix: when
+// the GitHub-side RemoveRunner call hangs, the reconciler must give
+// up on that individual runner after cleanupTimeoutPerRunner and
+// continue. Before the fix one slow DELETE held the tick hostage for
+// the full http.Client timeout (~60s), multiplied per orphan
+// candidate.
+func TestCleanupOrphanRunners_PerCallTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Shrink the per-call cap so the test doesn't sit on the real 10s.
+	orig := cleanupTimeoutPerRunner
+	cleanupTimeoutPerRunner = 100 * time.Millisecond
+	t.Cleanup(func() { cleanupTimeoutPerRunner = orig })
+
+	// Spin up a GH-API stub that hangs the DELETE forever (until the
+	// reconciler's per-call ctx fires).
+	mux := http.NewServeMux()
+	mux.HandleFunc("/orgs/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"total_count":0,"runners":[]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mgr := &fakeManager{rows: nil}
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
+	require.NoError(t, err)
+
+	// Pre-seed orphanFirstSeen so the call goes directly to RemoveRunner
+	// (skip the grace window).
+	r.orphanFirstSeen["gh-runner-test-1"] = time.Now().Add(-time.Hour)
+
+	start := time.Now()
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
+	})
+	elapsed := time.Since(start)
+
+	// Must return within timeout + slack — not block on the upstream.
+	require.Less(t, elapsed, 2*time.Second,
+		"cleanupOrphanRunners must give up after per-call timeout; took %s", elapsed)
+	// And the orphan stays tracked so the next tick can retry.
+	_, stillTracked := r.orphanFirstSeen["gh-runner-test-1"]
+	require.True(t, stillTracked,
+		"timed-out RemoveRunner must leave orphan in tracking for next-tick retry")
+}
+
 // 13. Proxmox VM exists but no DB row → reconciler destroys it.
 // TestSweepProxmoxOrphans_RespectsOrphanGrace locks in the grace
 // behaviour: a Proxmox VM missing from the store on its first sight
