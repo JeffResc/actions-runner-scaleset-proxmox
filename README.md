@@ -85,4 +85,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full dev setup.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+GNU General Public License 3.0 — see [LICENSE](LICENSE).
