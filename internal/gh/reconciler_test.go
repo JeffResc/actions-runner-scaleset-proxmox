@@ -829,3 +829,26 @@ func TestNew_RequiresNonNilDeps(t *testing.T) {
 	_, err = New(baseCfg(), cli, mgr, nil, nil, nil)
 	require.Error(t, err)
 }
+
+// TestStateTransitionTable_Completeness pins that every cell in the
+// reconciler's domain (dbState × ghLabel) has an explicit entry — no
+// silent fall-throughs. Per-cell behaviour assertions live in the
+// TestReconcile_* end-to-end tests above; this guards the table itself
+// from a regression that drops a cell.
+func TestStateTransitionTable_Completeness(t *testing.T) {
+	t.Parallel()
+	dbStates := []string{"assigned", "running", "hot"}
+	ghLabels := []string{"busy", "idle", "offline", "missing"}
+	for _, ds := range dbStates {
+		for _, gl := range ghLabels {
+			ds, gl := ds, gl
+			t.Run(ds+"/"+gl, func(t *testing.T) {
+				t.Parallel()
+				_, ok := stateTransitionTable[transitionKey{dbState: ds, ghLabel: gl}]
+				require.True(t, ok, "missing transition entry for (%s, %s)", ds, gl)
+			})
+		}
+	}
+	require.Len(t, stateTransitionTable, len(dbStates)*len(ghLabels),
+		"stateTransitionTable should hold exactly dbStates*ghLabels cells (no stale entries)")
+}
