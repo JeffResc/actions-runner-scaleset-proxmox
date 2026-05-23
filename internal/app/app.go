@@ -448,6 +448,25 @@ func buildCoordinator(cfg *config.Config, cb cluster.Callbacks, log *slog.Logger
 		TestTransport:    opts.RaftTransport,
 		TestLocalAddr:    opts.RaftLocalAddr,
 	}
+	// BuildServerTLS produces a tls.Config that doubles as the dial-
+	// side bundle (Certificates + RootCAs from the same CA file), so
+	// we can pass the same value to both halves of the StreamLayer.
+	if cfg.Cluster.Raft.TLS != nil {
+		raftTLS, err := cfg.Cluster.Raft.TLS.BuildServerTLS()
+		if err != nil {
+			return nil, fmt.Errorf("cluster: raft tls: %w", err)
+		}
+		// BuildServerTLS doesn't set RootCAs (server side has ClientCAs),
+		// so reuse the client builder to populate RootCAs for the dial.
+		if cfg.Cluster.Raft.TLS.CAFile != "" {
+			client, err := cfg.Cluster.Raft.TLS.BuildClientTLS()
+			if err != nil {
+				return nil, fmt.Errorf("cluster: raft tls (client): %w", err)
+			}
+			raftTLS.RootCAs = client.RootCAs
+		}
+		rcfg.TLS = raftTLS
+	}
 	return cluster.NewRaft(rcfg, cb, log)
 }
 

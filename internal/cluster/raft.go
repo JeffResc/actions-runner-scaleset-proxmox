@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -81,6 +82,14 @@ type RaftConfig struct {
 	HeartbeatTimeout time.Duration
 	ElectionTimeout  time.Duration
 	CommitTimeout    time.Duration
+
+	// TLS, when non-nil, wraps the raft TCP transport with a TLS
+	// stream layer so peer-to-peer raft RPCs are encrypted. The
+	// supplied tls.Config is used for BOTH the server-side listener
+	// (Certificates + optional ClientCAs / ClientAuth) and the
+	// client-side dial (Certificates + RootCAs). Pass the same
+	// bundle on every replica.
+	TLS *tls.Config
 
 	// TestTransport, when non-nil, replaces the production TCP
 	// transport. Used by raft.NewInmemTransport-based tests so
@@ -286,9 +295,28 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 		if err != nil {
 			return nil, fmt.Errorf("cluster: resolve advertise %q: %w", advertise, err)
 		}
-		tr, raftErr = raft.NewTCPTransportWithLogger(cfg.BindAddr, addr, 3, 10*time.Second, newSlogHclog(log, "raft.transport"))
-		if raftErr != nil {
-			return nil, fmt.Errorf("cluster: tcp transport on %s: %w", cfg.BindAddr, raftErr)
+		if cfg.TLS != nil {
+			// TLS stream layer: encrypted peer-to-peer raft RPCs.
+			// Mutual TLS is enabled when the operator's tls.Config sets
+			// ClientCAs + ClientAuth=RequireAndVerifyClientCert (the
+			// shape config.TLSConfig.BuildServerTLS produces when
+			// CAFile is set).
+			ln, lnErr := tls.Listen("tcp", cfg.BindAddr, cfg.TLS)
+			if lnErr != nil {
+				return nil, fmt.Errorf("cluster: tls listen on %s: %w", cfg.BindAddr, lnErr)
+			}
+			stream := &tlsStreamLayer{ln: ln, advertise: addr, tlsCfg: cfg.TLS}
+			tr = raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
+				Stream:  stream,
+				MaxPool: 3,
+				Timeout: 10 * time.Second,
+				Logger:  newSlogHclog(log, "raft.transport"),
+			})
+		} else {
+			tr, raftErr = raft.NewTCPTransportWithLogger(cfg.BindAddr, addr, 3, 10*time.Second, newSlogHclog(log, "raft.transport"))
+			if raftErr != nil {
+				return nil, fmt.Errorf("cluster: tcp transport on %s: %w", cfg.BindAddr, raftErr)
+			}
 		}
 	}
 
@@ -508,6 +536,37 @@ type noopSnapshot struct{}
 
 func (noopSnapshot) Persist(sink raft.SnapshotSink) error { return sink.Close() }
 func (noopSnapshot) Release()                             {}
+
+// tlsStreamLayer satisfies raft.StreamLayer with TLS-terminated TCP.
+// The wrapped tls.Listener is consumed by raft.NewNetworkTransportWithConfig
+// for inbound RPCs; Dial wraps an outbound TCP connection with
+// tls.Client using the same bundle. Pinning RootCAs (one-way TLS) or
+// ClientCAs + RequireAndVerifyClientCert (mTLS) is the operator's
+// choice and is enforced by the supplied tls.Config.
+type tlsStreamLayer struct {
+	ln        net.Listener
+	advertise net.Addr
+	tlsCfg    *tls.Config
+}
+
+// Accept blocks until a peer dials in or the listener is closed.
+func (s *tlsStreamLayer) Accept() (net.Conn, error) { return s.ln.Accept() }
+
+// Close shuts down the listener; raft calls this on Shutdown.
+func (s *tlsStreamLayer) Close() error { return s.ln.Close() }
+
+// Addr returns the advertise address so raft can publish it to peers.
+// Returning the listener's local Addr would expose 0.0.0.0:port which
+// other replicas can't dial when BindAddr is a wildcard.
+func (s *tlsStreamLayer) Addr() net.Addr { return s.advertise }
+
+// Dial opens an outbound TLS connection. The timeout caps the whole
+// TCP + TLS handshake budget — without it a hung peer would block
+// raft's call for the OS-level connect timeout (~75s).
+func (s *tlsStreamLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
+	d := &net.Dialer{Timeout: timeout}
+	return tls.DialWithDialer(d, "tcp", string(address), s.tlsCfg)
+}
 
 // slogHclog implements hclog.Logger by dispatching to slog at the
 // matching level. raft / raft-tcp / file-snapshot-store all accept an

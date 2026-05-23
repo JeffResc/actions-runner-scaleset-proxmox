@@ -3,10 +3,17 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -187,6 +194,95 @@ func (rc *raftCluster) shutdown() {
 
 func nodeID(i int) string   { return "node-" + strconv.Itoa(i) }
 func httpAddr(i int) string { return "10.0.0." + strconv.Itoa(i+1) + ":9100" }
+
+// TestRaft_TLSTransport_ElectsLeader brings up a single-node raft
+// cluster with a TLS stream layer (in-process self-signed loopback
+// cert + mTLS) and asserts the node still elects itself. Guards the
+// #64B fix: with TLS configured, raft RPCs must continue to work and
+// the listener must actually use the TLS-wrapped TCP socket.
+func TestRaft_TLSTransport_ElectsLeader(t *testing.T) {
+	t.Parallel()
+
+	certPEM, keyPEM := genSelfSignedCert(t)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	require.NoError(t, err)
+	pool := x509.NewCertPool()
+	require.True(t, pool.AppendCertsFromPEM(certPEM))
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      pool,
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ServerName:   "127.0.0.1",
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	// Reserve an ephemeral port for the raft bind.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	cfg := RaftConfig{
+		NodeID: "n0",
+		Peers: []RaftPeer{
+			{NodeID: "n0", RaftAddr: addr, HTTPAddr: "127.0.0.1:9100"},
+		},
+		BindAddr:         addr,
+		AdvertiseAddr:    addr,
+		DataDir:          t.TempDir(),
+		Bootstrap:        true,
+		HeartbeatTimeout: 50 * time.Millisecond,
+		ElectionTimeout:  50 * time.Millisecond,
+		CommitTimeout:    10 * time.Millisecond,
+		TLS:              tlsCfg,
+	}
+	c, err := NewRaft(cfg, Callbacks{}, discardLogger())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+
+	require.Eventually(t, c.IsLeader, 3*time.Second, 25*time.Millisecond,
+		"single-node TLS raft must still elect itself as leader")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("raft did not shut down within 3s")
+	}
+}
+
+// genSelfSignedCert returns a PEM-encoded ECDSA cert + key valid for
+// 127.0.0.1 / ::1 / localhost. Standalone helper so this test doesn't
+// import the config-package test fixtures.
+func genSelfSignedCert(t *testing.T) (certPEM, keyPEM []byte) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	require.NoError(t, err)
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	require.NoError(t, err)
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM
+}
 
 func TestRaft_SingleNodeElectsSelf(t *testing.T) {
 	t.Parallel()
