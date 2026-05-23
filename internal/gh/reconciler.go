@@ -291,17 +291,7 @@ func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 	out := make(map[string]pool.RunnerInfo)
 	opt := &github.ListRunnersOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	for page := 0; page < maxListPages; page++ {
-		var (
-			runnersPage *github.Runners
-			resp        *github.Response
-			err         error
-		)
-		if scope.Org != "" {
-			runnersPage, resp, err = gh.Actions.ListOrganizationRunners(ctx, scope.Org, opt)
-		} else {
-			owner, repo := splitRepo(scope.Repo)
-			runnersPage, resp, err = gh.Actions.ListRunners(ctx, owner, repo, opt)
-		}
+		runnersPage, resp, err := listRunnersPage(ctx, gh, scope, opt)
 		if err != nil {
 			return nil, err
 		}
@@ -328,6 +318,19 @@ func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 	return out, nil
 }
 
+// listRunnersPage fetches one page of runners from the API endpoint
+// that matches scope. Centralising the org-vs-repo dispatch here means
+// ListRunnersByPrefix's pagination loop carries no branching on scope
+// per iteration; a future enterprise endpoint becomes a one-line
+// addition in this function.
+func listRunnersPage(ctx context.Context, gh *github.Client, scope githubauth.Scope, opt *github.ListRunnersOptions) (*github.Runners, *github.Response, error) {
+	if scope.Org != "" {
+		return gh.Actions.ListOrganizationRunners(ctx, scope.Org, opt)
+	}
+	owner, repo := splitRepo(scope.Repo)
+	return gh.Actions.ListRunners(ctx, owner, repo, opt)
+}
+
 // NewRunnerLister returns a pool.RunnerLister that pages the GitHub
 // runners API for the given scope and prefix. Adopt uses it once at
 // leader startup; the reconciler's polling loop builds its own snapshot
@@ -338,8 +341,105 @@ func NewRunnerLister(gh *github.Client, scope githubauth.Scope, prefix string, l
 	}
 }
 
-// applyMatrix walks each row and applies the state-transition table
-// defined in the package doc.
+// transitionOp is the dispatcher's per-cell action.
+type transitionOp int
+
+const (
+	opNoop transitionOp = iota
+	opPromote
+	opDestroy
+)
+
+// transitionKey indexes [stateTransitionTable]. ghLabel is the
+// low-cardinality string ghStateLabel produces (busy / idle / offline
+// / missing).
+type transitionKey struct {
+	dbState string
+	ghLabel string
+}
+
+// transitionAction captures everything the dispatcher needs to fire
+// for one (dbState, ghLabel) cell.
+//
+// grace returns the row-age threshold the action waits on; nil means
+// "no time gate". Reading it through Config means a per-cell decision
+// lives next to the rest of the cell definition.
+//
+// promoteMsg and promoteWarn shape the log line emitted on promote —
+// preserved verbatim from the prior reconcile{Assigned,Hot} so log
+// consumers see no churn.
+type transitionAction struct {
+	op           transitionOp
+	destroyMsg   string
+	mismatchKind string
+	promoteMsg   string
+	promoteWarn  bool
+	grace        func(Config) time.Duration
+}
+
+// stateTransitionTable is the authoritative (dbState, ghLabel) → action
+// map. Adding a new state or ghLabel is a one-line addition here; the
+// dispatcher walks rows without per-state branches.
+//
+// Every cell is enumerated explicitly (no "any" sentinel) so a missing
+// combination is grep-visible rather than a silent fall-through.
+var stateTransitionTable = map[transitionKey]transitionAction{
+	// assigned: JIT injected, waiting for the runner to pick up work.
+	{dbState: "assigned", ghLabel: "busy"}: {
+		op:           opPromote,
+		promoteMsg:   "reconcile: promoting assigned->running (missed JobStarted)",
+		mismatchKind: "promote_running",
+	},
+	{dbState: "assigned", ghLabel: "offline"}: {
+		op:         opDestroy,
+		destroyMsg: "assigned: runner registered then went offline",
+		grace:      func(c Config) time.Duration { return c.AssignedOfflineGrace },
+	},
+	{dbState: "assigned", ghLabel: "idle"}: {
+		op:         opDestroy,
+		destroyMsg: "assigned: runner online but never picked up a job",
+		grace:      func(c Config) time.Duration { return c.AssignedGrace },
+	},
+	{dbState: "assigned", ghLabel: "missing"}: {
+		op:         opDestroy,
+		destroyMsg: "assigned: runner never registered on GitHub",
+		grace:      func(c Config) time.Duration { return c.AssignedGrace },
+	},
+
+	// running: a job is in flight.
+	{dbState: "running", ghLabel: "busy"}: {op: opNoop},
+	{dbState: "running", ghLabel: "idle"}: {
+		op:         opDestroy,
+		destroyMsg: "running: runner went idle (missed JobCompleted)",
+		grace:      func(c Config) time.Duration { return c.RunningIdleGrace },
+	},
+	{dbState: "running", ghLabel: "offline"}: {
+		op:         opDestroy,
+		destroyMsg: "running: runner went offline",
+	},
+	{dbState: "running", ghLabel: "missing"}: {
+		op:         opDestroy,
+		destroyMsg: "running: runner missing from GitHub",
+	},
+
+	// hot: pre-JIT pool. Only the busy-without-promote case is
+	// actionable; missing/offline/idle are the expected pre-handshake
+	// states and the pool's own age-based recycle handles a stalled
+	// hot row.
+	{dbState: "hot", ghLabel: "busy"}: {
+		op:           opPromote,
+		promoteMsg:   "reconcile: hot row observed as busy on GitHub; promoting",
+		promoteWarn:  true,
+		mismatchKind: "promote_running",
+	},
+	{dbState: "hot", ghLabel: "idle"}:    {op: opNoop},
+	{dbState: "hot", ghLabel: "offline"}: {op: opNoop},
+	{dbState: "hot", ghLabel: "missing"}: {op: opNoop},
+}
+
+// applyMatrix walks each row, looks up its (dbState, ghLabel) cell in
+// [stateTransitionTable], and fires the cell's action. The transition
+// table is the documentation for the reconciler's behaviour.
 func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo) {
 	now := time.Now()
 	for _, row := range rows {
@@ -347,66 +447,28 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 		ghLabel := ghStateLabel(gr, present)
 		age := now.Sub(row.StateSince)
 
-		switch row.State {
-		case "assigned":
-			r.reconcileAssigned(ctx, row, gr, present, age, ghLabel)
-		case "running":
-			r.reconcileRunning(ctx, row, gr, present, age, ghLabel)
-		case "hot":
-			r.reconcileHot(ctx, row, gr, present, age, ghLabel)
+		action, ok := stateTransitionTable[transitionKey{dbState: row.State, ghLabel: ghLabel}]
+		if !ok || action.op == opNoop {
+			continue
+		}
+		if action.grace != nil && age < action.grace(r.cfg) {
+			continue
+		}
+		switch action.op { //nolint:exhaustive // opNoop is short-circuited above
+		case opPromote:
+			if action.promoteWarn {
+				r.log.Warn(action.promoteMsg, "vmid", row.VMID, "runner_id", gr.ID)
+			} else {
+				r.log.Info(action.promoteMsg, "vmid", row.VMID, "runner_id", gr.ID)
+			}
+			r.promoteToRunning(ctx, row, gr.ID)
+			if action.mismatchKind != "" {
+				r.recordMismatch(row.State, ghLabel, action.mismatchKind)
+			}
+		case opDestroy:
+			r.forceDestroy(ctx, row.VMID, action.destroyMsg, row.State, ghLabel)
 		}
 	}
-}
-
-func (r *Reconciler) reconcileAssigned(ctx context.Context, row pool.RowSnapshot, gr pool.RunnerInfo, present bool, age time.Duration, ghLabel string) {
-	switch {
-	case present && gr.Busy:
-		// Listener missed JobStarted. Catch up.
-		r.log.Info("reconcile: promoting assigned->running (missed JobStarted)",
-			"vmid", row.VMID, "runner_id", gr.ID)
-		r.promoteToRunning(ctx, row, gr.ID)
-		r.recordMismatch(row.State, ghLabel, "promote_running")
-	case present && !gr.Online && age >= r.cfg.AssignedOfflineGrace:
-		// Runner registered then went offline before picking up work.
-		r.forceDestroy(ctx, row.VMID, "assigned: runner registered then went offline", row.State, ghLabel)
-	case present && gr.Online && !gr.Busy && age >= r.cfg.AssignedGrace:
-		// JIT injected, runner online, but never picked up a job.
-		r.forceDestroy(ctx, row.VMID, "assigned: runner online but never picked up a job", row.State, ghLabel)
-	case !present && age >= r.cfg.AssignedGrace:
-		// Runner never registered.
-		r.forceDestroy(ctx, row.VMID, "assigned: runner never registered on GitHub", row.State, ghLabel)
-	}
-}
-
-func (r *Reconciler) reconcileRunning(ctx context.Context, row pool.RowSnapshot, gr pool.RunnerInfo, present bool, age time.Duration, ghLabel string) {
-	switch {
-	case present && gr.Busy:
-		// Working as expected.
-	case present && gr.Online && !gr.Busy && age >= r.cfg.RunningIdleGrace:
-		// Job done; missed JobCompleted.
-		r.forceDestroy(ctx, row.VMID, "running: runner went idle (missed JobCompleted)", row.State, ghLabel)
-	case present && !gr.Online:
-		// Runner crashed or exited. Destroy and move on.
-		r.forceDestroy(ctx, row.VMID, "running: runner went offline", row.State, ghLabel)
-	case !present:
-		// Runner unregistered itself or was deleted out-of-band.
-		r.forceDestroy(ctx, row.VMID, "running: runner missing from GitHub", row.State, ghLabel)
-	}
-}
-
-func (r *Reconciler) reconcileHot(ctx context.Context, row pool.RowSnapshot, gr pool.RunnerInfo, present bool, _ time.Duration, ghLabel string) {
-	// Only act on the one anomalous case for Hot rows: GitHub observed
-	// the runner as busy without our local Hot -> Assigned ever firing.
-	// Hot + offline/missing is the NORMAL pre-JIT state (runners don't
-	// register until they boot), and the pool's own age-based recycle
-	// handles Hot rows that never come up.
-	if !present || !gr.Busy {
-		return
-	}
-	r.log.Warn("reconcile: hot row observed as busy on GitHub; promoting",
-		"vmid", row.VMID, "runner_id", gr.ID)
-	r.promoteToRunning(ctx, row, gr.ID)
-	r.recordMismatch(row.State, ghLabel, "promote_running")
 }
 
 // promoteToRunning is the shared error-handling wrapper for
