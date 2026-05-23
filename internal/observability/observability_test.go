@@ -349,7 +349,8 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	// Bind ":0" → kernel-assigned free port. Discovered via ln.Addr() so
 	// the test can run in parallel with any other Serve test without
 	// colliding on a fixed port.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := ln.Addr().String()
 
@@ -360,9 +361,17 @@ func TestServe_RespondsToProbes(t *testing.T) {
 		_ = observability.ServeOn(ctx, ln, reg, h, log)
 	}()
 
+	getURL := func(path string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		return http.DefaultClient.Do(req)
+	}
+
 	// Give Serve a moment to bind.
 	require.Eventually(t, func() bool {
-		resp, err := http.Get("http://" + addr + "/healthz")
+		resp, err := getURL("/healthz")
 		if err != nil {
 			return false
 		}
@@ -372,7 +381,7 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	}, time.Second, 20*time.Millisecond)
 
 	// /readyz should be 503 until health flips.
-	resp, err := http.Get("http://" + addr + "/readyz")
+	resp, err := getURL("/readyz")
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
@@ -382,13 +391,13 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	h.MarkRecoveryDone()
 	h.MarkProxmoxOK()
 
-	resp, err = http.Get("http://" + addr + "/readyz")
+	resp, err = getURL("/readyz")
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	// /metrics returns Prometheus text format.
-	resp, err = http.Get("http://" + addr + "/metrics")
+	resp, err = getURL("/metrics")
 	require.NoError(t, err)
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()

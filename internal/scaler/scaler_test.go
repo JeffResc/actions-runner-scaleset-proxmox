@@ -140,7 +140,7 @@ func (f *fakePool) acquireCount() int {
 type stubProvForScaler struct{}
 
 func (stubProvForScaler) Clone(context.Context, provisioner.CloneOptions) (*provisioner.VM, error) {
-	return nil, nil
+	return nil, nil //nolint:nilnil // test stub: scaler tests stub out provisionOne, so Clone isn't exercised
 }
 func (stubProvForScaler) Start(context.Context, *provisioner.VM) error                    { return nil }
 func (stubProvForScaler) Stop(context.Context, *provisioner.VM) error                     { return nil }
@@ -301,11 +301,11 @@ func TestHandleDesiredRunnerCount_PartialProvisionFailureReleasesVMs(t *testing.
 
 	// Custom provisionFn: the first 3 calls fail, the rest succeed.
 	var calls atomic.Int32
-	provisionFn := func(_ context.Context, vmObj *pool.VM) bool {
+	provisionFn := func(ctx context.Context, vmObj *pool.VM) bool {
 		n := calls.Add(1)
 		if n <= 3 {
 			// Simulate the production failure path: release the VM.
-			_ = fp.MarkCompleted(context.Background(), vmObj.VMID)
+			_ = fp.MarkCompleted(ctx, vmObj.VMID)
 			return false
 		}
 		return true

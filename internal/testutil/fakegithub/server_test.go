@@ -107,7 +107,9 @@ func TestServer_UnsupportedEndpointReturns501(t *testing.T) {
 	t.Parallel()
 	srv := fakegithub.New(t, fakegithub.Options{})
 
-	resp, err := http.Get(srv.URL + "/repos/octocat/hello/actions/jobs/42")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/repos/octocat/hello/actions/jobs/42", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusNotImplemented, resp.StatusCode,

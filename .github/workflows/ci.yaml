@@ -7,6 +7,10 @@ on:
   push:
     branches:
       - main
+  schedule:
+    # Weekly govulncheck run against main so newly-disclosed CVEs on
+    # already-pinned deps surface even when no PR touches the repo.
+    - cron: "0 8 * * 1"
 
 permissions:
   contents: read
@@ -112,9 +116,14 @@ jobs:
         run: go build -o bin/scaleset ./cmd/scaleset
 
       - name: Run govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          govulncheck ./...
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
+        with:
+          go-version-input: '1.26.3'
+          # The action's own actions/checkout step duplicates the
+          # Authorization header already set by the outer Checkout step,
+          # which makes git fetch fail with HTTP 400. Reuse the existing
+          # working tree instead.
+          repo-checkout: false
 
   helm-lint:
     name: Helm Lint

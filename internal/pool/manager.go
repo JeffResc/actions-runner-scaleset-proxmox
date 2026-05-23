@@ -926,7 +926,9 @@ func (m *manager) promoteN(_ context.Context, n int) {
 		}
 		row := w
 		m.wg.Add(1)
-		go func() {
+		// runBoot derives its own context from m.workerCtx; the caller's
+		// ctx is for the reconcile tick, not the boot lifetime.
+		go func() { //nolint:contextcheck // boot outlives the reconcile-tick ctx
 			defer m.wg.Done()
 			defer func() { m.logRecoveredPanic("promote", row.VMID, recover()) }()
 			defer m.bootSem.Release(1)
@@ -950,7 +952,9 @@ func (m *manager) kickClone(ctx context.Context, kind store.PoolKind, poweredOn 
 	}
 	m.wg.Add(1)
 	var vmid int
-	go func() {
+	// runClone derives its own context from m.workerCtx; the caller's
+	// ctx scopes the reconcile pass, not the clone lifetime.
+	go func() { //nolint:contextcheck // clone outlives the reconcile-tick ctx
 		defer m.wg.Done()
 		defer func() { m.logRecoveredPanic("clone", vmid, recover()) }()
 		defer m.cloneSem.Release(1)
@@ -1247,7 +1251,7 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 		// destroy succeeded doesn't abort the idempotent GitHub
 		// deregister already in flight and leak the registration.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), orphanCleanupTimeout)
-		err := m.cfg.OnRunnerOrphaned(cleanupCtx, runnerID)
+		err := m.cfg.OnRunnerOrphaned(cleanupCtx, runnerID) //nolint:contextcheck // deliberately detached; see comment above
 		cleanupCancel()
 		if err != nil {
 			m.log.Warn("destroy: orphan-runner cleanup failed", "vmid", vmid, "runner_id", runnerID, "err", err)

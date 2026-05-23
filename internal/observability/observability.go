@@ -372,7 +372,8 @@ func (h *Health) Ready() bool {
 // the configured address until ctx is cancelled. Wraps ServeOn with a
 // listener bound to addr.
 func Serve(ctx context.Context, addr string, reg *prometheus.Registry, h *Health, log *slog.Logger) error {
-	ln, err := net.Listen("tcp", addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("observability listen %s: %w", addr, err)
 	}
@@ -431,9 +432,12 @@ func ServeOn(ctx context.Context, ln net.Listener, reg *prometheus.Registry, h *
 
 	select {
 	case <-ctx.Done():
+		// Shutdown intentionally uses a fresh context: ctx is already
+		// cancelled, so deriving from it would short-circuit Shutdown
+		// before in-flight handlers finish their drain budget.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
+		if err := srv.Shutdown(shutdownCtx); err != nil { //nolint:contextcheck // see comment above
 			return fmt.Errorf("observability shutdown: %w", err)
 		}
 		return nil

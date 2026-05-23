@@ -20,6 +20,9 @@ linters:
     - nilerr
     - prealloc
     - gosec
+    - nilnil
+    - contextcheck
+    - noctx
   settings:
     revive:
       rules:

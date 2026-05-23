@@ -25,7 +25,7 @@ func do(t *testing.T, srv *fakeproxmox.Server, method, path string, body any) (i
 		require.NoError(t, err)
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, srv.URL+path, rdr)
+	req, err := http.NewRequestWithContext(t.Context(), method, srv.URL+path, rdr)
 	require.NoError(t, err)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

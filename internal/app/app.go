@@ -73,6 +73,8 @@ type Options struct {
 // error occurs. The caller owns the context lifecycle — main installs a
 // signal.NotifyContext for SIGINT/SIGTERM; tests cancel on their own
 // schedule.
+//
+//nolint:contextcheck // tracer/shutdown defers deliberately use fresh contexts; see in-body comments
 func Run(ctx context.Context, opts Options) error {
 	cfg, err := config.Load(opts.ConfigPath)
 	if err != nil {
@@ -102,7 +104,10 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("init tracer: %w", err)
 	}
-	defer func() {
+	defer func() { //nolint:contextcheck // see comment below
+		// Tracer flush uses a fresh context: this defer runs after
+		// ctx has been cancelled (signal or leader-plane failure), and
+		// deriving from a cancelled ctx would skip the flush.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := tracerShutdown(shutdownCtx); err != nil {
