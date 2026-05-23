@@ -286,7 +286,10 @@ type ProfileConfig struct {
 	MaxConcurrentRunners *int `yaml:"max_concurrent_runners,omitempty" validate:"omitempty,gte=0"`
 
 	// BootMaxAttempts / VMMaxAge are per-profile recycle/poison knobs.
-	// Nil/empty inherits the global pool defaults.
+	// Nil/empty inherits the global pool defaults. VMMaxAge must be a
+	// positive Go duration; zero/negative is rejected at config-load
+	// (Resolve) to avoid silently disabling age-based recycling. To
+	// inherit the fleet default, omit the field entirely.
 	BootMaxAttempts *int   `yaml:"boot_max_attempts,omitempty" validate:"omitempty,gte=0"`
 	VMMaxAge        string `yaml:"vm_max_age"`
 
@@ -756,6 +759,9 @@ func (c *Config) Resolve() error {
 		d, err := time.ParseDuration(p.VMMaxAge)
 		if err != nil {
 			return fmt.Errorf("profiles[%d].vm_max_age: %w", i, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("profiles[%q].vm_max_age must be positive (got %q)", p.Name, p.VMMaxAge)
 		}
 		p.VMMaxAgeD = d
 	}
