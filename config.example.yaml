@@ -58,6 +58,47 @@ scaleset:
   runner_group: default
   max_concurrent_runners: 50
 
+# --- Multi-scaleset shape (issue #1) ---
+# As an alternative to the singular `scaleset:` + top-level
+# `github.scope` + top-level `profiles:` form above, declare a
+# `scalesets:` list with one entry per scale set. Each entry
+# carries its own scope (org/repo), labels, max_concurrent_runners,
+# runner_group, and per-scaleset `profiles:`. Mixing the two
+# forms is rejected at load.
+#
+# NOTE: the schema, metric labels, and admin API namespacing all
+# support multiple scale sets, but the leader-plane orchestration
+# currently runs exactly one scale set per process — configs with
+# more than one entry are rejected at startup. The runtime fan-out
+# lands in a follow-up PR; declaring `scalesets: [{...}]` (single
+# element) today round-trips cleanly through ApplyDefaults.
+#
+# scalesets:
+#   - name: linux-x64
+#     labels: [self-hosted, linux, x64, proxmox]
+#     runner_group: default
+#     max_concurrent_runners: 50
+#     scope: { org: my-org }
+#     profiles:
+#       - name: linux-x64
+#         labels: [self-hosted, linux, x64, proxmox]
+#         hot_size: 5
+#         warm_size: 10
+#         max_concurrent_runners: 50
+#   - name: gpu-pool
+#     labels: [self-hosted, linux, gpu]
+#     max_concurrent_runners: 4
+#     scope: { org: my-other-org }
+#     profiles:
+#       - name: gpu
+#         labels: [self-hosted, linux, gpu]
+#         template_vmid: 9100
+#         cpu: 8
+#         memory_mb: 32768
+#         hot_size: 0
+#         warm_size: 1
+#         max_concurrent_runners: 4
+
 proxmox:
   endpoint: https://pve.example.com:8006/api2/json
   insecure_skip_verify: false

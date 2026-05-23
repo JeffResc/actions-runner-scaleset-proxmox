@@ -113,12 +113,33 @@ const envPrefix = "SCALESET_"
 // metadata but does not throttle or re-order based on it. See the
 // quotas / priority subpackages for the routing semantics.
 type Config struct {
-	GitHub        GitHubConfig        `yaml:"github" validate:"required"`
-	ScaleSet      ScaleSetConfig      `yaml:"scaleset" validate:"required"`
-	Proxmox       ProxmoxConfig       `yaml:"proxmox" validate:"required"`
-	Nodes         NodesConfig         `yaml:"nodes" validate:"required"`
-	Pool          PoolConfig          `yaml:"pool" validate:"required"`
-	Profiles      []ProfileConfig     `yaml:"profiles"`
+	GitHub GitHubConfig `yaml:"github" validate:"required"`
+
+	// ScaleSet is the legacy singular form. Operators with a
+	// single scaleset can keep this; ApplyDefaults normalises it
+	// into a 1-element Scalesets at load time and emits a
+	// deprecation warning. New configs should declare Scalesets
+	// directly. Mutually exclusive with Scalesets.
+	ScaleSet ScaleSetConfig `yaml:"scaleset,omitempty"`
+
+	// Scalesets hosts N scale sets in one orchestrator process
+	// (issue #1). Each entry has its own listener / pool /
+	// reconciler / scaler / profiles; shared infrastructure
+	// (proxmox, nodes, pool defaults, admin API, observability,
+	// cluster coordination) lives at the top level.
+	Scalesets []ScaleSetEntry `yaml:"scalesets,omitempty"`
+
+	Proxmox ProxmoxConfig `yaml:"proxmox" validate:"required"`
+	Nodes   NodesConfig   `yaml:"nodes" validate:"required"`
+	Pool    PoolConfig    `yaml:"pool" validate:"required"`
+
+	// Profiles is the legacy top-level profiles list. When
+	// ScaleSet (singular) is used, ApplyDefaults moves these
+	// into the synthesised 1-element Scalesets entry. With
+	// Scalesets declared, this must be empty (profiles are per-
+	// scaleset to avoid label collisions across scalesets).
+	Profiles []ProfileConfig `yaml:"profiles,omitempty"`
+
 	Quotas        QuotasConfig        `yaml:"quotas"`
 	Priority      PriorityConfig      `yaml:"priority"`
 	Observability ObservabilityConfig `yaml:"observability"`
@@ -212,7 +233,12 @@ type GitHubConfig struct {
 	AuthMode string           `yaml:"auth_mode" validate:"required,oneof=app pat"`
 	App      *GitHubAppConfig `yaml:"app,omitempty" validate:"required_if=AuthMode app"`
 	PAT      *GitHubPATConfig `yaml:"pat,omitempty" validate:"required_if=AuthMode pat"`
-	Scope    GitHubScope      `yaml:"scope" validate:"required"`
+
+	// Scope is the legacy top-level scope. Operators that use
+	// the singular `scaleset:` form set it here; ApplyDefaults
+	// folds it into the single Scalesets entry. Mutually
+	// exclusive with declaring Scalesets[i].Scope per-entry.
+	Scope GitHubScope `yaml:"scope,omitempty"`
 
 	// PollInterval is how often the reconciler queries the runners API.
 	// 15s is a good default — well under the rate limit and fast enough
@@ -272,12 +298,57 @@ type GitHubScope struct {
 	Repo string `yaml:"repo,omitempty"`
 }
 
-// ScaleSetConfig configures the scale set's identity.
+// ScaleSetConfig configures the scale set's identity. Used both
+// as the legacy singular Config.ScaleSet field and as the
+// embedded identity block in each ScaleSetEntry. The validator
+// requirements are dropped here (the wrapping struct enforces
+// them) so the singular form can be zero when Scalesets is the
+// active shape.
 type ScaleSetConfig struct {
+	Name                 string   `yaml:"name"`
+	Labels               []string `yaml:"labels"`
+	RunnerGroup          string   `yaml:"runner_group"`
+	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"gte=0"`
+}
+
+// ScaleSetEntry is one scale set within a multi-scaleset config
+// (issue #1). Each entry carries its own GitHub Scope and
+// Profiles so different scale sets can serve different orgs /
+// repos with different hardware shapes. Pool defaults, Proxmox
+// connection, node placement, admin API, observability, and
+// cluster coordination stay shared at the top level.
+type ScaleSetEntry struct {
+	// Identity fields (mirror ScaleSetConfig). Required on each
+	// entry.
 	Name                 string   `yaml:"name" validate:"required"`
 	Labels               []string `yaml:"labels"`
 	RunnerGroup          string   `yaml:"runner_group"`
 	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"required,gt=0"`
+
+	// Scope is the GitHub registration target for this scale
+	// set. Exactly one of Scope.Org or Scope.Repo must be set;
+	// uniqueness across the Scalesets list is enforced in
+	// Validate so two entries can't fight over the same scope.
+	Scope GitHubScope `yaml:"scope" validate:"required"`
+
+	// Profiles is the per-scaleset runner-profile catalog. May
+	// be empty: a one-profile scaleset implicitly synthesises a
+	// "default" profile from the entry's Labels +
+	// MaxConcurrentRunners + the shared Pool defaults, matching
+	// the singular-form behaviour.
+	Profiles []ProfileConfig `yaml:"profiles,omitempty"`
+}
+
+// asScaleSetConfig returns the identity fields of e in the
+// legacy ScaleSetConfig shape. Helper for code paths that
+// already speak ScaleSetConfig.
+func (e ScaleSetEntry) asScaleSetConfig() ScaleSetConfig {
+	return ScaleSetConfig{
+		Name:                 e.Name,
+		Labels:               e.Labels,
+		RunnerGroup:          e.RunnerGroup,
+		MaxConcurrentRunners: e.MaxConcurrentRunners,
+	}
 }
 
 // ProxmoxConfig configures the Proxmox VE connection and VM template/network.
@@ -919,6 +990,26 @@ func loadInto(yamlProvider koanf.Provider) (*Config, error) {
 		return nil, fmt.Errorf("config: unmarshal: %w", err)
 	}
 	cfg.unknownEnvOverrides = unknownEnv
+	// Mixing-rejection (issue #1): scalesets: is the new shape;
+	// scaleset: + top-level profiles: + github.scope are the
+	// legacy singular shape. Mixing the two leaves the
+	// orchestrator with two competing sources of truth — reject
+	// at load before ApplyDefaults silently merges them.
+	if len(cfg.Scalesets) > 0 {
+		var mixed []string
+		if cfg.ScaleSet.Name != "" || cfg.ScaleSet.MaxConcurrentRunners != 0 {
+			mixed = append(mixed, "scaleset:")
+		}
+		if len(cfg.Profiles) > 0 {
+			mixed = append(mixed, "profiles:")
+		}
+		if cfg.GitHub.Scope.Org != "" || cfg.GitHub.Scope.Repo != "" {
+			mixed = append(mixed, "github.scope:")
+		}
+		if len(mixed) > 0 {
+			return nil, fmt.Errorf("config: scalesets: declared alongside legacy %v — remove the legacy fields or remove scalesets: (mixing is ambiguous)", mixed)
+		}
+	}
 	cfg.ApplyDefaults()
 	if err := cfg.Resolve(); err != nil {
 		return nil, fmt.Errorf("config: resolve: %w", err)
@@ -1111,31 +1202,48 @@ func (c *Config) ApplyDefaults() {
 	if c.AdminAPI.TrustedProxies == nil {
 		c.AdminAPI.TrustedProxies = []string{"127.0.0.0/8", "::1/128"}
 	}
-	// Profiles: synthesise a single default profile from the global
-	// pool / proxmox / scaleset fields when no profiles block is
-	// declared. The rest of the orchestrator then runs the profile
-	// path uniformly — old single-profile configs still work, but
-	// internally there is always at least one profile.
-	if len(c.Profiles) == 0 {
-		c.Profiles = []ProfileConfig{{
-			Name:                 defaultProfileName,
+	// Multi-scaleset normalisation (issue #1):
+	//   - If the operator wrote the legacy singular form
+	//     (`scaleset:` + top-level `profiles:` + `github.scope`),
+	//     fold it into a 1-element Scalesets list.
+	//   - Mutually-exclusive use (both forms together) is caught
+	//     by Validate; ApplyDefaults's job is normalisation, not
+	//     enforcement.
+	//   - After this block, Scalesets is the source of truth.
+	//     The legacy ScaleSet / top-level Profiles / GitHub.Scope
+	//     fields are kept populated as projections of
+	//     Scalesets[0] for backwards-compatible call sites that
+	//     haven't been migrated yet.
+	if len(c.Scalesets) == 0 && (c.ScaleSet.Name != "" || c.ScaleSet.MaxConcurrentRunners != 0) {
+		c.Scalesets = []ScaleSetEntry{{
+			Name:                 c.ScaleSet.Name,
 			Labels:               append([]string(nil), c.ScaleSet.Labels...),
-			HotSize:              intp(c.Pool.HotSize),
-			WarmSize:             intp(c.Pool.WarmSize),
-			MaxConcurrentRunners: intp(c.ScaleSet.MaxConcurrentRunners),
-			BootMaxAttempts:      intp(c.Pool.BootMaxAttempts),
-			VMMaxAge:             c.Pool.VMMaxAge,
-			Schedules:            append([]ScheduleConfig(nil), c.Pool.Schedules...),
+			RunnerGroup:          c.ScaleSet.RunnerGroup,
+			MaxConcurrentRunners: c.ScaleSet.MaxConcurrentRunners,
+			Scope:                c.GitHub.Scope,
+			Profiles:             append([]ProfileConfig(nil), c.Profiles...),
 		}}
-	} else {
-		// Each profile inherits unset sizing knobs from the global
-		// pool / scaleset blocks. We assign back into the slice
-		// element because range copies the value. Nil-vs-explicit-zero
-		// distinction matters here: a profile that explicitly sets
-		// hot_size: 0 keeps it; a profile that omits the field
-		// inherits the global default.
-		for i := range c.Profiles {
-			p := &c.Profiles[i]
+	}
+	// Per-scaleset profile defaulting: synthesise a single
+	// "default" profile when an entry omits Profiles, and
+	// inherit unset sizing knobs from the global Pool block.
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		if len(s.Profiles) == 0 {
+			s.Profiles = []ProfileConfig{{
+				Name:                 defaultProfileName,
+				Labels:               append([]string(nil), s.Labels...),
+				HotSize:              intp(c.Pool.HotSize),
+				WarmSize:             intp(c.Pool.WarmSize),
+				MaxConcurrentRunners: intp(s.MaxConcurrentRunners),
+				BootMaxAttempts:      intp(c.Pool.BootMaxAttempts),
+				VMMaxAge:             c.Pool.VMMaxAge,
+				Schedules:            append([]ScheduleConfig(nil), c.Pool.Schedules...),
+			}}
+			continue
+		}
+		for i := range s.Profiles {
+			p := &s.Profiles[i]
 			if p.HotSize == nil {
 				p.HotSize = intp(c.Pool.HotSize)
 			}
@@ -1143,7 +1251,7 @@ func (c *Config) ApplyDefaults() {
 				p.WarmSize = intp(c.Pool.WarmSize)
 			}
 			if p.MaxConcurrentRunners == nil {
-				p.MaxConcurrentRunners = intp(c.ScaleSet.MaxConcurrentRunners)
+				p.MaxConcurrentRunners = intp(s.MaxConcurrentRunners)
 			}
 			if p.BootMaxAttempts == nil {
 				p.BootMaxAttempts = intp(c.Pool.BootMaxAttempts)
@@ -1152,6 +1260,19 @@ func (c *Config) ApplyDefaults() {
 				p.VMMaxAge = c.Pool.VMMaxAge
 			}
 		}
+	}
+	// Backwards-compat projection: when exactly one scaleset is
+	// declared (the singular-form case, or a new multi-scaleset
+	// config that happens to use 1 entry), keep ScaleSet /
+	// Profiles / GitHub.Scope populated as projections so call
+	// sites that still read the legacy fields continue to work.
+	// With N > 1 these legacy fields stay zero — those call
+	// sites must be migrated to iterate over Scalesets.
+	if len(c.Scalesets) == 1 {
+		s := c.Scalesets[0]
+		c.ScaleSet = s.asScaleSetConfig()
+		c.Profiles = append([]ProfileConfig(nil), s.Profiles...)
+		c.GitHub.Scope = s.Scope
 	}
 }
 
@@ -1179,12 +1300,18 @@ func (c *Config) Resolve() error {
 			return errors.New("github.app: set exactly one of client_id or app_id (both are empty)")
 		}
 	}
-	// GitHub scope: exactly one of org/repo.
-	switch {
-	case c.GitHub.Scope.Org == "" && c.GitHub.Scope.Repo == "":
-		return errors.New("github.scope: exactly one of org or repo must be set (both are empty)")
-	case c.GitHub.Scope.Org != "" && c.GitHub.Scope.Repo != "":
-		return errors.New("github.scope: exactly one of org or repo must be set (both are present)")
+	// GitHub scope: with N > 1 scalesets the legacy github.scope
+	// is meaningless (each scaleset has its own scope, validated
+	// by validateScalesets). Only enforce the legacy invariant
+	// when at most one scaleset is declared — in which case
+	// ApplyDefaults projected the scope into c.GitHub.Scope.
+	if len(c.Scalesets) <= 1 {
+		switch {
+		case c.GitHub.Scope.Org == "" && c.GitHub.Scope.Repo == "":
+			return errors.New("github.scope: exactly one of org or repo must be set (both are empty)")
+		case c.GitHub.Scope.Org != "" && c.GitHub.Scope.Repo != "":
+			return errors.New("github.scope: exactly one of org or repo must be set (both are present)")
+		}
 	}
 	// Proxmox API token secret — always required.
 	if c.Proxmox.Auth.TokenSecret == "" {
@@ -1223,14 +1350,23 @@ func (c *Config) Resolve() error {
 	// Profiles: per-profile vm_max_age must be positive when set.
 	// Empty inherits from pool (already applied in ApplyDefaults, so
 	// the inherit normally round-trips a positive default).
-	for i := range c.Profiles {
-		p := &c.Profiles[i]
-		if !p.VMMaxAge.Set() {
-			continue
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		for i := range s.Profiles {
+			p := &s.Profiles[i]
+			if !p.VMMaxAge.Set() {
+				continue
+			}
+			if p.VMMaxAge.D() <= 0 {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: vm_max_age must be positive",
+					si, s.Name, i, p.Name)
+			}
 		}
-		if p.VMMaxAge.D() <= 0 {
-			return fmt.Errorf("profiles[%d] %q: vm_max_age must be positive", i, p.Name)
-		}
+	}
+	// Keep the legacy projection in sync for backwards-compat
+	// callers reading c.Profiles directly.
+	if len(c.Scalesets) >= 1 {
+		c.Profiles = append([]ProfileConfig(nil), c.Scalesets[0].Profiles...)
 	}
 	// Profile schedules: parse Duration + Timezone + validate cron
 	// expression so misconfiguration surfaces at load rather than at
@@ -1336,6 +1472,9 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	if err := c.validateScalesets(); err != nil {
+		return err
+	}
 	if err := c.validateProfiles(); err != nil {
 		return err
 	}
@@ -1357,6 +1496,52 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// validateScalesets enforces the multi-scaleset invariants
+// (issue #1): at least one scaleset is declared, no two
+// entries share a Name or Scope, and each entry's
+// hot+warm <= max_concurrent_runners.
+//
+// NOTE: at runtime the orchestrator currently supports only one
+// active scaleset. Configurations with len(Scalesets) > 1 parse
+// and validate cleanly (so operators can stage the YAML form
+// for a future release) but are rejected at runtime by
+// app.Run with a clear migration message. The runtime fan-out
+// across N scalesets is tracked as a follow-up to issue #1.
+func (c *Config) validateScalesets() error {
+	if len(c.Scalesets) == 0 {
+		return errors.New("scalesets: at least one scale set must be declared (or use the legacy singular `scaleset:` form)")
+	}
+	seenName := make(map[string]int, len(c.Scalesets))
+	seenScope := make(map[string]int, len(c.Scalesets))
+	for i, s := range c.Scalesets {
+		if prev, dup := seenName[s.Name]; dup {
+			return fmt.Errorf("scalesets: duplicate name %q at indexes %d and %d", s.Name, prev, i)
+		}
+		seenName[s.Name] = i
+
+		hasOrg := s.Scope.Org != ""
+		hasRepo := s.Scope.Repo != ""
+		switch {
+		case hasOrg && hasRepo:
+			return fmt.Errorf("scalesets[%d] %q.scope: exactly one of org or repo must be set (both are present)", i, s.Name)
+		case !hasOrg && !hasRepo:
+			return fmt.Errorf("scalesets[%d] %q.scope: exactly one of org or repo must be set (both are empty)", i, s.Name)
+		}
+		scopeKey := "org:" + s.Scope.Org + "|repo:" + s.Scope.Repo
+		if prev, dup := seenScope[scopeKey]; dup {
+			return fmt.Errorf("scalesets: %q and %q share the same scope (org=%q repo=%q) — two scale sets cannot register against the same GitHub target",
+				c.Scalesets[prev].Name, s.Name, s.Scope.Org, s.Scope.Repo)
+		}
+		seenScope[scopeKey] = i
+
+		if c.Pool.HotSize+c.Pool.WarmSize > s.MaxConcurrentRunners {
+			return fmt.Errorf("scalesets[%d] %q: pool.hot_size+pool.warm_size (%d) must not exceed max_concurrent_runners (%d)",
+				i, s.Name, c.Pool.HotSize+c.Pool.WarmSize, s.MaxConcurrentRunners)
+		}
+	}
+	return nil
+}
+
 // validateProfileNetworks enforces internal consistency on each
 // profile's optional network block: an IPAM backend of "static"
 // must declare a non-empty pool, and IP entries must parse. The
@@ -1366,45 +1551,46 @@ func (c *Config) Validate() error {
 // at clone time. We just catch the obvious "static backend with
 // no pool" case where the operator clearly forgot a field.
 func (c *Config) validateProfileNetworks() error {
-	for i, p := range c.Profiles {
-		if p.Network == nil {
-			continue
-		}
-		// VLAN range checks — the struct-tag validator doesn't
-		// recurse through *ProfileNetworkConfig pointers, so do
-		// it manually.
-		if p.Network.VLANTag < 0 || p.Network.VLANTag > 4094 {
-			return fmt.Errorf("profiles[%d] %q: network.vlan_tag must be in [0, 4094]", i, p.Name)
-		}
-		if p.Network.MTU < 0 || p.Network.MTU > 9216 {
-			return fmt.Errorf("profiles[%d] %q: network.mtu must be in [0, 9216]", i, p.Name)
-		}
-		for j, nic := range p.Network.ExtraNICs {
-			if nic.Bridge == "" {
-				return fmt.Errorf("profiles[%d] %q: network.extra_nics[%d].bridge is required", i, p.Name, j)
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		for i, p := range s.Profiles {
+			prefix := fmt.Sprintf("scalesets[%d] %q.profiles[%d] %q", si, s.Name, i, p.Name)
+			if p.Network == nil {
+				continue
 			}
-			if nic.VLANTag < 0 || nic.VLANTag > 4094 {
-				return fmt.Errorf("profiles[%d] %q: network.extra_nics[%d].vlan_tag must be in [0, 4094]", i, p.Name, j)
+			if p.Network.VLANTag < 0 || p.Network.VLANTag > 4094 {
+				return fmt.Errorf("%s: network.vlan_tag must be in [0, 4094]", prefix)
 			}
-			if nic.MTU < 0 || nic.MTU > 9216 {
-				return fmt.Errorf("profiles[%d] %q: network.extra_nics[%d].mtu must be in [0, 9216]", i, p.Name, j)
+			if p.Network.MTU < 0 || p.Network.MTU > 9216 {
+				return fmt.Errorf("%s: network.mtu must be in [0, 9216]", prefix)
 			}
-		}
-		if p.Network.IPAM == nil {
-			continue
-		}
-		ip := p.Network.IPAM
-		switch ip.Backend {
-		case "", "noop":
-			if len(ip.Pool) > 0 {
-				return fmt.Errorf("profiles[%d] %q: ipam.pool must be empty when backend=noop", i, p.Name)
+			for j, nic := range p.Network.ExtraNICs {
+				if nic.Bridge == "" {
+					return fmt.Errorf("%s: network.extra_nics[%d].bridge is required", prefix, j)
+				}
+				if nic.VLANTag < 0 || nic.VLANTag > 4094 {
+					return fmt.Errorf("%s: network.extra_nics[%d].vlan_tag must be in [0, 4094]", prefix, j)
+				}
+				if nic.MTU < 0 || nic.MTU > 9216 {
+					return fmt.Errorf("%s: network.extra_nics[%d].mtu must be in [0, 9216]", prefix, j)
+				}
 			}
-		case "static":
-			if len(ip.Pool) == 0 {
-				return fmt.Errorf("profiles[%d] %q: ipam.pool is required when backend=static", i, p.Name)
+			if p.Network.IPAM == nil {
+				continue
 			}
-		default:
-			return fmt.Errorf("profiles[%d] %q: ipam.backend %q is not supported (must be one of: noop, static)", i, p.Name, ip.Backend)
+			ip := p.Network.IPAM
+			switch ip.Backend {
+			case "", "noop":
+				if len(ip.Pool) > 0 {
+					return fmt.Errorf("%s: ipam.pool must be empty when backend=noop", prefix)
+				}
+			case "static":
+				if len(ip.Pool) == 0 {
+					return fmt.Errorf("%s: ipam.pool is required when backend=static", prefix)
+				}
+			default:
+				return fmt.Errorf("%s: ipam.backend %q is not supported (must be one of: noop, static)", prefix, ip.Backend)
+			}
 		}
 	}
 	return nil
@@ -1419,13 +1605,18 @@ func (c *Config) validateProfileNetworks() error {
 //     auto-revert path can never fire — operator probably meant
 //     to set canary_template_vmid too).
 func (c *Config) validateProfileCanaries() error {
-	for i, p := range c.Profiles {
-		if p.CanaryTemplateVMID == 0 {
-			if p.CanaryPercent > 0 {
-				return fmt.Errorf("profiles[%d] %q: canary_percent > 0 requires canary_template_vmid", i, p.Name)
-			}
-			if p.CanaryMaxFailureRate > 0 {
-				return fmt.Errorf("profiles[%d] %q: canary_max_failure_rate > 0 requires canary_template_vmid", i, p.Name)
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		for i, p := range s.Profiles {
+			if p.CanaryTemplateVMID == 0 {
+				if p.CanaryPercent > 0 {
+					return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: canary_percent > 0 requires canary_template_vmid",
+						si, s.Name, i, p.Name)
+				}
+				if p.CanaryMaxFailureRate > 0 {
+					return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: canary_max_failure_rate > 0 requires canary_template_vmid",
+						si, s.Name, i, p.Name)
+				}
 			}
 		}
 	}
@@ -1443,9 +1634,17 @@ func (c *Config) validateNodeAffinity() error {
 	if len(c.Nodes.Affinity) == 0 {
 		return nil
 	}
-	knownProfiles := make(map[string]struct{}, len(c.Profiles))
-	for _, p := range c.Profiles {
-		knownProfiles[p.Name] = struct{}{}
+	// Profile names are scoped per-scaleset, so a rule that
+	// names "gpu" matches if ANY scaleset declares a "gpu"
+	// profile. Operators wanting per-scaleset affinity will
+	// need a future syntax extension (`match: { scaleset: ...,
+	// profile: ... }`); the current rule shape is intentionally
+	// scaleset-agnostic.
+	knownProfiles := make(map[string]struct{})
+	for si := range c.Scalesets {
+		for _, p := range c.Scalesets[si].Profiles {
+			knownProfiles[p.Name] = struct{}{}
+		}
 	}
 	knownNodes := make(map[string]struct{}, len(c.Nodes.Members)+1)
 	for _, n := range c.Nodes.Members {
@@ -1513,65 +1712,74 @@ func (c *Config) validatePriority() error {
 // through tags.ProfileTag without surprises.
 var profileNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
-// validateProfiles enforces non-empty, unique, well-formed profile
-// names and the GlobalMax ceiling. Per-profile inheritance from global
-// pool fields already happened in ApplyDefaults.
+// validateProfiles enforces per-scaleset profile-list invariants
+// and the fleet-wide GlobalMax ceiling. Per-profile inheritance
+// from global pool fields already happened in ApplyDefaults.
+//
+// Profile names are scoped to their owning scaleset, so two
+// scalesets may both declare a "default" profile without
+// collision. The label-coverage check runs per-scaleset: each
+// scaleset's profiles must collectively cover that scaleset's
+// labels.
 func (c *Config) validateProfiles() error {
-	if len(c.Profiles) == 0 {
-		// ApplyDefaults guarantees ≥ 1 profile; defending against a
-		// caller that bypassed it (e.g. constructing a Config in a
-		// test) keeps later code from segfaulting on an empty slice.
-		return errors.New("profiles: at least one profile is required (ApplyDefaults synthesises a default)")
-	}
-	seen := make(map[string]int, len(c.Profiles))
 	sumMax := 0
-	for i, p := range c.Profiles {
-		if !profileNameRE.MatchString(p.Name) {
-			return fmt.Errorf("profiles[%d].name %q must match %s", i, p.Name, profileNameRE.String())
+	for si := range c.Scalesets {
+		s := &c.Scalesets[si]
+		if len(s.Profiles) == 0 {
+			// ApplyDefaults guarantees >= 1 profile per
+			// scaleset; defending against a caller that
+			// bypassed it (e.g. constructing a Config in a
+			// test) keeps later code from segfaulting.
+			return fmt.Errorf("scalesets[%d] %q.profiles: at least one profile is required", si, s.Name)
 		}
-		if prev, dup := seen[p.Name]; dup {
-			return fmt.Errorf("profiles: duplicate name %q at indexes %d and %d", p.Name, prev, i)
-		}
-		seen[p.Name] = i
-		maxConc := p.MaxConcurrentRunnersOrDefault(c.ScaleSet.MaxConcurrentRunners)
-		if maxConc <= 0 {
-			return fmt.Errorf("profiles[%d] %q: max_concurrent_runners must be > 0 (inherited from scaleset when omitted)", i, p.Name)
-		}
-		hot := p.HotSizeOrDefault(c.Pool.HotSize)
-		warm := p.WarmSizeOrDefault(c.Pool.WarmSize)
-		if hot+warm > maxConc {
-			return fmt.Errorf("profiles[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
-				i, p.Name, hot+warm, maxConc)
-		}
-		// BootMaxAttempts must be >= 1 — accepting 0 would poison every
-		// VM in this profile on its first failed boot. ApplyDefaults
-		// inherits the global value when the profile omits the field, so
-		// any non-nil pointer here is operator intent.
-		if p.BootMaxAttempts != nil && *p.BootMaxAttempts < 1 {
-			return fmt.Errorf("profiles[%d] %q: boot_max_attempts (%d) must be >= 1",
-				i, p.Name, *p.BootMaxAttempts)
-		}
-		// Schedule sizes must not exceed the profile's
-		// max_concurrent_runners — otherwise a fired schedule would
-		// permanently exceed the cap. Reject at load time.
-		for j, s := range p.Schedules {
-			if s.HotSize+s.WarmSize > maxConc {
-				return fmt.Errorf("profiles[%d] %q.schedules[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
-					i, p.Name, j, s.Name, s.HotSize+s.WarmSize, maxConc)
+		seen := make(map[string]int, len(s.Profiles))
+		for i, p := range s.Profiles {
+			if !profileNameRE.MatchString(p.Name) {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d].name %q must match %s",
+					si, s.Name, i, p.Name, profileNameRE.String())
 			}
+			if prev, dup := seen[p.Name]; dup {
+				return fmt.Errorf("scalesets[%d] %q.profiles: duplicate name %q at indexes %d and %d",
+					si, s.Name, p.Name, prev, i)
+			}
+			seen[p.Name] = i
+			maxConc := p.MaxConcurrentRunnersOrDefault(s.MaxConcurrentRunners)
+			if maxConc <= 0 {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: max_concurrent_runners must be > 0 (inherited from scaleset when omitted)",
+					si, s.Name, i, p.Name)
+			}
+			hot := p.HotSizeOrDefault(c.Pool.HotSize)
+			warm := p.WarmSizeOrDefault(c.Pool.WarmSize)
+			if hot+warm > maxConc {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
+					si, s.Name, i, p.Name, hot+warm, maxConc)
+			}
+			if p.BootMaxAttempts != nil && *p.BootMaxAttempts < 1 {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: boot_max_attempts (%d) must be >= 1",
+					si, s.Name, i, p.Name, *p.BootMaxAttempts)
+			}
+			// Schedule sizes must not exceed the profile's
+			// max_concurrent_runners — otherwise a fired
+			// schedule would permanently exceed the cap.
+			for j, sched := range p.Schedules {
+				if sched.HotSize+sched.WarmSize > maxConc {
+					return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q.schedules[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
+						si, s.Name, i, p.Name, j, sched.Name, sched.HotSize+sched.WarmSize, maxConc)
+				}
+			}
+			sumMax += maxConc
 		}
-		sumMax += maxConc
+		// Label-routing safety: every label this scaleset
+		// advertises must be present on at least one of its
+		// profiles.
+		if gaps := uncoveredScaleSetLabels(s.Labels, s.Profiles); len(gaps) > 0 {
+			return fmt.Errorf("scalesets[%d] %q: no profile covers labels %v — add the labels to a profile or remove them from scaleset.labels",
+				si, s.Name, gaps)
+		}
 	}
 	if c.Pool.GlobalMax > 0 && sumMax > c.Pool.GlobalMax {
-		return fmt.Errorf("pool.global_max (%d) is below the sum of profile.max_concurrent_runners (%d)", c.Pool.GlobalMax, sumMax)
-	}
-	// Label-routing safety: every label the scaleset advertises must
-	// be present on at least one profile, otherwise a job arriving
-	// with that label has nowhere to go. The router (issue #7) will
-	// reject such jobs at runtime; catching the misconfiguration at
-	// load time is a much better operator experience.
-	if gaps := uncoveredScaleSetLabels(c.ScaleSet.Labels, c.Profiles); len(gaps) > 0 {
-		return fmt.Errorf("profiles: no profile covers scaleset labels %v — add the labels to a profile or remove them from scaleset.labels", gaps)
+		return fmt.Errorf("pool.global_max (%d) is below the sum of profile.max_concurrent_runners across all scalesets (%d)",
+			c.Pool.GlobalMax, sumMax)
 	}
 	return nil
 }

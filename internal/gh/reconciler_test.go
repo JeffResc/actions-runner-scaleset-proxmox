@@ -204,6 +204,7 @@ func baseCfg() Config {
 		AssignedOfflineGrace: 2 * time.Minute,
 		OrphanGrace:          60 * time.Second,
 		RunnerNamePrefix:     "gh-runner-test-",
+		ScaleSetName:         "test",
 	}
 }
 
@@ -453,7 +454,7 @@ func TestReconcile_PromoteFailure_MetersAndContinues(t *testing.T) {
 
 	require.Len(t, mgr.promoteCalls, 1, "reconciler must still attempt the promotion")
 	require.Equal(t, float64(1),
-		testutil.ToFloat64(metrics.ReconcileErrors.WithLabelValues("promote_running")),
+		testutil.ToFloat64(metrics.ReconcileErrors.WithLabelValues("test", "promote_running")),
 		"failed PromoteToRunning must increment scaleset_reconcile_errors_total{op=promote_running}")
 }
 

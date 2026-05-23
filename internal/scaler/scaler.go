@@ -43,8 +43,12 @@ var _ listener.Scaler = (*Scaler)(nil)
 // Config bundles the static information the Scaler needs.
 type Config struct {
 	ScaleSetID int
-	WorkFolder string // "_work" by default
-	NamePrefix string // matches the pool's VM name prefix
+	// ScaleSetName is the human-readable scaleset identifier
+	// recorded as the `scaleset` label on every metric this
+	// scaler emits (issue #1). Required.
+	ScaleSetName string
+	WorkFolder   string // "_work" by default
+	NamePrefix   string // matches the pool's VM name prefix
 }
 
 // Scaler implements scaleset.Scaler against the orchestrator's pool.
@@ -135,7 +139,7 @@ func (s *Scaler) SetPriority(p *priority.Matcher) { s.priority = p }
 // requires a deeper listener integration, deferred to a future PR.
 func (s *Scaler) HandleJobStarted(ctx context.Context, info *scaleset.JobStarted) error {
 	if s.metrics != nil {
-		s.metrics.ListenerMessages.WithLabelValues("job_started").Inc()
+		s.metrics.ListenerMessages.WithLabelValues(s.cfg.ScaleSetName, "job_started").Inc()
 	}
 	s.recordRouting(info.RequestLabels)
 	vmid, ok := vmidFromRunnerName(info.RunnerName, s.cfg.NamePrefix)
@@ -188,7 +192,7 @@ func (s *Scaler) recordPriority(class priority.Class) {
 	if s.metrics == nil {
 		return
 	}
-	s.metrics.PriorityAcquires.WithLabelValues(class.Name).Inc()
+	s.metrics.PriorityAcquires.WithLabelValues(s.cfg.ScaleSetName, class.Name).Inc()
 }
 
 // recordQuota looks up the effective per-(org|repo) cap for the
@@ -219,7 +223,7 @@ func (s *Scaler) recordQuota(_ context.Context, org, repo string) {
 		s.log.Warn("quota: bucket over cap",
 			"scope", res.Scope, "name", res.Name, "count", count, "cap", res.Cap)
 		if s.metrics != nil {
-			s.metrics.QuotaThrottled.WithLabelValues(string(res.Scope), res.Name).Inc()
+			s.metrics.QuotaThrottled.WithLabelValues(s.cfg.ScaleSetName, string(res.Scope), res.Name).Inc()
 		}
 	}
 }
@@ -270,7 +274,7 @@ func (s *Scaler) recordRouting(jobLabels []string) {
 	if err != nil {
 		s.log.Warn("router: no profile satisfies job labels", "labels", jobLabels, "err", err)
 		if s.metrics != nil {
-			s.metrics.UnroutedJobs.WithLabelValues(joinLabelsForMetric(jobLabels)).Inc()
+			s.metrics.UnroutedJobs.WithLabelValues(s.cfg.ScaleSetName, joinLabelsForMetric(jobLabels)).Inc()
 		}
 		return
 	}
@@ -295,7 +299,7 @@ func joinLabelsForMetric(labels []string) string {
 // HandleJobCompleted is called when a job finishes. We destroy the VM.
 func (s *Scaler) HandleJobCompleted(ctx context.Context, info *scaleset.JobCompleted) error {
 	if s.metrics != nil {
-		s.metrics.ListenerMessages.WithLabelValues("job_completed").Inc()
+		s.metrics.ListenerMessages.WithLabelValues(s.cfg.ScaleSetName, "job_completed").Inc()
 		// JobDuration intentionally NOT observed here — the listener
 		// payload doesn't carry the runner's start time, and the
 		// orchestrator's clock differs from the runner VM's. Track
@@ -331,7 +335,7 @@ const maxConcurrentProvisions = 8
 // to acquire — the next listener message will retry.
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
 	if s.metrics != nil {
-		s.metrics.ListenerMessages.WithLabelValues("desired_count").Inc()
+		s.metrics.ListenerMessages.WithLabelValues(s.cfg.ScaleSetName, "desired_count").Inc()
 	}
 	// Drive the pool's effective floor BEFORE we try to acquire — if
 	// count > HotSize we want reconcile to clone the difference asap,
@@ -436,7 +440,7 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	if err != nil {
 		s.log.Error("jit config generation failed; releasing vm", "vmid", vmObj.VMID, "err", err)
 		if s.metrics != nil {
-			s.metrics.GitHubErrors.WithLabelValues("generate_jit").Inc()
+			s.metrics.GitHubErrors.WithLabelValues(s.cfg.ScaleSetName, "generate_jit").Inc()
 		}
 		if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
 			s.log.Warn("mark completed failed after jit generation error", "vmid", vmObj.VMID, "err", mcErr)
@@ -475,7 +479,7 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		s.log.Error("jit injection failed (after retries); releasing vm", "vmid", vmObj.VMID, "err", err)
 		// Helper enforces the closed enum on `op` so a future caller
 		// can't blow up Prometheus cardinality silently.
-		s.metrics.RecordProxmoxError("inject_jit", vmObj.Node)
+		s.metrics.RecordProxmoxError(s.cfg.ScaleSetName, "inject_jit", vmObj.Node)
 		// Also deregister the runner we just minted; otherwise the
 		// next clone of this VMID will hit a 409.
 		s.cleanupStaleRunnerByName(vmObj.Name) //nolint:contextcheck // deliberately detached; see function comment
@@ -507,7 +511,7 @@ func (s *Scaler) cleanupStaleRunnerByName(name string) {
 	existing, err := s.gh.GetRunnerByName(ctx, name)
 	if err != nil {
 		if s.metrics != nil {
-			s.metrics.GitHubErrors.WithLabelValues("get_runner_by_name").Inc()
+			s.metrics.GitHubErrors.WithLabelValues(s.cfg.ScaleSetName, "get_runner_by_name").Inc()
 		}
 		s.log.Debug("stale runner cleanup: lookup failed", "name", name, "err", err)
 		return
@@ -518,7 +522,7 @@ func (s *Scaler) cleanupStaleRunnerByName(name string) {
 	}
 	if err := s.gh.RemoveRunner(ctx, int64(existing.ID)); err != nil {
 		if s.metrics != nil {
-			s.metrics.GitHubErrors.WithLabelValues("remove_stale_runner").Inc()
+			s.metrics.GitHubErrors.WithLabelValues(s.cfg.ScaleSetName, "remove_stale_runner").Inc()
 		}
 		s.log.Warn("stale runner cleanup: remove failed", "name", name, "id", existing.ID, "err", err)
 		return

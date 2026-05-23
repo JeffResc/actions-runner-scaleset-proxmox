@@ -248,6 +248,9 @@ func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner,
 	if cfg.BootMaxAttempts == 0 {
 		cfg.BootMaxAttempts = 3
 	}
+	if cfg.ScaleSetName == "" {
+		cfg.ScaleSetName = "test"
+	}
 
 	sel, err := nodeselector.NewSingle("pve1")
 	require.NoError(t, err)
@@ -1606,6 +1609,7 @@ func TestDestroyAsync_BacklogFull_DropsAndIncrementsCounter(t *testing.T) {
 		VMNamePrefix:         "gh-runner-test-",
 		TemplateNode:         "pve1",
 		BootMaxAttempts:      3,
+		ScaleSetName:         "test",
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	mi, err := NewManager(cfg, st, fp, sel, log, metrics)
@@ -1630,14 +1634,14 @@ func TestDestroyAsync_BacklogFull_DropsAndIncrementsCounter(t *testing.T) {
 	}
 
 	require.Eventually(t, func() bool {
-		drops := testutil.ToFloat64(metrics.PoolDestroyBacklogFull.WithLabelValues("default"))
+		drops := testutil.ToFloat64(metrics.PoolDestroyBacklogFull.WithLabelValues("test", "default"))
 		return drops >= float64(extras)
 	}, 2*time.Second, 5*time.Millisecond,
 		"expected at least %d backlog-full drops once queue + sem saturate", extras)
 
 	// And the drop count must not have ballooned past the burst size —
 	// dropped requests should be exactly the excess over the live cap.
-	drops := testutil.ToFloat64(metrics.PoolDestroyBacklogFull.WithLabelValues("default"))
+	drops := testutil.ToFloat64(metrics.PoolDestroyBacklogFull.WithLabelValues("test", "default"))
 	require.LessOrEqual(t, drops, float64(total),
 		"drop count (%g) should not exceed total burst (%d)", drops, total)
 }

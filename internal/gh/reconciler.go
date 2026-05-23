@@ -74,6 +74,11 @@ type Config struct {
 	// runner name (e.g. "gh-runner-proxmox-ubuntu-x64-"). Runners NOT
 	// matching this prefix are ignored.
 	RunnerNamePrefix string
+
+	// ScaleSetName is the human-readable identifier recorded as
+	// the `scaleset` label on every metric this reconciler emits
+	// (issue #1). Required.
+	ScaleSetName string
 }
 
 // Validate returns nil iff the config is internally consistent.
@@ -414,7 +419,7 @@ func (r *Reconciler) promoteToRunning(ctx context.Context, row pool.RowSnapshot,
 		r.log.Warn("reconcile: promote to running failed",
 			"vmid", row.VMID, "runner_id", runnerID, "db_state", row.State, "err", err)
 		if r.metrics != nil {
-			r.metrics.ReconcileErrors.WithLabelValues("promote_running").Inc()
+			r.metrics.ReconcileErrors.WithLabelValues(r.cfg.ScaleSetName, "promote_running").Inc()
 		}
 	}
 }
@@ -482,7 +487,7 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 		if err != nil {
 			r.log.Warn("reconcile: orphan runner removal failed", "name", name, "err", err)
 			if r.metrics != nil {
-				r.metrics.GitHubErrors.WithLabelValues("remove_runner").Inc()
+				r.metrics.GitHubErrors.WithLabelValues(r.cfg.ScaleSetName, "remove_runner").Inc()
 			}
 			// Leave in tracking so the next tick retries.
 			continue
@@ -562,7 +567,7 @@ func (r *Reconciler) forceDestroy(ctx context.Context, vmid int, reason, dbState
 func (r *Reconciler) recordMismatch(dbState, ghState, action string) {
 	// Helper enforces the closed enum on ghState/action so a typo or
 	// future caller can't blow up Prometheus cardinality silently.
-	r.metrics.RecordGHStateMismatch(dbState, ghState, action)
+	r.metrics.RecordGHStateMismatch(r.cfg.ScaleSetName, dbState, ghState, action)
 }
 
 // ghStateLabel collapses the (present, online, busy) tuple into a single

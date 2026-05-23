@@ -996,7 +996,7 @@ func TestProfiles_UncoveredScaleSetLabelRejected(t *testing.T) {
 		"[self-hosted, linux, proxmox, gpu]", "[self-hosted, linux, gpu]")
 	_, err := config.Parse([]byte(uncovered))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no profile covers scaleset labels")
+	require.Contains(t, err.Error(), "no profile covers labels")
 	require.Contains(t, err.Error(), "proxmox")
 }
 
@@ -1588,6 +1588,165 @@ func TestSchedules_PoolSchedulesInheritsIntoDefaultProfile(t *testing.T) {
 	require.Len(t, cfg.Profiles, 1)
 	require.Len(t, cfg.Profiles[0].Schedules, 1)
 	require.Equal(t, "night", cfg.Profiles[0].Schedules[0].Name)
+}
+
+const validMultiScalesetYAML = `
+github:
+  auth_mode: pat
+  pat:
+    token: testtoken
+
+scalesets:
+  - name: linux-x64
+    labels: [self-hosted, linux, proxmox, x64]
+    max_concurrent_runners: 10
+    scope:
+      org: org-a
+  - name: gpu-pool
+    labels: [self-hosted, linux, gpu]
+    max_concurrent_runners: 4
+    scope:
+      org: org-b
+    profiles:
+      - name: gpu
+        labels: [self-hosted, linux, gpu]
+        template_vmid: 9100
+        cpu: 8
+        memory_mb: 32768
+        hot_size: 0
+        warm_size: 1
+        max_concurrent_runners: 4
+
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  auth:
+    token_id: scaleset@pve!automation
+    token_secret: testsecret
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage:  { disk: local-lvm, snippets: local }
+  network:  { bridge: vmbr0 }
+  clone:    { linked: true }
+
+nodes:
+  strategy: single
+  single_node: pve1
+
+pool:
+  hot_size: 0
+  warm_size: 0
+  reconcile_interval: 5s
+  vm_max_age: 12h
+  drain_timeout: 15m
+  boot_max_attempts: 3
+`
+
+func TestScalesets_PluralFormParses(t *testing.T) {
+	cfg, err := config.Parse([]byte(validMultiScalesetYAML))
+	require.NoError(t, err)
+	require.Len(t, cfg.Scalesets, 2)
+	require.Equal(t, "linux-x64", cfg.Scalesets[0].Name)
+	require.Equal(t, "org-a", cfg.Scalesets[0].Scope.Org)
+	require.Equal(t, "gpu-pool", cfg.Scalesets[1].Name)
+	require.Equal(t, "org-b", cfg.Scalesets[1].Scope.Org)
+	// linux-x64 omits profiles; ApplyDefaults synthesised one.
+	require.Len(t, cfg.Scalesets[0].Profiles, 1)
+	require.Equal(t, "default", cfg.Scalesets[0].Profiles[0].Name)
+	// gpu-pool declared its own profile.
+	require.Len(t, cfg.Scalesets[1].Profiles, 1)
+	require.Equal(t, "gpu", cfg.Scalesets[1].Profiles[0].Name)
+}
+
+func TestScalesets_SingularFormFoldsToPlural(t *testing.T) {
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.Len(t, cfg.Scalesets, 1, "singular scaleset must normalise to 1-element Scalesets")
+	s := cfg.Scalesets[0]
+	require.Equal(t, "proxmox-ubuntu-x64", s.Name)
+	require.Equal(t, "my-org", s.Scope.Org)
+	require.Len(t, s.Profiles, 1)
+	// Backwards-compat projection: legacy fields stay populated.
+	require.Equal(t, s.Name, cfg.ScaleSet.Name)
+	require.Equal(t, s.Scope, cfg.GitHub.Scope)
+}
+
+func TestScalesets_MixingLegacyAndPluralRejected(t *testing.T) {
+	mixed := strings.Replace(validMultiScalesetYAML,
+		"github:\n  auth_mode: pat\n  pat:\n    token: testtoken\n",
+		"github:\n  auth_mode: pat\n  pat:\n    token: testtoken\n  scope:\n    org: leftover\n",
+		1)
+	_, err := config.Parse([]byte(mixed))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "scalesets:")
+	require.Contains(t, err.Error(), "github.scope")
+}
+
+func TestScalesets_DuplicateScopeRejected(t *testing.T) {
+	dup := strings.Replace(validMultiScalesetYAML, "org: org-b", "org: org-a", 1)
+	_, err := config.Parse([]byte(dup))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "share the same scope")
+}
+
+func TestScalesets_DuplicateNameRejected(t *testing.T) {
+	dup := strings.Replace(validMultiScalesetYAML, "name: gpu-pool", "name: linux-x64", 1)
+	_, err := config.Parse([]byte(dup))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate name")
+}
+
+func TestScalesets_BothOrgAndRepoInScopeRejected(t *testing.T) {
+	bad := strings.Replace(validMultiScalesetYAML,
+		"    scope:\n      org: org-a",
+		"    scope:\n      org: org-a\n      repo: org-a/repo",
+		1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exactly one of org or repo")
+}
+
+func TestScalesets_ProfileNamespacedPerScaleset(t *testing.T) {
+	// Both scalesets get a "default" profile from ApplyDefaults
+	// (no profiles block declared) — must not collide.
+	bare := `
+github:
+  auth_mode: pat
+  pat:
+    token: testtoken
+scalesets:
+  - name: a
+    labels: [a]
+    max_concurrent_runners: 5
+    scope: { org: org-a }
+  - name: b
+    labels: [b]
+    max_concurrent_runners: 5
+    scope: { org: org-b }
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  auth:
+    token_id: scaleset@pve!automation
+    token_secret: testsecret
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage: { disk: local-lvm, snippets: local }
+  network: { bridge: vmbr0 }
+nodes:
+  strategy: single
+  single_node: pve1
+pool:
+  hot_size: 0
+  warm_size: 0
+  reconcile_interval: 5s
+  vm_max_age: 12h
+  drain_timeout: 15m
+  boot_max_attempts: 3
+`
+	cfg, err := config.Parse([]byte(bare))
+	require.NoError(t, err)
+	require.Len(t, cfg.Scalesets, 2)
+	require.Equal(t, "default", cfg.Scalesets[0].Profiles[0].Name)
+	require.Equal(t, "default", cfg.Scalesets[1].Profiles[0].Name)
 }
 
 // TestDuration_UnmarshalText pins the parsing semantics: empty leaves

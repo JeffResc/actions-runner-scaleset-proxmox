@@ -233,7 +233,7 @@ func itoa(n int) string {
 func quietScaler(t *testing.T, fp *fakePool, provisionFn func(context.Context, *pool.VM) bool) *Scaler {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, fp, stubProvForScaler{}, log, nil)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, fp, stubProvForScaler{}, log, nil)
 	if provisionFn == nil {
 		provisionFn = func(context.Context, *pool.VM) bool { return true }
 	}
@@ -412,7 +412,7 @@ func scalerWithRouter(t *testing.T, profiles []router.Profile) (*Scaler, *observ
 	t.Helper()
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
 	r, err := router.New(profiles)
 	require.NoError(t, err)
 	s.SetRouter(r)
@@ -445,7 +445,7 @@ func TestHandleJobStarted_RoutedJobDoesNotIncrementUnrouted(t *testing.T) {
 
 	// Joined label key the recorder would have used IF this were a miss.
 	require.Equal(t, 0.0,
-		counterValue(t, metrics.UnroutedJobs, "linux|self-hosted|x64"),
+		counterValue(t, metrics.UnroutedJobs, "test", "linux|self-hosted|x64"),
 		"a matched job must not increment unrouted_jobs_total")
 }
 
@@ -466,7 +466,7 @@ func TestHandleJobStarted_UnroutedJobIncrementsCounter(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 1.0,
-		counterValue(t, metrics.UnroutedJobs, "self-hosted|windows"),
+		counterValue(t, metrics.UnroutedJobs, "test", "self-hosted|windows"),
 		"unrouted job must increment scaleset_unrouted_jobs_total with sorted|joined labels")
 }
 
@@ -474,7 +474,7 @@ func TestHandleJobStarted_NoRouterAttachedIsNoop(t *testing.T) {
 	t.Parallel()
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
 	// No SetRouter call — routing is disabled.
 
 	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
@@ -486,7 +486,7 @@ func TestHandleJobStarted_NoRouterAttachedIsNoop(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, 0.0,
-		counterValue(t, metrics.UnroutedJobs, "matches|never"),
+		counterValue(t, metrics.UnroutedJobs, "test", "matches|never"),
 		"nil router must NOT touch the unrouted counter")
 }
 
@@ -525,7 +525,7 @@ func TestHandleJobStarted_StampsJobMetadata(t *testing.T) {
 	t.Parallel()
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
 
 	pm, err := priority.New([]priority.Class{
 		{Name: "critical", Weight: 100, Match: priority.Match{Org: "acme"}},
@@ -546,7 +546,7 @@ func TestHandleJobStarted_StampsJobMetadata(t *testing.T) {
 
 	// priority_acquires_total{class="critical"} must increment.
 	require.Equal(t, 1.0,
-		counterValue(t, metrics.PriorityAcquires, "critical"),
+		counterValue(t, metrics.PriorityAcquires, "test", "critical"),
 		"job from matching org must increment its class counter")
 }
 
@@ -554,7 +554,7 @@ func TestHandleJobStarted_DefaultPriorityWhenNoMatcher(t *testing.T) {
 	t.Parallel()
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
 	// No SetPriority — every job falls into priority.ZeroClass ("default").
 
 	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
@@ -567,7 +567,7 @@ func TestHandleJobStarted_DefaultPriorityWhenNoMatcher(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 1.0,
-		counterValue(t, metrics.PriorityAcquires, "default"),
+		counterValue(t, metrics.PriorityAcquires, "test", "default"),
 		"no-priority-config baseline series under 'default'")
 }
 
@@ -575,7 +575,7 @@ func TestHandleJobStarted_QuotaOverIncrementsThrottled(t *testing.T) {
 	t.Parallel()
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
 
 	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 3})
 	require.NoError(t, err)
@@ -595,7 +595,7 @@ func TestHandleJobStarted_QuotaOverIncrementsThrottled(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 1.0,
-		counterValue(t, metrics.QuotaThrottled, "repo", "acme/platform"),
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
 		"quota over-cap must increment scaleset_quota_throttled_total{repo}")
 }
 
@@ -603,7 +603,7 @@ func TestHandleJobStarted_QuotaUnderCapNoThrottle(t *testing.T) {
 	t.Parallel()
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
 
 	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 10})
 	require.NoError(t, err)
@@ -622,7 +622,7 @@ func TestHandleJobStarted_QuotaUnderCapNoThrottle(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 0.0,
-		counterValue(t, metrics.QuotaThrottled, "repo", "acme/platform"),
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
 		"under-cap job must NOT increment throttled counter")
 }
 
@@ -630,7 +630,7 @@ func TestHandleJobStarted_DisabledQuotaResolverIsNoop(t *testing.T) {
 	t.Parallel()
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
 	// Empty config → Enabled()==false. Even if a counter says we're
 	// over 9000, no throttled metric is emitted.
 	qr, err := quotas.New(quotas.Config{})
@@ -650,7 +650,7 @@ func TestHandleJobStarted_DisabledQuotaResolverIsNoop(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 0.0,
-		counterValue(t, metrics.QuotaThrottled, "repo", "acme/platform"),
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
 		"disabled quotas resolver must skip the check entirely")
 }
 

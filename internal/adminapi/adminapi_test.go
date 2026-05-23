@@ -952,7 +952,7 @@ func TestPreempt_QueuesPreemptionAndIncrementsMetric(t *testing.T) {
 
 	require.Equal(t, []int{12345}, fp.preempted)
 	require.Equal(t, 1.0,
-		testutil.ToFloat64(metrics.Preemptions.WithLabelValues("", "manual")),
+		testutil.ToFloat64(metrics.Preemptions.WithLabelValues("", "", "manual")),
 		"preempt endpoint must bump scaleset_preemptions_total{to_class=manual}")
 }
 
@@ -1012,4 +1012,52 @@ func preemptHandler(s *Server) http.Handler {
 	r.Use(s.requireBearerToken)
 	r.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
 	return r
+}
+
+// TestNamespacedRoutes_RouteToCorrectScaleset locks in the
+// multi-scaleset routing (issue #1). Each scaleset registers its own
+// PoolAccessor; the namespaced URL determines which pool.Manager the
+// handler operates on. An unknown scaleset name produces 404, not the
+// 503 the legacy single-pool path returns on leader transitions.
+func TestNamespacedRoutes_RouteToCorrectScaleset(t *testing.T) {
+	t.Parallel()
+	fpA := &fakePool{stats: pool.Stats{Hot: 11}}
+	fpB := &fakePool{stats: pool.Stats{Hot: 22}}
+
+	s, err := New(Config{SharedSecret: "tk"}, nil, nil, AlwaysLeader{}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+	s.SetScalesetPool("a", func() pool.Manager { return fpA })
+	s.SetScalesetPool("b", func() pool.Manager { return fpB })
+
+	r := chi.NewRouter()
+	r.Use(s.requireBearerToken)
+	r.Get("/admin/{scaleset}/state", s.handleState)
+
+	// GET /admin/a/state → 200 with fpA's stats.
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/a/state", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp stateResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, 11, resp.Pool.Hot, "must route to scaleset a")
+
+	// GET /admin/b/state → 200 with fpB's stats.
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/b/state", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, 22, resp.Pool.Hot, "must route to scaleset b")
+
+	// Unknown scaleset → 404 (not 503).
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/nonexistent/state", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusNotFound, w.Code,
+		"unknown scaleset name must 404, not 503 (which means leader transition)")
 }
