@@ -508,27 +508,23 @@ func writeConfig(t testing.TB, v configValues) string {
 }
 
 // parseMetric does a minimal text-format scan looking for `name{labels...} value`.
-// labels is a slice of "k=v" strings (order matters — Prometheus emits
-// labels alphabetically, which is what we feed in). When labels is
-// empty, the unlabelled sample is returned. Returns 0 if no matching
-// sample is found.
+// labels is a slice of `k="v"` strings — REQUIRED subset, not an exact
+// match: a line whose labels are a superset of the requested ones still
+// matches, so tests that don't care about (e.g.) the `profile` dimension
+// don't break when a new label is added to the metric. When labels is
+// empty, the first sample whose label set is empty matches; if none
+// exists, the first sample is returned. Returns 0 if no sample matches.
 func parseMetric(body, name string, labels []string) float64 {
-	wantLabels := ""
-	if len(labels) > 0 {
-		wantLabels = "{" + strings.Join(labels, ",") + "}"
-	}
-	prefix := name + wantLabels + " "
 	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "#") {
+		if strings.HasPrefix(line, "#") || line == "" {
 			continue
 		}
-		if !strings.HasPrefix(line, prefix) {
+		gotName, gotLabels, valStr, ok := splitMetricLine(line)
+		if !ok || gotName != name {
 			continue
 		}
-		valStr := strings.TrimPrefix(line, prefix)
-		// Strip trailing timestamp if present.
-		if i := strings.IndexByte(valStr, ' '); i >= 0 {
-			valStr = valStr[:i]
+		if !labelSubset(labels, gotLabels) {
+			continue
 		}
 		v, err := strconv.ParseFloat(valStr, 64)
 		if err != nil {
@@ -537,6 +533,56 @@ func parseMetric(body, name string, labels []string) float64 {
 		return v
 	}
 	return 0
+}
+
+// splitMetricLine pulls `name{labels} value` out of a single text-format
+// metric line. Returns the name, the label string verbatim (without
+// the braces; empty when unlabelled), the value string, and ok=true
+// when the line parsed cleanly.
+func splitMetricLine(line string) (name, labels, value string, ok bool) {
+	// Find name terminator: either '{' (labelled) or ' ' (unlabelled).
+	brace := strings.IndexByte(line, '{')
+	space := strings.IndexByte(line, ' ')
+	if brace >= 0 && (space < 0 || brace < space) {
+		name = line[:brace]
+		closeBrace := strings.IndexByte(line[brace:], '}')
+		if closeBrace < 0 {
+			return "", "", "", false
+		}
+		labels = line[brace+1 : brace+closeBrace]
+		rest := strings.TrimLeft(line[brace+closeBrace+1:], " ")
+		// Strip trailing timestamp if present.
+		if i := strings.IndexByte(rest, ' '); i >= 0 {
+			rest = rest[:i]
+		}
+		return name, labels, rest, true
+	}
+	if space < 0 {
+		return "", "", "", false
+	}
+	name = line[:space]
+	rest := strings.TrimLeft(line[space:], " ")
+	if i := strings.IndexByte(rest, ' '); i >= 0 {
+		rest = rest[:i]
+	}
+	return name, "", rest, true
+}
+
+// labelSubset reports whether every `k="v"` in want appears in the
+// metric line's emitted labels (got). got is the verbatim
+// comma-separated label string Prometheus emits — substring search is
+// enough because labels are always quoted with `"` so a partial-key
+// false match is not possible.
+func labelSubset(want []string, got string) bool {
+	for _, w := range want {
+		if w == "" {
+			continue
+		}
+		if !strings.Contains(got, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // formatLabel builds a "k=\"v\"" snippet suitable for label-matched
