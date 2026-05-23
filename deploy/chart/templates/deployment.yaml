@@ -62,22 +62,26 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            - name: GITHUB_PAT
+            # Secret env vars are named for the canonical koanf
+            # override of the matching yaml key path
+            # (SCALESET_<UPPER.DOT.TO.UNDERSCORE>) — the orchestrator
+            # picks them up automatically; no yaml change needed.
+            - name: SCALESET_GITHUB_PAT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "scaleset.secretName" . }}
-                  key: GITHUB_PAT
-            - name: PROXMOX_TOKEN_SECRET
+                  key: SCALESET_GITHUB_PAT_TOKEN
+            - name: SCALESET_PROXMOX_AUTH_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "scaleset.secretName" . }}
-                  key: PROXMOX_TOKEN_SECRET
+                  key: SCALESET_PROXMOX_AUTH_TOKEN_SECRET
             {{- if or .Values.secrets.adminApi.sharedSecretValue .Values.secrets.existingSecret }}
-            - name: SCALESET_ADMIN_SECRET
+            - name: SCALESET_ADMIN_API_SHARED_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "scaleset.secretName" . }}
-                  key: SCALESET_ADMIN_SECRET
+                  key: SCALESET_ADMIN_API_SHARED_SECRET
                   optional: true
             {{- end }}
           volumeMounts:

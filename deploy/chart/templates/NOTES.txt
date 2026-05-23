@@ -15,7 +15,7 @@ Hit the admin API (the Service routes to any replica; non-leaders
 reverse-proxy to the leader transparently):
 
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "scaleset.fullname" . }} 9101:9101
-  curl -H "Authorization: Bearer <SCALESET_ADMIN_SECRET>" http://127.0.0.1:9101/admin/state
+  curl -H "Authorization: Bearer <SCALESET_ADMIN_API_SHARED_SECRET>" http://127.0.0.1:9101/admin/state
 
 Prometheus metrics:
 

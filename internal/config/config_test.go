@@ -26,7 +26,7 @@ const validPATYAML = `
 github:
   auth_mode: pat
   pat:
-    token_env: TEST_GH_TOKEN
+    token: testtoken
   scope:
     org: my-org
 
@@ -39,7 +39,7 @@ proxmox:
   endpoint: https://pve.example.com:8006/api2/json
   auth:
     token_id: scaleset@pve!automation
-    token_secret_env: TEST_PVE_TOKEN
+    token_secret: testsecret
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage:  { disk: local-lvm, snippets: local }
@@ -76,17 +76,12 @@ func setEnv(t *testing.T, kv map[string]string) {
 }
 
 func TestParse_ValidPAT(t *testing.T) {
-	setEnv(t, map[string]string{
-		"TEST_GH_TOKEN":  "ghp_fake",
-		"TEST_PVE_TOKEN": "pve-secret",
-	})
-
 	cfg, err := config.Parse([]byte(validPATYAML))
 	require.NoError(t, err)
 
-	// Env vars resolved into secret fields.
-	require.Equal(t, "ghp_fake", cfg.GitHub.PAT.Token)
-	require.Equal(t, "pve-secret", cfg.Proxmox.Auth.TokenSecret)
+	// Secrets populated from the yaml-side test value.
+	require.Equal(t, "testtoken", cfg.GitHub.PAT.Token)
+	require.Equal(t, "testsecret", cfg.Proxmox.Auth.TokenSecret)
 
 	// Durations parsed.
 	require.Equal(t, 5*time.Second, cfg.Pool.ReconcileIntervalD)
@@ -94,14 +89,105 @@ func TestParse_ValidPAT(t *testing.T) {
 	require.Equal(t, 15*time.Minute, cfg.Pool.DrainTimeoutD)
 }
 
-func TestParse_MissingEnvVar(t *testing.T) {
+// TestParse_EnvOverridesYAML covers the koanf env layer winning over a
+// yaml-supplied value. Sets a non-secret yaml field, overrides it via
+// the canonical SCALESET_* env var, asserts env wins.
+func TestParse_EnvOverridesYAML(t *testing.T) {
+	// validPATYAML has scaleset.name=proxmox-ubuntu-x64.
+	setEnv(t, map[string]string{"SCALESET_SCALESET_NAME": "from-env"})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.Equal(t, "from-env", cfg.ScaleSet.Name,
+		"SCALESET_SCALESET_NAME must override the yaml-supplied scaleset.name")
+}
+
+// TestParse_SecretFromEnvOnly covers the canonical production shape:
+// yaml omits the secret entirely, env supplies it via SCALESET_*. The
+// resolved Config carries the env value.
+func TestParse_SecretFromEnvOnly(t *testing.T) {
+	noSecretsYAML := strings.ReplaceAll(validPATYAML, "    token: testtoken", "")
+	noSecretsYAML = strings.ReplaceAll(noSecretsYAML, "    token_secret: testsecret", "")
 	setEnv(t, map[string]string{
-		"TEST_GH_TOKEN": "x",
-		// TEST_PVE_TOKEN intentionally unset
+		"SCALESET_GITHUB_PAT_TOKEN":          "ghp_from_env",
+		"SCALESET_PROXMOX_AUTH_TOKEN_SECRET": "pve_from_env",
 	})
-	_, err := config.Parse([]byte(validPATYAML))
+	cfg, err := config.Parse([]byte(noSecretsYAML))
+	require.NoError(t, err)
+	require.Equal(t, "ghp_from_env", cfg.GitHub.PAT.Token)
+	require.Equal(t, "pve_from_env", cfg.Proxmox.Auth.TokenSecret)
+}
+
+// TestParse_MissingSecret covers the "neither yaml nor env supplied
+// the secret" path: Resolve must reject with a clear error naming the
+// koanf key and the canonical SCALESET_* env var operators should set.
+func TestParse_MissingSecret(t *testing.T) {
+	noProxmoxSecretYAML := strings.ReplaceAll(validPATYAML, "    token_secret: testsecret", "")
+	_, err := config.Parse([]byte(noProxmoxSecretYAML))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), `"TEST_PVE_TOKEN"`)
+	require.Contains(t, err.Error(), "proxmox.auth.token_secret")
+	require.Contains(t, err.Error(), "SCALESET_PROXMOX_AUTH_TOKEN_SECRET")
+}
+
+// TestParse_UnknownEnvVarSurfaced covers the typo-detection path: a
+// SCALESET_*-prefixed env var that doesn't map to any schema key
+// doesn't fail the load (so host env pollution can't crash the
+// orchestrator), but Config.UnknownEnvOverrides surfaces it so the
+// caller can warn. Operators who typo SCALESET_POOL_HOTSIZE instead of
+// SCALESET_POOL_HOT_SIZE see the mistake at startup.
+//
+// Pairs real and bogus keys in the same Setenv batch so the negative
+// case (a valid override must NOT appear in the unknowns list) is
+// exercised alongside the positive cases.
+func TestParse_UnknownEnvVarSurfaced(t *testing.T) {
+	setEnv(t, map[string]string{
+		// Bogus — should appear in the unknowns list.
+		"SCALESET_TOTALLY_MADE_UP_KEY": "whatever",
+		"SCALESET_POOL_HOTSIZE":        "10", // typo: missing _ between hot and size
+		// Real — should be applied and NOT appear in the unknowns list.
+		"SCALESET_POOL_HOT_SIZE":           "7",
+		"SCALESET_OBSERVABILITY_LOG_LEVEL": "warn",
+	})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+
+	unknowns := cfg.UnknownEnvOverrides()
+	require.Contains(t, unknowns, "SCALESET_TOTALLY_MADE_UP_KEY")
+	require.Contains(t, unknowns, "SCALESET_POOL_HOTSIZE")
+	require.NotContains(t, unknowns, "SCALESET_POOL_HOT_SIZE",
+		"a real override must not be reported as unknown")
+	require.NotContains(t, unknowns, "SCALESET_OBSERVABILITY_LOG_LEVEL",
+		"a real override must not be reported as unknown")
+
+	// Sanity: the real overrides also took effect.
+	require.Equal(t, 7, cfg.Pool.HotSize)
+	require.Equal(t, "warn", cfg.Observability.LogLevel)
+}
+
+// TestParse_ProfileCanaryFieldsRoundTripThroughKoanf locks in that the
+// canary-rollout fields added under ProfileConfig (canary_template_vmid,
+// canary_percent, canary_max_failure_rate) are recognised by the koanf
+// strict-mode walk and unmarshal into the struct. A regression here
+// would silently swallow operator-specified canary settings.
+func TestParse_ProfileCanaryFieldsRoundTripThroughKoanf(t *testing.T) {
+	src := validPATYAML + `
+profiles:
+  - name: linux-x64
+    labels: [self-hosted, linux, proxmox]
+    template_vmid: 9000
+    cpu: 2
+    memory_mb: 4096
+    max_concurrent_runners: 5
+    canary_template_vmid: 9500
+    canary_percent: 25
+    canary_max_failure_rate: 0.15
+`
+	cfg, err := config.Parse([]byte(src))
+	require.NoError(t, err)
+	require.Len(t, cfg.Profiles, 1)
+	p := cfg.Profiles[0]
+	require.Equal(t, 9500, p.CanaryTemplateVMID)
+	require.Equal(t, 25, p.CanaryPercent)
+	require.InDelta(t, 0.15, p.CanaryMaxFailureRate, 1e-9)
 }
 
 func TestParse_UnknownYAMLField(t *testing.T) {
@@ -203,14 +289,14 @@ func TestApplyDefaults_FillsMissingFields(t *testing.T) {
 	minimal := `
 github:
   auth_mode: pat
-  pat: { token_env: TEST_GH_TOKEN }
+  pat: { token: testtoken }
   scope: { org: o }
 scaleset:
   name: x
   max_concurrent_runners: 5
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -258,12 +344,12 @@ func TestPool_RaceGraceKnobs_AcceptOverrides(t *testing.T) {
 	yaml := `
 github:
   auth_mode: pat
-  pat: { token_env: TEST_GH_TOKEN }
+  pat: { token: testtoken }
   scope: { org: o }
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -302,12 +388,12 @@ func TestPool_RaceGraceKnobs_RejectZeroOrNegative(t *testing.T) {
 			yaml := `
 github:
   auth_mode: pat
-  pat: { token_env: TEST_GH_TOKEN }
+  pat: { token: testtoken }
   scope: { org: o }
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -330,7 +416,7 @@ func TestParse_GitHubReconcilerOverrides(t *testing.T) {
 	src := `
 github:
   auth_mode: pat
-  pat: { token_env: TEST_GH_TOKEN }
+  pat: { token: testtoken }
   scope: { org: o }
   poll_interval: 7s
   assigned_grace: 99m
@@ -339,7 +425,7 @@ github:
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -367,7 +453,7 @@ github:
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -394,7 +480,7 @@ github:
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -420,7 +506,7 @@ github:
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -447,7 +533,7 @@ github:
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -474,7 +560,7 @@ github:
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
-  auth: { token_id: a!b, token_secret_env: TEST_PVE_TOKEN }
+  auth: { token_id: a!b, token_secret: testsecret }
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage: { disk: d, snippets: s }
@@ -756,7 +842,7 @@ const validProfileYAML = `
 github:
   auth_mode: pat
   pat:
-    token_env: TEST_GH_TOKEN
+    token: testtoken
   scope:
     org: my-org
 
@@ -769,7 +855,7 @@ proxmox:
   endpoint: https://pve.example.com:8006/api2/json
   auth:
     token_id: scaleset@pve!automation
-    token_secret_env: TEST_PVE_TOKEN
+    token_secret: testsecret
   template_vmid: 9000
   vmid_range: { min: 10000, max: 19999 }
   storage:  { disk: local-lvm, snippets: local }

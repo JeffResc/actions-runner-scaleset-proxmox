@@ -254,7 +254,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		return nil
 	}
 	if s.cfg.SharedSecret == "" {
-		return errors.New("admin: shared_secret_env must be set when http_addr is set")
+		return errors.New("admin: shared_secret must be set (via yaml or SCALESET_ADMIN_API_SHARED_SECRET) when http_addr is set")
 	}
 
 	r := chi.NewRouter()

@@ -1,15 +1,22 @@
 // Package config defines the orchestrator's runtime configuration: YAML
-// schema, env-var expansion for secrets, defaults, and validation.
+// schema, automatic env-var overrides, defaults, and validation.
 //
-// Secrets are NEVER stored in the YAML file. Instead, fields ending in
-// `*Env` (e.g. TokenSecretEnv) name an environment variable from which the
-// secret is read at startup by [Config.Resolve]. The resolved value is
-// kept in a sibling field tagged `yaml:"-"` so it is never serialized
-// back to disk.
+// Secrets are NEVER stored in the YAML file. Every config key — secret or
+// not — is overridable via an env var. The env-var name is the YAML key
+// path with dots replaced by underscores and uppercased, prefixed with
+// "SCALESET_". For example:
+//
+//	github.pat.token              → SCALESET_GITHUB_PAT_TOKEN
+//	proxmox.auth.token_secret     → SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+//	admin_api.shared_secret       → SCALESET_ADMIN_API_SHARED_SECRET
+//	pool.hot_size                 → SCALESET_POOL_HOT_SIZE
+//
+// snake_case yaml keys are preserved as single tokens (e.g. hot_size is
+// one key, not nested under hot.size); the env-name → key-path mapping
+// is built by reflecting on the Config struct's yaml tags at init.
 package config
 
 import (
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -17,15 +24,27 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
-	"gopkg.in/yaml.v3"
+	koanfyaml "github.com/knadh/koanf/parsers/yaml"
+	koanfenv "github.com/knadh/koanf/providers/env/v2"
+	koanffile "github.com/knadh/koanf/providers/file"
+	koanfrawbytes "github.com/knadh/koanf/providers/rawbytes"
+	"github.com/knadh/koanf/v2"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
 )
+
+// envPrefix is the prefix every config-overriding env var must carry.
+// Chosen to namespace this orchestrator's vars against unrelated env on
+// the host. Combined with the schema map below, SCALESET_FOO_BAR_BAZ
+// uniquely identifies one koanf key path.
+const envPrefix = "SCALESET_"
 
 // Config is the full orchestrator configuration parsed from YAML.
 //
@@ -51,6 +70,22 @@ type Config struct {
 	Observability ObservabilityConfig `yaml:"observability"`
 	AdminAPI      AdminAPIConfig      `yaml:"admin_api"`
 	Cluster       ClusterConfig       `yaml:"cluster"`
+
+	// unknownEnvOverrides captures SCALESET_*-prefixed env vars present
+	// at Load time that didn't match any schema key. Exposed via
+	// [Config.UnknownEnvOverrides] so the caller can warn — typos like
+	// SCALESET_POOL_HOTSIZE (missing the second underscore) would
+	// otherwise silently no-op and leave the operator guessing why the
+	// override didn't take effect.
+	unknownEnvOverrides []string `yaml:"-"`
+}
+
+// UnknownEnvOverrides returns the SCALESET_*-prefixed env vars that
+// were present at Load time but didn't match any schema key. Callers
+// (typically the orchestrator's main()) should log each one as a
+// warning so a typo'd override is loud instead of silently dropped.
+func (c *Config) UnknownEnvOverrides() []string {
+	return append([]string(nil), c.unknownEnvOverrides...)
 }
 
 // QuotasConfig caps per-org / per-repo concurrent VMs. The actual
@@ -175,10 +210,11 @@ func (g GitHubAppConfig) Issuer() string {
 }
 
 // GitHubPATConfig configures personal access token authentication. The
-// token itself is read from the env var named by TokenEnv at Resolve time.
+// token must be supplied via the SCALESET_GITHUB_PAT_TOKEN env var (or
+// any other koanf-source override of the github.pat.token key); writing
+// it into yaml is not recommended.
 type GitHubPATConfig struct {
-	TokenEnv string `yaml:"token_env" validate:"required"`
-	Token    string `yaml:"-"`
+	Token string `yaml:"token" koanf:"token"`
 }
 
 // GitHubScope selects the registration target. Exactly one of Org or Repo
@@ -208,12 +244,13 @@ type ProxmoxConfig struct {
 	Clone              CloneConfig    `yaml:"clone"`
 }
 
-// ProxmoxAuth holds API token credentials. The secret is read from the env
-// var named by TokenSecretEnv at Resolve time.
+// ProxmoxAuth holds API token credentials. The secret must be supplied
+// via the SCALESET_PROXMOX_AUTH_TOKEN_SECRET env var (or any other
+// koanf-source override of the proxmox.auth.token_secret key); writing
+// it into yaml is not recommended.
 type ProxmoxAuth struct {
-	TokenID        string `yaml:"token_id" validate:"required"`
-	TokenSecretEnv string `yaml:"token_secret_env" validate:"required"`
-	TokenSecret    string `yaml:"-"`
+	TokenID     string `yaml:"token_id" validate:"required"`
+	TokenSecret string `yaml:"token_secret" koanf:"token_secret"`
 }
 
 // VMIDRange is the inclusive range of VMIDs the orchestrator may allocate.
@@ -556,9 +593,8 @@ type TracingConfig struct {
 // AdminAPIConfig configures the admin HTTP API. Optional; disabled when
 // HTTPAddr is empty.
 type AdminAPIConfig struct {
-	HTTPAddr        string `yaml:"http_addr"`
-	SharedSecretEnv string `yaml:"shared_secret_env"`
-	SharedSecret    string `yaml:"-"`
+	HTTPAddr     string `yaml:"http_addr"`
+	SharedSecret string `yaml:"shared_secret" koanf:"shared_secret"`
 
 	// TrustedProxies is the list of CIDR ranges from which the admin
 	// server will honor X-Forwarded-For / X-Real-IP headers when
@@ -708,21 +744,66 @@ func Load(path string) (*Config, error) {
 	if err := fileperm.CheckOwnership(info, path); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	data, err := os.ReadFile(path) // #nosec G304 -- path is the operator-supplied config file; perm- and owner-checked above.
-	if err != nil {
-		return nil, fmt.Errorf("config: read %s: %w", path, err)
-	}
-	return Parse(data)
+	// koanf's file provider re-reads the file inside k.Load. The
+	// fileperm checks above gate the read so a too-permissive PEM
+	// can't be silently slurped.
+	return loadInto(koanffile.Provider(path))
 }
 
 // Parse is the in-memory equivalent of [Load]. Useful for tests.
+//
+// Load order, with later layers overriding earlier ones:
+//
+//  1. YAML file (bytes argument).
+//  2. SCALESET_*-prefixed env vars, mapped to koanf keys via the
+//     reflect-built schema map.
+//
+// Any unknown YAML key (typo) fails the load — same as the pre-koanf
+// loader's KnownFields(true) behaviour. Unknown SCALESET_* env vars are
+// silently ignored: env is often the wrong place to enforce schema, and
+// host-level env pollution shouldn't crash the orchestrator.
 func Parse(data []byte) (*Config, error) {
-	var cfg Config
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true) // catch typos in YAML keys early
-	if err := dec.Decode(&cfg); err != nil {
+	return loadInto(koanfrawbytes.Provider(data))
+}
+
+// loadInto is the shared koanf pipeline for both Load() (file provider)
+// and Parse() (raw-bytes provider). Producing identical behaviour from
+// both entry points was non-trivial under the pre-koanf bespoke loader;
+// here it's a parameter.
+func loadInto(yamlProvider koanf.Provider) (*Config, error) {
+	k := koanf.New(".")
+	if err := k.Load(yamlProvider, koanfyaml.Parser()); err != nil {
 		return nil, fmt.Errorf("config: parse yaml: %w", err)
 	}
+	if err := rejectUnknownYAMLKeys(k); err != nil {
+		return nil, err
+	}
+
+	// Capture SCALESET_*-prefixed env vars whose names don't map to any
+	// schema key, so the caller can warn at startup. The env.Provider
+	// only invokes this transform for already-prefixed names (the
+	// Prefix option filters first), so the closure is bounded to the
+	// operator's intentional overrides.
+	var unknownEnv []string
+	envProv := koanfenv.Provider(".", koanfenv.Opt{
+		Prefix: envPrefix,
+		TransformFunc: func(name, value string) (string, any) {
+			if key, ok := schemaEnvMap[name]; ok {
+				return key, value
+			}
+			unknownEnv = append(unknownEnv, name)
+			return "", nil
+		},
+	})
+	if err := k.Load(envProv, nil); err != nil {
+		return nil, fmt.Errorf("config: load env: %w", err)
+	}
+
+	var cfg Config
+	if err := k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{Tag: "yaml"}); err != nil {
+		return nil, fmt.Errorf("config: unmarshal: %w", err)
+	}
+	cfg.unknownEnvOverrides = unknownEnv
 	cfg.ApplyDefaults()
 	if err := cfg.Resolve(); err != nil {
 		return nil, fmt.Errorf("config: resolve: %w", err)
@@ -731,6 +812,139 @@ func Parse(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("config: validate: %w", err)
 	}
 	return &cfg, nil
+}
+
+// rejectUnknownYAMLKeys preserves the pre-koanf loader's strict-mode
+// behaviour: any YAML key not in the Config schema fails the load with
+// a clear error pointing at the offending key. Without this, an
+// operator typo (`pool.hot_sze: 5`) would silently no-op.
+func rejectUnknownYAMLKeys(k *koanf.Koanf) error {
+	for _, key := range k.Keys() {
+		if !isSchemaKey(key) {
+			return fmt.Errorf("config: unknown yaml key %q", key)
+		}
+	}
+	return nil
+}
+
+// schemaEnvMap maps SCALESET_-prefixed env names to koanf key paths.
+// schemaKeySet is the union of all valid koanf key paths reachable
+// from the Config struct, used by rejectUnknownYAMLKeys.
+//
+// Both are built once at package init by walking the Config struct's
+// yaml tags. List-of-struct paths (e.g. profiles[].name) are tracked
+// by their list head only; per-element keys round-trip through koanf
+// unmarshal without needing a per-index env mapping (the env override
+// surface for slice-of-struct is intentionally limited).
+var (
+	schemaEnvMap map[string]string
+	schemaKeySet map[string]struct{}
+)
+
+func init() {
+	schemaEnvMap = make(map[string]string)
+	schemaKeySet = make(map[string]struct{})
+	buildSchema(reflect.TypeOf(Config{}), "")
+}
+
+func buildSchema(t reflect.Type, prefix string) {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := strings.Split(f.Tag.Get("yaml"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		key := tag
+		if prefix != "" {
+			key = prefix + "." + tag
+		}
+		schemaKeySet[key] = struct{}{}
+		envName := envPrefix + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+		schemaEnvMap[envName] = key
+
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		switch ft.Kind() { //nolint:exhaustive // only struct + slice-of-struct need recursion; other kinds are leaves
+		case reflect.Struct:
+			buildSchema(ft, key)
+		case reflect.Slice:
+			elem := ft.Elem()
+			if elem.Kind() == reflect.Pointer {
+				elem = elem.Elem()
+			}
+			if elem.Kind() == reflect.Struct {
+				// Slice-of-struct: register element field key paths so a
+				// typo'd YAML key inside (e.g. profiles[0].nme) still
+				// fails the strict-mode walk. Env-override of slice
+				// elements is not supported (no stable per-index env
+				// name), so we don't add these to schemaEnvMap.
+				buildSliceElemSchema(elem, key)
+			}
+		}
+	}
+}
+
+func buildSliceElemSchema(t reflect.Type, prefix string) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := strings.Split(f.Tag.Get("yaml"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		key := prefix + "." + tag
+		schemaKeySet[key] = struct{}{}
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Struct {
+			buildSliceElemSchema(ft, key)
+		} else if ft.Kind() == reflect.Slice {
+			elem := ft.Elem()
+			if elem.Kind() == reflect.Pointer {
+				elem = elem.Elem()
+			}
+			if elem.Kind() == reflect.Struct {
+				buildSliceElemSchema(elem, key)
+			}
+		}
+	}
+}
+
+// isSchemaKey reports whether the given koanf key path corresponds to
+// a declared field in the Config schema. Per-index slice keys are
+// stripped of their numeric index before lookup so e.g.
+// "profiles.0.name" matches the registered "profiles.name".
+func isSchemaKey(key string) bool {
+	if _, ok := schemaKeySet[key]; ok {
+		return true
+	}
+	stripped := stripSliceIndices(key)
+	_, ok := schemaKeySet[stripped]
+	return ok
+}
+
+// stripSliceIndices removes numeric path components from a koanf key,
+// collapsing "profiles.0.network.extra_nics.1.bridge" to
+// "profiles.network.extra_nics.bridge" — the form buildSchema records.
+func stripSliceIndices(key string) string {
+	parts := strings.Split(key, ".")
+	out := parts[:0]
+	for _, p := range parts {
+		if _, err := strconv.Atoi(p); err == nil {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, ".")
 }
 
 // defaultProfileName is the synthetic profile name used when no
@@ -853,16 +1067,18 @@ func (c *Config) ApplyDefaults() {
 	}
 }
 
-// Resolve performs env-var expansion of secret-bearing fields and parses
-// duration strings into [time.Duration]. Call before [Validate].
+// Resolve enforces cross-field invariants and parses duration strings
+// into [time.Duration]. Call before [Validate].
+//
+// Secrets are no longer env-resolved here — koanf's env layer in Parse
+// already populated them. Resolve only checks that the required secret
+// fields are non-empty after the koanf merge.
 func (c *Config) Resolve() error {
-	// GitHub PAT token.
+	// GitHub PAT token — must be present when PAT auth is selected.
 	if c.GitHub.PAT != nil {
-		v, err := mustEnv(c.GitHub.PAT.TokenEnv)
-		if err != nil {
-			return fmt.Errorf("github.pat.token_env: %w", err)
+		if c.GitHub.PAT.Token == "" {
+			return errors.New("github.pat.token: required (set via yaml or SCALESET_GITHUB_PAT_TOKEN)")
 		}
-		c.GitHub.PAT.Token = v
 	}
 	// GitHub App: exactly one of client_id / app_id.
 	if c.GitHub.App != nil {
@@ -882,22 +1098,13 @@ func (c *Config) Resolve() error {
 	case c.GitHub.Scope.Org != "" && c.GitHub.Scope.Repo != "":
 		return errors.New("github.scope: exactly one of org or repo must be set (both are present)")
 	}
-	// Proxmox API token secret.
-	if c.Proxmox.Auth.TokenSecretEnv != "" {
-		v, err := mustEnv(c.Proxmox.Auth.TokenSecretEnv)
-		if err != nil {
-			return fmt.Errorf("proxmox.auth.token_secret_env: %w", err)
-		}
-		c.Proxmox.Auth.TokenSecret = v
+	// Proxmox API token secret — always required.
+	if c.Proxmox.Auth.TokenSecret == "" {
+		return errors.New("proxmox.auth.token_secret: required (set via yaml or SCALESET_PROXMOX_AUTH_TOKEN_SECRET)")
 	}
-	// Admin API shared secret (optional).
-	if c.AdminAPI.SharedSecretEnv != "" {
-		v, err := mustEnv(c.AdminAPI.SharedSecretEnv)
-		if err != nil {
-			return fmt.Errorf("admin_api.shared_secret_env: %w", err)
-		}
-		c.AdminAPI.SharedSecret = v
-	}
+	// Admin API shared secret — optional at config-load (the admin API
+	// itself refuses to start with an empty secret when HTTPAddr is
+	// set; see adminapi.Serve and #146 for the loud failure mode).
 	// Node selector consistency.
 	switch c.Nodes.Strategy {
 	case "single":
@@ -1422,13 +1629,4 @@ func (t *TLSConfig) validate(prefix string) error {
 		}
 	}
 	return nil
-}
-
-// mustEnv reads a required env var, returning an error if it's empty.
-func mustEnv(name string) (string, error) {
-	v, ok := os.LookupEnv(name)
-	if !ok || v == "" {
-		return "", fmt.Errorf("env var %q is not set or empty", name)
-	}
-	return v, nil
 }
