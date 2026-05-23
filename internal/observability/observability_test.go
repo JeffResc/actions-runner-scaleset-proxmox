@@ -64,20 +64,21 @@ func TestNewMetrics_RegistersAll(t *testing.T) {
 	require.NotNil(t, m)
 
 	// Touch each instrument so it shows up in /metrics output.
-	m.PoolSize.WithLabelValues("default", "hot").Set(2)
-	m.VMsTotal.WithLabelValues("default", "success").Inc()
-	m.CloneDuration.WithLabelValues("default", "true", "pve1").Observe(1.5)
-	m.BootDuration.WithLabelValues("default", "pve1").Observe(7.0)
-	m.AcquireDuration.WithLabelValues("default", "hot").Observe(0.5)
-	m.ProxmoxErrors.WithLabelValues("clone", "pve1").Inc()
-	m.GitHubErrors.WithLabelValues("list-runners").Inc()
-	m.ListenerMessages.WithLabelValues("job_started").Inc()
-	m.ReconcileDuration.Observe(0.05)
-	m.AtCapacityTotal.Inc()
-	m.GHAPICalls.WithLabelValues("runners", "2xx").Inc()
-	m.GHRateLimitRemaining.Set(4999)
-	m.GHStateMismatch.WithLabelValues("assigned", "missing", "destroy").Inc()
-	m.RunnerHookEvents.WithLabelValues("started", "ok").Inc()
+	const ss = "test-ss"
+	m.PoolSize.WithLabelValues(ss, "default", "hot").Set(2)
+	m.VMsTotal.WithLabelValues(ss, "default", "success").Inc()
+	m.CloneDuration.WithLabelValues(ss, "default", "true", "pve1").Observe(1.5)
+	m.BootDuration.WithLabelValues(ss, "default", "pve1").Observe(7.0)
+	m.AcquireDuration.WithLabelValues(ss, "default", "hot").Observe(0.5)
+	m.ProxmoxErrors.WithLabelValues(ss, "clone", "pve1").Inc()
+	m.GitHubErrors.WithLabelValues(ss, "list-runners").Inc()
+	m.ListenerMessages.WithLabelValues(ss, "job_started").Inc()
+	m.ReconcileDuration.WithLabelValues(ss).Observe(0.05)
+	m.AtCapacityTotal.WithLabelValues(ss).Inc()
+	m.GHAPICalls.WithLabelValues(ss, "runners", "2xx").Inc()
+	m.GHRateLimitRemaining.WithLabelValues(ss).Set(4999)
+	m.GHStateMismatch.WithLabelValues(ss, "assigned", "missing", "destroy").Inc()
+	m.RunnerHookEvents.WithLabelValues(ss, "started", "ok").Inc()
 	m.Leader.Set(1)
 
 	families, err := reg.Gather()
@@ -122,8 +123,8 @@ func TestCloneBootBuckets_CoverSlowProxmox(t *testing.T) {
 	// Single observation past the old upper bucket but inside the new
 	// one. If the buckets are too tight this observation lands in +Inf;
 	// if they're wide enough, the largest non-Inf bucket includes it.
-	m.CloneDuration.WithLabelValues("default", "true", "pve1").Observe(600)
-	m.BootDuration.WithLabelValues("default", "pve1").Observe(600)
+	m.CloneDuration.WithLabelValues("test-ss", "default", "true", "pve1").Observe(600)
+	m.BootDuration.WithLabelValues("test-ss", "default", "pve1").Observe(600)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -183,9 +184,10 @@ func TestMetrics_RateLimitObserver(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := observability.NewMetrics(reg)
 
-	m.ObserveRateLimit(1234)
-	m.ObserveCall("runners", "5xx")
-	m.ObserveCall("jobs", "2xx")
+	scoped := m.ForScaleset("test-ss")
+	scoped.ObserveRateLimit(1234)
+	scoped.ObserveCall("runners", "5xx")
+	scoped.ObserveCall("jobs", "2xx")
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -205,9 +207,12 @@ func TestMetrics_RateLimitObserver(t *testing.T) {
 			}
 		}
 	}
-	require.InDelta(t, 1234.0, got["scaleset_gh_rate_limit_remaining"], 0.001)
-	require.InDelta(t, 1.0, got["scaleset_gh_api_calls_total:endpoint=runners:status=5xx"], 0.001)
-	require.InDelta(t, 1.0, got["scaleset_gh_api_calls_total:endpoint=jobs:status=2xx"], 0.001)
+	// prometheus.Gather sorts labels alphabetically by name in
+	// the protobuf output, so `endpoint` precedes `scaleset`
+	// which precedes `status`.
+	require.InDelta(t, 1234.0, got["scaleset_gh_rate_limit_remaining:scaleset=test-ss"], 0.001)
+	require.InDelta(t, 1.0, got["scaleset_gh_api_calls_total:endpoint=runners:scaleset=test-ss:status=5xx"], 0.001)
+	require.InDelta(t, 1.0, got["scaleset_gh_api_calls_total:endpoint=jobs:scaleset=test-ss:status=2xx"], 0.001)
 }
 
 func TestHealth_LeaderTransitionsToReady(t *testing.T) {
@@ -288,10 +293,10 @@ func TestRecordProxmoxError_ClampsUnknownOp(t *testing.T) {
 	m := observability.NewMetrics(reg)
 
 	// Known op passes through.
-	require.Equal(t, "inject_jit", m.RecordProxmoxError("inject_jit", "pve1"))
+	require.Equal(t, "inject_jit", m.RecordProxmoxError("test-ss", "inject_jit", "pve1"))
 
 	// Unknown op is clamped to "unknown".
-	require.Equal(t, "unknown", m.RecordProxmoxError("destroy-vmid-12345", "pve1"))
+	require.Equal(t, "unknown", m.RecordProxmoxError("test-ss", "destroy-vmid-12345", "pve1"))
 
 	// Assert the metric output only contains known + unknown label values.
 	families, err := reg.Gather()
@@ -322,12 +327,12 @@ func TestRecordGHStateMismatch_ClampsUnknownLabels(t *testing.T) {
 	m := observability.NewMetrics(reg)
 
 	// Known values pass through.
-	gh, ac := m.RecordGHStateMismatch("assigned", "busy", "promote_running")
+	gh, ac := m.RecordGHStateMismatch("test-ss", "assigned", "busy", "promote_running")
 	require.Equal(t, "busy", gh)
 	require.Equal(t, "promote_running", ac)
 
 	// Unknown ghState and action both clamp to "unknown".
-	gh, ac = m.RecordGHStateMismatch("assigned", "stale-gh-runner-id-9999", "retry-7")
+	gh, ac = m.RecordGHStateMismatch("test-ss", "assigned", "stale-gh-runner-id-9999", "retry-7")
 	require.Equal(t, "unknown", gh)
 	require.Equal(t, "unknown", ac)
 }
@@ -341,7 +346,7 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	m := observability.NewMetrics(reg)
 	// Labelled metrics don't appear in /metrics output until at least one
 	// label combination has been observed, so touch one explicitly.
-	m.PoolSize.WithLabelValues("default", "hot").Set(0)
+	m.PoolSize.WithLabelValues("test-ss", "default", "hot").Set(0)
 	h := observability.NewHealth(time.Minute)
 
 	log, _ := observability.NewLoggerTo(io.Discard, "error", "text")

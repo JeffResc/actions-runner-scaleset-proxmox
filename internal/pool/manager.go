@@ -511,7 +511,7 @@ func (m *manager) Stats(_ context.Context) (Stats, error) {
 				continue
 			}
 			for st, n := range perProfile {
-				m.metrics.PoolSize.WithLabelValues(name, string(st)).Set(float64(n))
+				m.metrics.PoolSize.WithLabelValues(m.cfg.ScaleSetName, name, string(st)).Set(float64(n))
 			}
 		}
 	}
@@ -529,7 +529,7 @@ func (m *manager) statsForProfile(profile string) (Stats, error) {
 	}
 	if m.metrics != nil {
 		for st, n := range raw {
-			m.metrics.PoolSize.WithLabelValues(profile, string(st)).Set(float64(n))
+			m.metrics.PoolSize.WithLabelValues(m.cfg.ScaleSetName, profile, string(st)).Set(float64(n))
 		}
 	}
 	return statsFromRaw(raw), nil
@@ -574,7 +574,7 @@ func (m *manager) Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, e
 	case errors.Is(err, store.ErrAtCapacity):
 		span.SetStatus(codes.Ok, "at_capacity")
 		if m.metrics != nil {
-			m.metrics.AtCapacityTotal.Inc()
+			m.metrics.AtCapacityTotal.WithLabelValues(m.cfg.ScaleSetName).Inc()
 		}
 		return nil, ErrAtCapacity
 	case errors.Is(err, store.ErrNoneAvailable):
@@ -620,7 +620,7 @@ func (m *manager) AcquireForProfile(ctx context.Context, jobID int64, profile st
 	case errors.Is(err, store.ErrAtCapacity):
 		span.SetStatus(codes.Ok, "at_capacity")
 		if m.metrics != nil {
-			m.metrics.AtCapacityTotal.Inc()
+			m.metrics.AtCapacityTotal.WithLabelValues(m.cfg.ScaleSetName).Inc()
 		}
 		return nil, ErrAtCapacity
 	case errors.Is(err, store.ErrNoneAvailable):
@@ -1002,7 +1002,7 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		"vmid", pv.VMID, "node", pv.Node, "name", pv.Name, "profile", profile,
 		"state", state, "pool_kind", kind, "runner_id", runnerID)
 	if m.metrics != nil {
-		m.metrics.VMsTotal.WithLabelValues(profile, "adopted_"+string(state)).Inc()
+		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, profile, "adopted_"+string(state)).Inc()
 	}
 }
 
@@ -1263,7 +1263,7 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	start := time.Now()
 	defer func() {
 		if m.metrics != nil {
-			m.metrics.ReconcileDuration.Observe(time.Since(start).Seconds())
+			m.metrics.ReconcileDuration.WithLabelValues(m.cfg.ScaleSetName).Observe(time.Since(start).Seconds())
 		}
 	}()
 
@@ -1693,7 +1693,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		span.SetStatus(codes.Error, "clone failed")
 		m.log.Warn("clone: provisioner failed", "vmid", vmid, "err", err)
 		if m.metrics != nil {
-			m.metrics.VMsTotal.WithLabelValues(profileName, "clone-failed").Inc()
+			m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, profileName, "clone-failed").Inc()
 		}
 		// Mark the row destroying and let the destroy path clean up.
 		if _, updErr := m.store.Update(vmid, func(v *store.VM) {
@@ -1706,8 +1706,8 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		return
 	}
 	if m.metrics != nil {
-		m.metrics.CloneDuration.WithLabelValues(profileName, fmt.Sprintf("%t", m.cfg.LinkedClones), node).Observe(time.Since(cloneStart).Seconds())
-		m.metrics.VMsTotal.WithLabelValues(profileName, "clone-success").Inc()
+		m.metrics.CloneDuration.WithLabelValues(m.cfg.ScaleSetName, profileName, fmt.Sprintf("%t", m.cfg.LinkedClones), node).Observe(time.Since(cloneStart).Seconds())
+		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, profileName, "clone-success").Inc()
 	}
 	// Feed the canary controller's clone counter (only the
 	// candidate class actually counts; the controller ignores
@@ -1777,7 +1777,7 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 		return
 	}
 	if m.metrics != nil {
-		m.metrics.BootDuration.WithLabelValues(row.Profile, row.Node).Observe(time.Since(bootStart).Seconds())
+		m.metrics.BootDuration.WithLabelValues(m.cfg.ScaleSetName, row.Profile, row.Node).Observe(time.Since(bootStart).Seconds())
 	}
 	if _, err := m.store.Update(row.VMID, func(v *store.VM) {
 		v.State = store.StateHot
@@ -1813,7 +1813,7 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 			m.log.Warn("canary: auto-reverted percent to 0; investigate canary template",
 				"profile", row.Profile, "vmid", row.VMID)
 			if m.metrics != nil {
-				m.metrics.CanaryReverts.WithLabelValues(row.Profile).Inc()
+				m.metrics.CanaryReverts.WithLabelValues(m.cfg.ScaleSetName, row.Profile).Inc()
 			}
 		}
 	}
@@ -1866,7 +1866,7 @@ func (m *manager) destroyAsync(vmid int, node, profile string) {
 	select {
 	case m.destroyQueue <- destroyRequest{vmid: vmid, node: node, profile: profile}:
 		if m.metrics != nil {
-			m.metrics.PoolDestroyBacklogDepth.Set(float64(len(m.destroyQueue)))
+			m.metrics.PoolDestroyBacklogDepth.WithLabelValues(m.cfg.ScaleSetName).Set(float64(len(m.destroyQueue)))
 		}
 	default:
 		m.wg.Done()
@@ -1875,7 +1875,7 @@ func (m *manager) destroyAsync(vmid int, node, profile string) {
 			label = defaultProfileName
 		}
 		if m.metrics != nil {
-			m.metrics.PoolDestroyBacklogFull.WithLabelValues(label).Inc()
+			m.metrics.PoolDestroyBacklogFull.WithLabelValues(m.cfg.ScaleSetName, label).Inc()
 		}
 		m.log.Warn("destroy: backlog full; dropping request, sweep will re-enqueue",
 			"vmid", vmid, "profile", label, "cap", cap(m.destroyQueue))
@@ -1897,7 +1897,7 @@ func (m *manager) destroyDispatcher() {
 		select {
 		case req := <-m.destroyQueue:
 			if m.metrics != nil {
-				m.metrics.PoolDestroyBacklogDepth.Set(float64(len(m.destroyQueue)))
+				m.metrics.PoolDestroyBacklogDepth.WithLabelValues(m.cfg.ScaleSetName).Set(float64(len(m.destroyQueue)))
 			}
 			if err := m.destroySem.Acquire(m.workerCtx, 1); err != nil {
 				m.log.Debug("destroy: cancelled before sem acquired", "vmid", req.vmid, "err", err)
@@ -1929,7 +1929,7 @@ func (m *manager) drainDestroyQueueLocked() {
 			m.wg.Done()
 		default:
 			if m.metrics != nil {
-				m.metrics.PoolDestroyBacklogDepth.Set(0)
+				m.metrics.PoolDestroyBacklogDepth.WithLabelValues(m.cfg.ScaleSetName).Set(0)
 			}
 			return
 		}
@@ -2007,7 +2007,7 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 		}
 	}
 	if m.metrics != nil {
-		m.metrics.VMsTotal.WithLabelValues(destroyedProfile, "destroyed").Inc()
+		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, destroyedProfile, "destroyed").Inc()
 	}
 
 	// Release the IPAM allocation BEFORE the runner-orphan

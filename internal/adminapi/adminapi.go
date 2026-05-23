@@ -101,6 +101,14 @@ type Server struct {
 	// be wired to the per-leader-election canary controller.
 	canary CanaryAccessor
 
+	// scalesetPool maps scaleset name → PoolAccessor for the
+	// namespaced `/admin/{scaleset}/...` routes (issue #1).
+	// Populated by SetScalesetPool / SetScalesetCanary from
+	// app.Run's leader-plane fan-out. Empty / missing key
+	// produces 404 on the namespaced routes.
+	scalesetPool   map[string]PoolAccessor
+	scalesetCanary map[string]CanaryAccessor
+
 	// drain is invoked from POST /admin/drain. Typically wired by main()
 	// to cancel the orchestrator's root context, which triggers graceful
 	// shutdown across every errgroup goroutine. Nil disables the endpoint.
@@ -259,6 +267,65 @@ type CanaryAccessor func() CanaryPromoter
 // /admin/template/promote endpoint. Wired by app.Run.
 func (s *Server) SetCanary(c CanaryAccessor) { s.canary = c }
 
+// SetScalesetPool registers a per-scaleset PoolAccessor so the
+// namespaced routes (`/admin/{scaleset}/state`, etc.) can route
+// to the right pool manager when one binary hosts multiple scale
+// sets (issue #1). Called once per scaleset from app.Run's
+// leader-plane fan-out.
+func (s *Server) SetScalesetPool(scaleset string, fn PoolAccessor) {
+	if s.scalesetPool == nil {
+		s.scalesetPool = make(map[string]PoolAccessor)
+	}
+	s.scalesetPool[scaleset] = fn
+}
+
+// SetScalesetCanary registers a per-scaleset CanaryAccessor for
+// the namespaced `/admin/{scaleset}/template/promote/{profile}`
+// route (issue #1). Wired alongside SetScalesetPool.
+func (s *Server) SetScalesetCanary(scaleset string, fn CanaryAccessor) {
+	if s.scalesetCanary == nil {
+		s.scalesetCanary = make(map[string]CanaryAccessor)
+	}
+	s.scalesetCanary[scaleset] = fn
+}
+
+// poolFor returns the pool manager for the request — either the
+// per-scaleset accessor identified by chi URL param `scaleset`,
+// or the legacy single-scaleset accessor when the route has no
+// scaleset prefix. Returns nil when the named scaleset isn't
+// registered (handler responds 404).
+func (s *Server) poolFor(r *http.Request) pool.Manager {
+	name := chi.URLParam(r, "scaleset")
+	if name == "" {
+		if s.pool == nil {
+			return nil
+		}
+		return s.pool()
+	}
+	fn, ok := s.scalesetPool[name]
+	if !ok || fn == nil {
+		return nil
+	}
+	return fn()
+}
+
+// canaryFor mirrors poolFor for the canary accessor — used by
+// /admin/template/promote handlers.
+func (s *Server) canaryFor(r *http.Request) CanaryPromoter {
+	name := chi.URLParam(r, "scaleset")
+	if name == "" {
+		if s.canary == nil {
+			return nil
+		}
+		return s.canary()
+	}
+	fn, ok := s.scalesetCanary[name]
+	if !ok || fn == nil {
+		return nil
+	}
+	return fn()
+}
+
 // SetMetrics attaches the orchestrator's Prometheus metric set so
 // handlers (preempt currently; future ones can join) can emit
 // counters from operator-driven actions. Nil disables the metric
@@ -308,11 +375,22 @@ func (s *Server) Serve(ctx context.Context) error {
 	// expands the secret blast radius across replicas.
 	r.Use(s.leaderOrForward)
 	r.Use(s.requireBearerToken)
+	// Legacy single-scaleset paths — still served for backwards
+	// compatibility when the operator runs one scaleset per
+	// process. New configs with multiple scalesets must use the
+	// namespaced paths below.
 	r.Get("/admin/state", s.handleState)
 	r.Post("/admin/drain", s.handleDrain)
 	r.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
 	r.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
 	r.Post("/admin/template/promote/{profile}", s.handlePromoteTemplate)
+	// Namespaced multi-scaleset paths (issue #1). Drain stays
+	// fleet-wide — there is no per-scaleset drain semantic
+	// distinct from "shut the orchestrator down".
+	r.Get("/admin/{scaleset}/state", s.handleState)
+	r.Post("/admin/{scaleset}/destroy/{vmid}", s.handleDestroyVM)
+	r.Post("/admin/{scaleset}/preempt/{vmid}", s.handlePreemptVM)
+	r.Post("/admin/{scaleset}/template/promote/{profile}", s.handlePromoteTemplate)
 
 	srv := &http.Server{
 		Addr:              s.cfg.HTTPAddr,
@@ -517,10 +595,15 @@ type stateResponse struct {
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	p := s.pool()
+	p := s.poolFor(r)
 	if p == nil {
 		// We passed the leader gate yet the pool is nil — race during
-		// election handover. Tell the caller to retry rather than 500.
+		// election handover, or the namespaced URL named a scaleset
+		// that isn't configured.
+		if chi.URLParam(r, "scaleset") != "" {
+			http.Error(w, "scaleset not found", http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
 		return
@@ -585,11 +668,20 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 // 404 when no canary controller is wired, 409 when the profile
 // has no candidate to promote, and 202 on success.
 func (s *Server) handlePromoteTemplate(w http.ResponseWriter, r *http.Request) {
-	if s.canary == nil {
+	scaleset := chi.URLParam(r, "scaleset")
+	if scaleset == "" && s.canary == nil {
 		http.Error(w, "canary controller not configured", http.StatusNotFound)
 		return
 	}
-	c := s.canary()
+	if scaleset != "" {
+		// Namespaced route: a 404 here means the scaleset name
+		// isn't registered, not a leader transition.
+		if _, ok := s.scalesetCanary[scaleset]; !ok {
+			http.Error(w, "scaleset not found", http.StatusNotFound)
+			return
+		}
+	}
+	c := s.canaryFor(r)
 	if c == nil {
 		// Standby replica (or pre-election leader) — surface
 		// as 503 so callers retry against the current leader.
@@ -629,8 +721,12 @@ func (s *Server) handlePreemptVM(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
 		return
 	}
-	p := s.pool()
+	p := s.poolFor(r)
 	if p == nil {
+		if chi.URLParam(r, "scaleset") != "" {
+			http.Error(w, "scaleset not found", http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
 		return
@@ -651,7 +747,10 @@ func (s *Server) handlePreemptVM(w http.ResponseWriter, r *http.Request) {
 	// don't want to widen the snapshot just for an admin-action
 	// label. Operators care about the increment.
 	if s.metrics != nil {
-		s.metrics.Preemptions.WithLabelValues("", "manual").Inc()
+		// Scaleset label is populated by handlePreemptVM from the
+		// admin URL prefix (issue #1); from_class stays empty per
+		// the snapshot limitation noted above.
+		s.metrics.Preemptions.WithLabelValues(chi.URLParam(r, "scaleset"), "", "manual").Inc()
 	}
 	w.WriteHeader(http.StatusAccepted)
 	if _, err := w.Write([]byte("preempt queued")); err != nil {
@@ -669,8 +768,12 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
 		return
 	}
-	p := s.pool()
+	p := s.poolFor(r)
 	if p == nil {
+		if chi.URLParam(r, "scaleset") != "" {
+			http.Error(w, "scaleset not found", http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
 		return

@@ -20,6 +20,14 @@ Proxmox node placement is pluggable via `nodes.strategy`: **`single`** (always t
 
 An optional `nodes.affinity:` block layers profile-keyed rules over the chosen strategy: pin a profile to specific nodes with `prefer_nodes: [...]` (combine with `require: true` for a hard pin that fails the clone when no preferred node is eligible), and keep two profiles off the same node with `anti_affinity_with: { profile: ... }`. Rules apply before the underlying strategy picks among the surviving candidates so rotation / load balancing keep their semantics within the eligible set. Hard-pin failures surface as `nodeselector.ErrAffinityRequireUnsatisfiable`. Config validation rejects rules that name an undeclared profile or node — typos surface at load time rather than as silent no-ops at runtime.
 
+## Multi-scaleset schema
+
+The config now accepts a top-level `scalesets:` list — one entry per scale set, each carrying its own `name`, `labels`, `max_concurrent_runners`, GitHub `scope:` (org/repo), and per-scaleset `profiles:` (issue #1). The legacy singular form (`scaleset:` + top-level `profiles:` + `github.scope`) is automatically normalised into a 1-element `scalesets:` list at load time, so existing configs keep working unchanged. Mixing the two shapes is rejected at load with a clear error pointing at the offending legacy keys.
+
+Every per-scaleset Prometheus metric now carries `scaleset=<name>` as its first label so dashboards can slice cleanly. Admin endpoints are also reachable under `/admin/{scaleset}/...` (e.g. `/admin/{scaleset}/state`, `/admin/{scaleset}/preempt/{vmid}`, `/admin/{scaleset}/template/promote/{profile}`); the un-namespaced `/admin/...` paths keep working for backwards compatibility when there is exactly one scale set.
+
+**Runtime status:** the parser, validator, metrics, and admin API are ready for multiple scale sets, but the leader-plane orchestration still runs exactly one scale set per process — configurations with more than one entry are rejected at startup with a migration message. The runtime fan-out lands in a follow-up PR.
+
 ## Runner profiles
 
 A scale set can declare one or more **profiles** — named bundles of `{labels, template VMID, CPU / memory / disk shape, hot/warm/max sizing}`. Each profile gets its own reconcile loop and pool state; VMs are tagged with their profile name so crash recovery routes them back into the right pool on restart. Configs without a `profiles:` block keep working unchanged — the orchestrator synthesises a single `default` profile from the global `pool:` / `scaleset:` blocks. See `profiles:` in [config.example.yaml](config.example.yaml) for the full schema. Prometheus metrics are partitioned by `profile=` so dashboards can slice by hardware shape.
@@ -83,6 +91,8 @@ Optional escape-hatch HTTP API enabled by setting `admin_api.http_addr` and supp
 | `POST` | `/admin/preempt/{vmid}` | Preempt an Assigned VM (refuses Running; 409 when not preempt-eligible) |
 | `POST` | `/admin/template/promote/{profile}` | Atomically swap a profile's canary candidate template into stable (409 when no candidate; 503 during leader transition) |
 | `POST` | `/admin/destroy/{vmid}` | Force-destroy a specific VM regardless of its state |
+
+Each non-drain endpoint also accepts a `/admin/{scaleset_name}/...` prefix (issue #1) so operators running multiple scale sets in one orchestrator can disambiguate. Unknown scaleset names return 404; the un-prefixed paths above route to the single configured scale set.
 
 In Kubernetes multi-replica deployments the admin API is bound on every replica. Non-leader replicas reverse-proxy requests to the leader (whose endpoint is published in a Lease annotation), so callers don't need to know which pod holds the lease.
 

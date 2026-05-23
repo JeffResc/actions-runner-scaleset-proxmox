@@ -71,6 +71,11 @@ func parseLevel(s string) (slog.Level, error) {
 
 // Metrics is the orchestrator's Prometheus instrument set. Construct via
 // [NewMetrics] which registers all instruments on a provided registry.
+//
+// Every per-scaleset metric carries `scaleset` as the FIRST
+// label (issue #1) so dashboards can slice cleanly when one
+// binary hosts multiple scale sets. Fleet-wide instruments
+// (Leader) keep their original signature.
 type Metrics struct {
 	PoolSize             *prometheus.GaugeVec
 	VMsTotal             *prometheus.CounterVec
@@ -80,10 +85,10 @@ type Metrics struct {
 	ProxmoxErrors        *prometheus.CounterVec
 	GitHubErrors         *prometheus.CounterVec
 	ListenerMessages     *prometheus.CounterVec
-	ReconcileDuration    prometheus.Histogram
-	AtCapacityTotal      prometheus.Counter
+	ReconcileDuration    *prometheus.HistogramVec
+	AtCapacityTotal      *prometheus.CounterVec
 	GHAPICalls           *prometheus.CounterVec
-	GHRateLimitRemaining prometheus.Gauge
+	GHRateLimitRemaining *prometheus.GaugeVec
 	GHStateMismatch      *prometheus.CounterVec
 	RunnerHookEvents     *prometheus.CounterVec
 	ReconcileErrors      *prometheus.CounterVec
@@ -104,7 +109,7 @@ type Metrics struct {
 	PoolDestroyBacklogFull *prometheus.CounterVec
 	// PoolDestroyBacklogDepth tracks the live depth of the destroy
 	// dispatcher queue. The bound is 2 * the destroy semaphore cap.
-	PoolDestroyBacklogDepth prometheus.Gauge
+	PoolDestroyBacklogDepth *prometheus.GaugeVec
 }
 
 // ProxmoxOpUnknown is the fallback for off-list values of the
@@ -158,14 +163,14 @@ var validGHActions = map[string]struct{}{
 // can't blow up Prometheus cardinality silently. Returns the op the
 // counter was incremented with so callers (typically tests) can
 // observe the substitution.
-func (m *Metrics) RecordProxmoxError(op, node string) string {
+func (m *Metrics) RecordProxmoxError(scaleset, op, node string) string {
 	if m == nil {
 		return op
 	}
 	if _, ok := validProxmoxOps[op]; !ok {
 		op = ProxmoxOpUnknown
 	}
-	m.ProxmoxErrors.WithLabelValues(op, node).Inc()
+	m.ProxmoxErrors.WithLabelValues(scaleset, op, node).Inc()
 	return op
 }
 
@@ -174,7 +179,7 @@ func (m *Metrics) RecordProxmoxError(op, node string) string {
 // expected to be a store.State value; we leave it unchanged because
 // store.State is a typed enum at the call site (no risk of unbounded
 // input). Off-list ghState / action become "unknown".
-func (m *Metrics) RecordGHStateMismatch(dbState, ghState, action string) (string, string) {
+func (m *Metrics) RecordGHStateMismatch(scaleset, dbState, ghState, action string) (string, string) {
 	if m == nil {
 		return ghState, action
 	}
@@ -184,7 +189,7 @@ func (m *Metrics) RecordGHStateMismatch(dbState, ghState, action string) (string
 	if _, ok := validGHActions[action]; !ok {
 		action = GHActionUnknown
 	}
-	m.GHStateMismatch.WithLabelValues(dbState, ghState, action).Inc()
+	m.GHStateMismatch.WithLabelValues(scaleset, dbState, ghState, action).Inc()
 	return ghState, action
 }
 
@@ -193,154 +198,114 @@ func (m *Metrics) RecordGHStateMismatch(dbState, ghState, action string) (string
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	const ns = "scaleset"
 	m := &Metrics{
-		// Profile-aware label set: every metric below now partitions
-		// by runner profile so operators with multiple profiles can
-		// slice dashboards by hardware shape (linux-x64 vs gpu vs
-		// big-mem etc.). Single-profile deployments emit profile=
-		// "default" so existing dashboards keep working — they just
-		// see one extra label.
+		// Every per-scaleset metric carries `scaleset` as the
+		// FIRST label so dashboards can slice cleanly when one
+		// binary hosts multiple scale sets (issue #1). Profile-
+		// keyed metrics carry `profile` next.
 		PoolSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "pool_size",
-			Help: "Number of VMs in each lifecycle state, by profile.",
-		}, []string{"profile", "state"}),
+			Help: "Number of VMs in each lifecycle state, by scaleset and profile.",
+		}, []string{"scaleset", "profile", "state"}),
 		VMsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "vms_total",
-			Help: "Cumulative count of VMs created, partitioned by profile and outcome.",
-		}, []string{"profile", "outcome"}),
-		// CloneDuration label set is intentionally bounded by
-		// profile count × node count × linked-bool. Do NOT add
-		// vm.id here — it would produce one series per VM per scrape,
-		// blowing up Prometheus cardinality. If you need per-VM
-		// clone latency, emit a trace span (we already do — see
-		// provisioner.Clone) rather than a metric.
+			Help: "Cumulative count of VMs created, partitioned by scaleset, profile and outcome.",
+		}, []string{"scaleset", "profile", "outcome"}),
 		CloneDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "clone_duration_seconds",
-			Help: "Time to clone a VM from template.",
-			// 0.5s .. ~1024s — wide enough to keep p99 meaningful when
-			// Proxmox is slow. The narrower 9-bucket range used to top
-			// out at ~128s, collapsing high-end percentiles into +Inf
-			// exactly when operators most needed to see the latency.
+			Help:    "Time to clone a VM from template.",
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 12),
-		}, []string{"profile", "linked", "node"}),
+		}, []string{"scaleset", "profile", "linked", "node"}),
 		BootDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "boot_duration_seconds",
-			Help: "Time from VM start to guest-agent ready.",
-			// 1s .. ~1024s — same widening as CloneDuration. Real VM
-			// boots can run several minutes when Proxmox is loaded.
+			Help:    "Time from VM start to guest-agent ready.",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
-		}, []string{"profile", "node"}),
+		}, []string{"scaleset", "profile", "node"}),
 		AcquireDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "acquire_duration_seconds",
-			Help:    "Time from Acquire call to a ready VM, by profile and source tier.",
+			Help:    "Time from Acquire call to a ready VM, by scaleset, profile and source tier.",
 			Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
-		}, []string{"profile", "tier"}),
+		}, []string{"scaleset", "profile", "tier"}),
 		ProxmoxErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "proxmox_api_errors_total",
-			Help: "Errors from Proxmox API calls, partitioned by operation.",
-		}, []string{"operation", "node"}),
+			Help: "Errors from Proxmox API calls, partitioned by scaleset and operation.",
+		}, []string{"scaleset", "operation", "node"}),
 		GitHubErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "github_api_errors_total",
 			Help: "Errors from GitHub API calls.",
-		}, []string{"endpoint"}),
+		}, []string{"scaleset", "endpoint"}),
 		ListenerMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "listener_messages_total",
 			Help: "Inbound listener messages by kind.",
-		}, []string{"kind"}),
-		ReconcileDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+		}, []string{"scaleset", "kind"}),
+		ReconcileDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "reconcile_duration_seconds",
 			Help:    "Wall-clock time of one pool reconciliation pass.",
 			Buckets: prometheus.ExponentialBuckets(0.01, 2, 10),
-		}),
-		AtCapacityTotal: prometheus.NewCounter(prometheus.CounterOpts{
+		}, []string{"scaleset"}),
+		AtCapacityTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "at_capacity_total",
 			Help: "Times an Acquire was rejected because the orchestrator was at MaxConcurrentRunners.",
-		}),
+		}, []string{"scaleset"}),
 		GHAPICalls: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "gh_api_calls_total",
-			Help: "Outbound GitHub REST API calls, by endpoint group and HTTP status class.",
-		}, []string{"endpoint", "status"}),
-		GHRateLimitRemaining: prometheus.NewGauge(prometheus.GaugeOpts{
+			Help: "Outbound GitHub REST API calls, by scaleset, endpoint group and HTTP status class.",
+		}, []string{"scaleset", "endpoint", "status"}),
+		GHRateLimitRemaining: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "gh_rate_limit_remaining",
 			Help: "Most recent X-RateLimit-Remaining value observed on a GitHub REST response.",
-		}),
+		}, []string{"scaleset"}),
 		GHStateMismatch: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "gh_runner_state_mismatch_total",
 			Help: "Reconciler events where DB state diverged from GitHub runner state, by action taken.",
-		}, []string{"db_state", "gh_state", "action"}),
+		}, []string{"scaleset", "db_state", "gh_state", "action"}),
 		RunnerHookEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "runner_hook_events_total",
 			Help: "Inbound events from in-VM runner-side lifecycle hooks.",
-		}, []string{"phase", "result"}),
+		}, []string{"scaleset", "phase", "result"}),
 		ReconcileErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "reconcile_errors_total",
 			Help: "Errors raised inside the gh.Reconciler when applying state transitions, by operation.",
-		}, []string{"op"}),
+		}, []string{"scaleset", "op"}),
 		UnroutedJobs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "unrouted_jobs_total",
-			// labels is the sorted, pipe-joined RequestLabels of the
-			// job that could not be routed. Cardinality is bounded
-			// by the distinct label sets workflows actually use
-			// (typically << 100). Operators concerned about
-			// cardinality can drop the label via Prometheus
-			// metric_relabel_configs.
 			Help: "Jobs whose requested labels did not match any configured runner profile.",
-		}, []string{"labels"}),
+		}, []string{"scaleset", "labels"}),
 		QuotaThrottled: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "quota_throttled_total",
-			// scope is "org" or "repo" (matches quotas.Scope);
-			// name is the org or owner/repo bucket. Bounded by
-			// the number of distinct overrides + active orgs/repos.
 			Help: "Jobs observed exceeding their configured per-org or per-repo quota.",
-		}, []string{"scope", "name"}),
+		}, []string{"scaleset", "scope", "name"}),
 		PriorityAcquires: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "priority_acquires_total",
-			// class is the priority.Class.Name (or "default" when
-			// no class matched). Bounded by the operator's class
-			// list.
 			Help: "Jobs paired with a runner VM, partitioned by their priority class.",
-		}, []string{"class"}),
+		}, []string{"scaleset", "class"}),
 		Preemptions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "preemptions_total",
-			// from_class is the class of the VM that was destroyed;
-			// to_class is the class of the job that triggered the
-			// preempt (or "manual" when invoked via the admin API
-			// without a triggering job context).
 			Help: "Assigned VMs preempted to free capacity, partitioned by from_class and to_class.",
-		}, []string{"from_class", "to_class"}),
+		}, []string{"scaleset", "from_class", "to_class"}),
 		CanaryReverts: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "canary_reverted_total",
-			// Increments each time the canary controller auto-
-			// reverts a profile's canary_percent to 0 because
-			// the cumulative canary failure rate exceeded the
-			// configured threshold. Bounded by profile count.
 			Help: "Canary template rollouts auto-reverted to 0% due to failure rate exceeding threshold.",
-		}, []string{"profile"}),
+		}, []string{"scaleset", "profile"}),
 		ScheduleFires: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "schedule_fires_total",
-			// One increment per cron fire (per profile, per
-			// schedule name). Cardinality is bounded by
-			// operator-declared schedules.
 			Help: "Schedule cron fires that applied a pool-size override.",
-		}, []string{"profile", "schedule"}),
+		}, []string{"scaleset", "profile", "schedule"}),
 		ScheduleActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "schedule_active",
-			// 1 for the schedule whose override window is currently
-			// open on each profile, 0 otherwise. The "" schedule
-			// label represents the no-override / baseline state.
 			Help: "Active schedule override per profile (1 = currently applying).",
-		}, []string{"profile", "schedule"}),
+		}, []string{"scaleset", "profile", "schedule"}),
 		Leader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
 		}),
 		PoolDestroyBacklogFull: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "pool_destroy_backlog_full_total",
-			Help: "Destroy requests dropped because the dispatcher queue was at capacity, by profile.",
-		}, []string{"profile"}),
-		PoolDestroyBacklogDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Help: "Destroy requests dropped because the dispatcher queue was at capacity, by scaleset and profile.",
+		}, []string{"scaleset", "profile"}),
+		PoolDestroyBacklogDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "pool_destroy_backlog_depth",
-			Help: "Current depth of the pool destroy dispatcher queue.",
-		}),
+			Help: "Current depth of the pool destroy dispatcher queue, by scaleset.",
+		}, []string{"scaleset"}),
 	}
 	reg.MustRegister(
 		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
@@ -356,17 +321,44 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return m
 }
 
+// ScopedMetrics binds a scaleset name so callers that observe
+// the githubauth.RateLimitObserver contract can record metrics
+// against the right scaleset (issue #1). Obtain via
+// Metrics.ForScaleset.
+type ScopedMetrics struct {
+	m        *Metrics
+	scaleset string
+}
+
+// ForScaleset returns a ScopedMetrics view that pre-binds the
+// scaleset label on every per-scaleset metric. With one scope
+// per scaleset, callers that don't otherwise know the scaleset
+// name (e.g. the githubauth round-tripper) can observe correctly.
+func (m *Metrics) ForScaleset(scaleset string) *ScopedMetrics {
+	if m == nil {
+		return nil
+	}
+	return &ScopedMetrics{m: m, scaleset: scaleset}
+}
+
 // ObserveRateLimit satisfies the githubauth.RateLimitObserver contract.
-// Stores the most recent X-RateLimit-Remaining value emitted by GitHub.
-func (m *Metrics) ObserveRateLimit(remaining int) {
-	m.GHRateLimitRemaining.Set(float64(remaining))
+// Stores the most recent X-RateLimit-Remaining value emitted by GitHub
+// for this scope's scaleset.
+func (s *ScopedMetrics) ObserveRateLimit(remaining int) {
+	if s == nil {
+		return
+	}
+	s.m.GHRateLimitRemaining.WithLabelValues(s.scaleset).Set(float64(remaining))
 }
 
 // ObserveCall satisfies the githubauth.RateLimitObserver contract by
 // counting GitHub REST calls partitioned by endpoint group and status
 // class (2xx/3xx/4xx/5xx/transport_error).
-func (m *Metrics) ObserveCall(endpoint, statusClass string) {
-	m.GHAPICalls.WithLabelValues(endpoint, statusClass).Inc()
+func (s *ScopedMetrics) ObserveCall(endpoint, statusClass string) {
+	if s == nil {
+		return
+	}
+	s.m.GHAPICalls.WithLabelValues(s.scaleset, endpoint, statusClass).Inc()
 }
 
 // ---------------------------------------------------------------------------

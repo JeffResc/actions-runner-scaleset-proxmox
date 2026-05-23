@@ -94,6 +94,16 @@ func Run(ctx context.Context, opts Options) error {
 	slog.SetDefault(log)
 	log.Info("scaleset starting", "version", opts.Version, "config", opts.ConfigPath, "dry_run", opts.DryRun)
 
+	// Runtime multi-scaleset guard (issue #1): the config schema,
+	// metric labels, and admin-API namespaced routes all support
+	// N scalesets, but the leader-plane orchestration still runs
+	// one scaleset per process. Configs with N > 1 are rejected
+	// with a clear message so operators know the schema is ready
+	// but the runtime fan-out lands in a follow-up PR.
+	if len(cfg.Scalesets) > 1 {
+		return fmt.Errorf("scalesets: %d scale sets declared, but the runtime currently supports exactly one; the schema is ready for future multi-scaleset runtime support, but please consolidate to a single entry for now", len(cfg.Scalesets))
+	}
+
 	// Warn about SCALESET_*-prefixed env vars that look like overrides
 	// but don't map to any schema key — the canonical operator-typo
 	// signal (e.g. SCALESET_POOL_HOTSIZE instead of SCALESET_POOL_HOT_SIZE).
@@ -180,8 +190,12 @@ func Run(ctx context.Context, opts Options) error {
 	// though only the leader runs the gh reconciler — the client carries
 	// no state of its own. Scale-set lookup/create now happens
 	// exclusively inside the leader plane; non-leaders do no GitHub
-	// setup work at startup.
-	restCli, err := auth.NewRESTClient(ctx, githubauth.WithRateLimitMetrics(metrics))
+	// setup work at startup. The rate-limit observer is scoped to
+	// the (singular-form) scaleset so the
+	// scaleset_gh_rate_limit_remaining metric carries the right
+	// `scaleset` label. Multi-scaleset fan-out will build a
+	// per-scaleset REST client + scoped observer per worker.
+	restCli, err := auth.NewRESTClient(ctx, githubauth.WithRateLimitMetrics(metrics.ForScaleset(cfg.ScaleSet.Name)))
 	if err != nil {
 		return fmt.Errorf("build github rest client: %w", err)
 	}
@@ -443,6 +457,21 @@ func Run(ctx context.Context, opts Options) error {
 	// accessor (standby / pre-election leader) makes the
 	// /admin/template/promote handler return 503.
 	admin.SetCanary(adminapi.CanaryAccessor(func() adminapi.CanaryPromoter {
+		c := poolCanary.Load()
+		if c == nil {
+			return nil
+		}
+		return c
+	}))
+	// Mirror the legacy single-scaleset accessors onto the
+	// namespaced multi-scaleset admin routes (issue #1) so
+	// operators can hit either `/admin/state` or
+	// `/admin/<scaleset>/state` interchangeably. With N == 1
+	// the two routes serve the same pool / canary; the
+	// follow-up multi-scaleset PR will register one accessor
+	// per scaleset.
+	admin.SetScalesetPool(cfg.ScaleSet.Name, poolFn)
+	admin.SetScalesetCanary(cfg.ScaleSet.Name, adminapi.CanaryAccessor(func() adminapi.CanaryPromoter {
 		c := poolCanary.Load()
 		if c == nil {
 			return nil
