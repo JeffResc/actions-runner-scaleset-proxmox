@@ -5,15 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
@@ -171,7 +172,7 @@ func newRaftStores(persistent bool, dataDir string, log *slog.Logger) (raft.LogS
 	}
 	// retain=3 keeps the last three snapshots for operator recovery
 	// while keeping the disk footprint bounded.
-	snapStore, err := raft.NewFileSnapshotStore(snapDir, 3, slogWriter{log: log, level: slog.LevelDebug})
+	snapStore, err := raft.NewFileSnapshotStoreWithLogger(snapDir, 3, newSlogHclog(log, "raft.snapshot"))
 	if err != nil {
 		_ = logStore.Close()
 		_ = stableStore.Close()
@@ -242,7 +243,7 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 
 	rcfg := raft.DefaultConfig()
 	rcfg.LocalID = raft.ServerID(cfg.NodeID)
-	rcfg.LogOutput = slogWriter{log: log, level: slog.LevelDebug}
+	rcfg.Logger = newSlogHclog(log, "raft")
 	if cfg.HeartbeatTimeout > 0 {
 		rcfg.HeartbeatTimeout = cfg.HeartbeatTimeout
 	}
@@ -285,7 +286,7 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 		if err != nil {
 			return nil, fmt.Errorf("cluster: resolve advertise %q: %w", advertise, err)
 		}
-		tr, raftErr = raft.NewTCPTransport(cfg.BindAddr, addr, 3, 10*time.Second, slogWriter{log: log, level: slog.LevelDebug})
+		tr, raftErr = raft.NewTCPTransportWithLogger(cfg.BindAddr, addr, 3, 10*time.Second, newSlogHclog(log, "raft.transport"))
 		if raftErr != nil {
 			return nil, fmt.Errorf("cluster: tcp transport on %s: %w", cfg.BindAddr, raftErr)
 		}
@@ -508,17 +509,109 @@ type noopSnapshot struct{}
 func (noopSnapshot) Persist(sink raft.SnapshotSink) error { return sink.Close() }
 func (noopSnapshot) Release()                             {}
 
-// slogWriter adapts an *slog.Logger to the io.Writer hashicorp/raft
-// expects for its log output. raft writes single-line, level-prefixed
-// records — we strip the prefix and re-emit at the configured slog
-// level so production log pipelines stay structured.
-type slogWriter struct {
-	log   *slog.Logger
-	level slog.Level
+// slogHclog implements hclog.Logger by dispatching to slog at the
+// matching level. raft / raft-tcp / file-snapshot-store all accept an
+// hclog.Logger; this is the bridge so production log pipelines see
+// raft's own level tagging rather than every record at Debug.
+type slogHclog struct {
+	log  *slog.Logger
+	name string
+	// implied is hclog's "With" / "Named" carrier — every value added
+	// via those helpers is appended to subsequent records.
+	implied []any
 }
 
-func (s slogWriter) Write(p []byte) (int, error) {
-	msg := strings.TrimRight(string(p), "\n")
-	s.log.Log(context.Background(), s.level, msg)
-	return len(p), nil
+func newSlogHclog(log *slog.Logger, name string) hclog.Logger {
+	return &slogHclog{log: log, name: name}
+}
+
+func (s *slogHclog) Log(level hclog.Level, msg string, args ...any) {
+	s.log.Log(context.Background(), hclogLevelToSlog(level), msg, s.combine(args)...)
+}
+
+func (s *slogHclog) Trace(msg string, args ...any) { s.Log(hclog.Trace, msg, args...) }
+func (s *slogHclog) Debug(msg string, args ...any) { s.Log(hclog.Debug, msg, args...) }
+func (s *slogHclog) Info(msg string, args ...any)  { s.Log(hclog.Info, msg, args...) }
+func (s *slogHclog) Warn(msg string, args ...any)  { s.Log(hclog.Warn, msg, args...) }
+func (s *slogHclog) Error(msg string, args ...any) { s.Log(hclog.Error, msg, args...) }
+
+func (s *slogHclog) IsTrace() bool { return s.log.Enabled(context.Background(), slog.LevelDebug) }
+func (s *slogHclog) IsDebug() bool { return s.log.Enabled(context.Background(), slog.LevelDebug) }
+func (s *slogHclog) IsInfo() bool  { return s.log.Enabled(context.Background(), slog.LevelInfo) }
+func (s *slogHclog) IsWarn() bool  { return s.log.Enabled(context.Background(), slog.LevelWarn) }
+func (s *slogHclog) IsError() bool { return s.log.Enabled(context.Background(), slog.LevelError) }
+
+func (s *slogHclog) ImpliedArgs() []any { return s.implied }
+
+func (s *slogHclog) With(args ...any) hclog.Logger {
+	cp := *s
+	cp.implied = append(append([]any{}, s.implied...), args...)
+	return &cp
+}
+
+func (s *slogHclog) Name() string { return s.name }
+
+func (s *slogHclog) Named(name string) hclog.Logger {
+	cp := *s
+	if s.name != "" {
+		cp.name = s.name + "." + name
+	} else {
+		cp.name = name
+	}
+	return &cp
+}
+
+func (s *slogHclog) ResetNamed(name string) hclog.Logger {
+	cp := *s
+	cp.name = name
+	return &cp
+}
+
+// SetLevel is a no-op — slog handlers decide their own level filtering
+// at construction time; hclog's runtime level changes don't translate.
+func (s *slogHclog) SetLevel(hclog.Level) {}
+func (s *slogHclog) GetLevel() hclog.Level {
+	switch {
+	case s.IsDebug():
+		return hclog.Debug
+	case s.IsInfo():
+		return hclog.Info
+	case s.IsWarn():
+		return hclog.Warn
+	default:
+		return hclog.Error
+	}
+}
+
+func (s *slogHclog) StandardLogger(*hclog.StandardLoggerOptions) *stdlog.Logger {
+	return stdlog.New(s.StandardWriter(nil), "", 0)
+}
+
+func (s *slogHclog) StandardWriter(*hclog.StandardLoggerOptions) io.Writer {
+	return io.Discard
+}
+
+func (s *slogHclog) combine(args []any) []any {
+	if len(s.implied) == 0 {
+		return args
+	}
+	out := make([]any, 0, len(s.implied)+len(args))
+	out = append(out, s.implied...)
+	out = append(out, args...)
+	return out
+}
+
+func hclogLevelToSlog(l hclog.Level) slog.Level {
+	switch l {
+	case hclog.Trace, hclog.Debug, hclog.NoLevel:
+		return slog.LevelDebug
+	case hclog.Info:
+		return slog.LevelInfo
+	case hclog.Warn:
+		return slog.LevelWarn
+	case hclog.Error, hclog.Off:
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
