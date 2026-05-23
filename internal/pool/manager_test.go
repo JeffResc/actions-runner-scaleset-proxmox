@@ -857,6 +857,48 @@ func TestAdopt_OfflineRunner_BecomesAssigned(t *testing.T) {
 	require.Equal(t, runnerID, row.RunnerID)
 }
 
+// TestAdopt_OneHungVMDoesNotBlockStartup: a per-VM PowerState that
+// hangs (one stuck Proxmox node) must not pin leader-plane Adopt for
+// the full HTTP client timeout. classifyAdoption wraps each call in
+// adoptPowerStateTimeoutPerVM and falls back to Hot on timeout —
+// keeping the gh.Reconciler's matrix able to reclassify on its next
+// tick.
+func TestAdopt_OneHungVMDoesNotBlockStartup(t *testing.T) {
+	// Mutates the package-level adoptPowerStateTimeoutPerVM, which
+	// every other Adopt test in this file reads — keep this test
+	// serial so -race doesn't flag the unsynchronised var.
+	prev := adoptPowerStateTimeoutPerVM
+	adoptPowerStateTimeoutPerVM = 100 * time.Millisecond
+	t.Cleanup(func() { adoptPowerStateTimeoutPerVM = prev })
+
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 10010, Node: "hung", Name: "gh-runner-test-10010"},
+			{VMID: 10011, Node: "fast", Name: "gh-runner-test-10011"},
+		},
+		powerStateHangBy: map[int]bool{10010: true},
+		powerStateBy:     map[int]string{10011: "running"},
+	}
+	mgr := newTestManager(t, st, fp, Config{})
+
+	start := time.Now()
+	require.NoError(t, mgr.Adopt(context.Background()))
+	elapsed := time.Since(start)
+	require.Less(t, elapsed, 2*time.Second,
+		"Adopt took %s; one hung VM should be bounded by adoptPowerStateTimeoutPerVM", elapsed)
+
+	// Hung VM still got adopted, defaulting to Hot.
+	row, err := st.Get(10010)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State,
+		"power-state timeout must fall back to Hot, not skip the VM")
+	// Fast VM classified normally.
+	row, err = st.Get(10011)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State)
+}
+
 // TestAdopt_PowerQueryFailure_DefaultsToHot: when Proxmox PowerState
 // fails for a single VM, adopt defaults to Hot rather than Warm — Hot
 // keeps the row visible to the gh.Reconciler's matrix, which will

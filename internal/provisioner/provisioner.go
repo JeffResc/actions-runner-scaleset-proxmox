@@ -337,6 +337,13 @@ func (p *pmox) Ping(ctx context.Context) error {
 // connection is established. Tests may override this.
 var templateDiscoveryTimeoutPerNode = 30 * time.Second
 
+// listOwnedVMsTimeoutPerNode caps how long ListOwnedVMs may spend
+// querying a single node before logging a warn and moving on.
+// sweepProxmoxOrphans runs every reconcile tick; a hung node would
+// otherwise stall the tick for the HTTP client's full timeout (~60s).
+// Tests may override this.
+var listOwnedVMsTimeoutPerNode = 15 * time.Second
+
 // discoverTemplateNode walks the cluster to find the node hosting the
 // configured template VMID. If a node has the VMID but the VM isn't a
 // template, the scan continues (the VMID might appear on multiple nodes
@@ -623,12 +630,19 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 	}
 	var out []*VM
 	for _, ns := range statuses {
-		node, err := p.cli.Node(ctx, ns.Node)
+		// Per-node timeout so one hung Proxmox node cannot pin the
+		// reconciler's orphan-sweep tick for the full HTTP client
+		// timeout. On timeout we log + skip the node; partial results
+		// are still returned to the caller.
+		nodeCtx, cancel := context.WithTimeout(ctx, listOwnedVMsTimeoutPerNode)
+		node, err := p.cli.Node(nodeCtx, ns.Node)
 		if err != nil {
+			cancel()
 			p.log.Warn("list-owned: get node failed; skipping", "node", ns.Node, "err", err)
 			continue
 		}
-		vms, err := node.VirtualMachines(ctx)
+		vms, err := node.VirtualMachines(nodeCtx)
+		cancel()
 		if err != nil {
 			p.log.Warn("list-owned: list vms failed; skipping", "node", ns.Node, "err", err)
 			continue
