@@ -45,6 +45,11 @@ func (m *manager) logRecoveredPanic(opName string, vmid int, r any) {
 		"op", opName, "vmid", vmid, "panic", fmt.Sprintf("%v", r))
 }
 
+// ErrUnknownProfile is returned by SetTargetSizes (and any future
+// per-profile API) when the operator names a profile the manager
+// has no state for.
+var ErrUnknownProfile = errors.New("pool: unknown profile")
+
 // ProfileSettings is the per-profile sizing and clone-shape the
 // manager applies. Zero / empty fields fall back to the top-level
 // Config defaults (HotSize / WarmSize / MaxConcurrentRunners /
@@ -152,6 +157,14 @@ type Config struct {
 type profileState struct {
 	settings     ProfileSettings
 	desiredCount atomic.Int32
+	// hotSize and warmSize are the live target sizes the
+	// reconcile loop reads each tick. Initialised from
+	// settings.{HotSize,WarmSize} and mutated at runtime by
+	// SetTargetSizes (driven by the schedule package, issue #9).
+	// Atomic int32 so the reconcile reader and the schedule
+	// goroutine writer don't contend on a mutex.
+	hotSize  atomic.Int32
+	warmSize atomic.Int32
 	// refill is a per-profile signal channel so a profile's
 	// reconcile loop can be nudged without waking sibling loops.
 	refill chan struct{}
@@ -358,10 +371,13 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 		powerPollErrLastLog: make(map[int]time.Time),
 	}
 	for _, p := range cfg.Profiles {
-		m.profiles[p.Name] = &profileState{
+		ps := &profileState{
 			settings: p,
 			refill:   make(chan struct{}, 1),
 		}
+		ps.hotSize.Store(int32(p.HotSize))   //nolint:gosec // pool sizes are config-bounded
+		ps.warmSize.Store(int32(p.WarmSize)) //nolint:gosec // pool sizes are config-bounded
+		m.profiles[p.Name] = ps
 		m.profileOrder = append(m.profileOrder, p.Name)
 	}
 	go m.destroyDispatcher()
@@ -430,6 +446,51 @@ func (m *manager) SetDesiredCount(n int) {
 		ps.desiredCount.Store(int32(n)) // #nosec G115 -- see above
 	}
 	m.SignalRefill()
+}
+
+// SetTargetSizes updates the live hot/warm target sizes for the
+// named profile (issue #9). Called from the schedule runner on
+// each cron fire / window expiry; the reconcile loop picks up
+// the new values on its next tick and converges (draining
+// excess hot/warm capacity if the new targets are smaller,
+// cloning more if larger).
+//
+// Returns ErrUnknownProfile when name doesn't match a
+// configured profile. Negative sizes are clamped to zero, and
+// the sum is clamped to the profile's MaxConcurrentRunners so a
+// runaway schedule can't permanently exceed the operator's
+// concurrency cap.
+func (m *manager) SetTargetSizes(name string, hot, warm int) error {
+	ps, ok := m.profiles[name]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownProfile, name)
+	}
+	if hot < 0 {
+		hot = 0
+	}
+	if warm < 0 {
+		warm = 0
+	}
+	if cap := ps.settings.MaxConcurrentRunners; hot+warm > cap {
+		// Trim warm first — hot is the latency-sensitive pool
+		// operators tend to care about more.
+		if hot > cap {
+			hot = cap
+			warm = 0
+		} else {
+			warm = cap - hot
+		}
+	}
+	prevHot := ps.hotSize.Swap(int32(hot))    //nolint:gosec // bounded by MaxConcurrentRunners
+	prevWarm := ps.warmSize.Swap(int32(warm)) //nolint:gosec // bounded above
+	if int(prevHot) != hot || int(prevWarm) != warm {
+		m.log.Info("pool: target sizes updated",
+			"profile", name,
+			"hot_from", prevHot, "hot_to", hot,
+			"warm_from", prevWarm, "warm_to", warm)
+		m.SignalRefill()
+	}
+	return nil
 }
 
 // Stats returns the orchestrator-wide pool-population snapshot.
@@ -1256,8 +1317,8 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	busy := stats.Busy()
 	desired := int(ps.desiredCount.Load())
 
-	hotSize := ps.settings.HotSize
-	warmSize := ps.settings.WarmSize
+	hotSize := int(ps.hotSize.Load())
+	warmSize := int(ps.warmSize.Load())
 	profileMax := ps.settings.MaxConcurrentRunners
 
 	needIdle := hotSize - available

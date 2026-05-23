@@ -92,6 +92,8 @@ type Metrics struct {
 	PriorityAcquires     *prometheus.CounterVec
 	Preemptions          *prometheus.CounterVec
 	CanaryReverts        *prometheus.CounterVec
+	ScheduleFires        *prometheus.CounterVec
+	ScheduleActive       *prometheus.GaugeVec
 	Leader               prometheus.Gauge
 
 	// PoolDestroyBacklogFull counts destroy requests dropped because the
@@ -313,6 +315,20 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			// configured threshold. Bounded by profile count.
 			Help: "Canary template rollouts auto-reverted to 0% due to failure rate exceeding threshold.",
 		}, []string{"profile"}),
+		ScheduleFires: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "schedule_fires_total",
+			// One increment per cron fire (per profile, per
+			// schedule name). Cardinality is bounded by
+			// operator-declared schedules.
+			Help: "Schedule cron fires that applied a pool-size override.",
+		}, []string{"profile", "schedule"}),
+		ScheduleActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "schedule_active",
+			// 1 for the schedule whose override window is currently
+			// open on each profile, 0 otherwise. The "" schedule
+			// label represents the no-override / baseline state.
+			Help: "Active schedule override per profile (1 = currently applying).",
+		}, []string{"profile", "schedule"}),
 		Leader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
@@ -333,6 +349,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
 		m.ReconcileErrors, m.UnroutedJobs,
 		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions, m.CanaryReverts,
+		m.ScheduleFires, m.ScheduleActive,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
 		m.Leader,
 	)

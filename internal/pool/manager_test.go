@@ -2581,3 +2581,61 @@ func TestPreempt_HotRowRefused(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, store.StateHot, row.State)
 }
+
+func TestSetTargetSizes_MutatesAtomicsAndSignalsRefill(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		MaxConcurrentRunners: 10,
+		Profiles: []ProfileSettings{
+			{Name: "cpu", HotSize: 2, WarmSize: 3, MaxConcurrentRunners: 10, BootMaxAttempts: 3},
+		},
+	})
+
+	require.NoError(t, mgr.SetTargetSizes("cpu", 5, 4))
+	ps := mgr.profiles["cpu"]
+	require.Equal(t, int32(5), ps.hotSize.Load())
+	require.Equal(t, int32(4), ps.warmSize.Load())
+
+	// refill must be signalled so reconcile picks up the change
+	// promptly rather than waiting for the next ticker.
+	select {
+	case <-ps.refill:
+	default:
+		t.Fatal("SetTargetSizes did not signal refill")
+	}
+}
+
+func TestSetTargetSizes_RejectsUnknownProfile(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		MaxConcurrentRunners: 10,
+		Profiles: []ProfileSettings{
+			{Name: "cpu", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 3},
+		},
+	})
+	err := mgr.SetTargetSizes("nonexistent", 1, 1)
+	require.ErrorIs(t, err, ErrUnknownProfile)
+}
+
+func TestSetTargetSizes_ClampsToMaxConcurrentRunners(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		MaxConcurrentRunners: 10,
+		Profiles: []ProfileSettings{
+			{Name: "cpu", HotSize: 1, WarmSize: 1, MaxConcurrentRunners: 5, BootMaxAttempts: 3},
+		},
+	})
+	// hot=4 + warm=8 = 12 > cap=5; warm gets trimmed.
+	require.NoError(t, mgr.SetTargetSizes("cpu", 4, 8))
+	ps := mgr.profiles["cpu"]
+	require.Equal(t, int32(4), ps.hotSize.Load())
+	require.Equal(t, int32(1), ps.warmSize.Load(), "warm trimmed to cap-hot")
+
+	// hot alone exceeds cap → hot=cap, warm=0.
+	require.NoError(t, mgr.SetTargetSizes("cpu", 99, 99))
+	require.Equal(t, int32(5), ps.hotSize.Load())
+	require.Equal(t, int32(0), ps.warmSize.Load())
+}

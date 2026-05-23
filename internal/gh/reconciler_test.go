@@ -145,6 +145,7 @@ func (f *fakeManager) Adopt(context.Context) error                   { return ni
 func (f *fakeManager) Run(context.Context) error                     { return nil }
 func (f *fakeManager) SignalRefill()                                 {}
 func (f *fakeManager) SetDesiredCount(int)                           {}
+func (f *fakeManager) SetTargetSizes(string, int, int) error         { return nil }
 
 // stubProv satisfies provisioner.Provisioner with no-ops. The reconciler
 // only calls ListOwnedVMs and Destroy via the orphan sweep.

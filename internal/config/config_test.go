@@ -1477,3 +1477,116 @@ func TestProfileNetwork_OmittedIsValid(t *testing.T) {
 		require.Nil(t, p.Network, "no network block: profile.Network must remain nil")
 	}
 }
+
+func TestSchedules_ProfileScheduleParses(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	withSched := strings.Replace(validProfileYAML,
+		"    max_concurrent_runners: 20",
+		`    max_concurrent_runners: 20
+    schedules:
+      - name: business-hours
+        cron: "0 8 * * 1-5"
+        duration: 10h
+        timezone: America/New_York
+        hot_size: 5
+        warm_size: 10`, 1)
+	cfg, err := config.Parse([]byte(withSched))
+	require.NoError(t, err)
+
+	x64 := cfg.Profiles[0]
+	require.Len(t, x64.Schedules, 1)
+	s := x64.Schedules[0]
+	require.Equal(t, "business-hours", s.Name)
+	require.Equal(t, "0 8 * * 1-5", s.Cron)
+	require.Equal(t, 10*time.Hour, s.DurationD)
+	require.NotNil(t, s.Location)
+	require.Equal(t, "America/New_York", s.Location.String())
+	require.Equal(t, 5, s.HotSize)
+	require.Equal(t, 10, s.WarmSize)
+}
+
+func TestSchedules_RejectsInvalidCron(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"    max_concurrent_runners: 20",
+		`    max_concurrent_runners: 20
+    schedules:
+      - name: bad
+        cron: "garbage spec"
+        duration: 1h
+        hot_size: 1
+        warm_size: 1`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cron")
+}
+
+func TestSchedules_RejectsSizesExceedingMaxConcurrent(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"    max_concurrent_runners: 4",
+		`    max_concurrent_runners: 4
+    schedules:
+      - name: oversized
+        cron: "0 8 * * *"
+        duration: 1h
+        hot_size: 10
+        warm_size: 10`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "max_concurrent_runners")
+}
+
+func TestSchedules_RejectsDuplicateNames(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"    max_concurrent_runners: 20",
+		`    max_concurrent_runners: 20
+    schedules:
+      - name: dup
+        cron: "0 8 * * *"
+        duration: 1h
+        hot_size: 1
+        warm_size: 1
+      - name: dup
+        cron: "0 18 * * *"
+        duration: 1h
+        hot_size: 1
+        warm_size: 1`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate")
+}
+
+func TestSchedules_PoolSchedulesInheritsIntoDefaultProfile(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	withGlobal := strings.Replace(validPATYAML,
+		"  boot_max_attempts: 3",
+		`  boot_max_attempts: 3
+  schedules:
+    - name: night
+      cron: "0 22 * * *"
+      duration: 8h
+      hot_size: 0
+      warm_size: 1`, 1)
+	cfg, err := config.Parse([]byte(withGlobal))
+	require.NoError(t, err)
+	require.Len(t, cfg.Profiles, 1)
+	require.Len(t, cfg.Profiles[0].Schedules, 1)
+	require.Equal(t, "night", cfg.Profiles[0].Schedules[0].Name)
+}

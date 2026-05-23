@@ -173,6 +173,29 @@ pool:
 #     max_concurrent_runners: 20
 #     boot_max_attempts: 3
 #     vm_max_age: 12h               # per-profile recycle window
+#     # Optional cron-driven pool-size overrides (issue #9).
+#     # On each fire, the runner sets hot_size/warm_size for
+#     # the profile and holds them for `duration`; then the
+#     # reconcile loop reverts to the profile baseline above
+#     # unless another schedule's window is still open
+#     # (last-fired wins). Sizes are clamped to
+#     # max_concurrent_runners. Fires emit
+#     # scaleset_schedule_fires_total{profile, schedule};
+#     # the active override is exposed as
+#     # scaleset_schedule_active{profile, schedule}.
+#     schedules:
+#       - name: business-hours
+#         cron: "0 8 * * 1-5"       # 8am Mon-Fri
+#         duration: 10h
+#         timezone: America/New_York
+#         hot_size: 10
+#         warm_size: 20
+#       - name: night-mode
+#         cron: "0 18 * * 1-5"      # 6pm Mon-Fri
+#         duration: 14h             # extends to 8am next day
+#         timezone: America/New_York
+#         hot_size: 2
+#         warm_size: 5
 #     # Optional per-profile network. Each field is optional;
 #     # omitted ones inherit proxmox.network.*. ipam.backend
 #     # is "noop" (default; DHCP via cloud-init) or "static"
