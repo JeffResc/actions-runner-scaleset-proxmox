@@ -34,7 +34,6 @@ func main() {
 		configPath string
 		dryRun     bool
 	)
-	root.PersistentFlags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config YAML.")
 
 	runCmd := &cobra.Command{
 		Use:   "run",
@@ -49,6 +48,7 @@ func main() {
 			})
 		},
 	}
+	runCmd.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config YAML.")
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Log intended Proxmox actions without executing them.")
 
 	versionCmd := &cobra.Command{
