@@ -259,6 +259,54 @@ func TestDiscoverTemplateNode_OneHungNodeDoesNotBlock(t *testing.T) {
 		"discoverTemplateNode took %s; expected one hung node to be bounded by templateDiscoveryTimeoutPerNode", elapsed)
 }
 
+// TestListOwnedVMs_OneHungNodeDoesNotBlock: one unreachable node must
+// not pin sweepProxmoxOrphans for the underlying HTTP client's full
+// timeout per tick. Mirrors the per-node-timeout guarantee already in
+// place for discoverTemplateNode.
+func TestListOwnedVMs_OneHungNodeDoesNotBlock(t *testing.T) {
+	t.Parallel()
+
+	prev := listOwnedVMsTimeoutPerNode
+	listOwnedVMsTimeoutPerNode = 200 * time.Millisecond
+	t.Cleanup(func() { listOwnedVMsTimeoutPerNode = prev })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nodes", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[{"node":"hung"},{"node":"fast"}]}`)
+	})
+	mux.HandleFunc("/nodes/hung/status", func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/nodes/hung/qemu", func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/nodes/fast/status", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{}}`)
+	})
+	mux.HandleFunc("/nodes/fast/qemu", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := config.ProxmoxConfig{
+		Endpoint:           srv.URL,
+		InsecureSkipVerify: true,
+		Auth:               config.ProxmoxAuth{TokenID: "a!b", TokenSecret: "x"},
+		TemplateVMID:       9000,
+		VMIDRange:          config.VMIDRange{Min: 10000, Max: 19999},
+	}
+	p := &pmox{cfg: cfg, cli: newProxmoxClient(cfg), scaleSetName: "t", log: quietLogger()}
+
+	start := time.Now()
+	vms, err := p.ListOwnedVMs(context.Background())
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	require.Empty(t, vms, "fast node has no owned VMs")
+	require.Less(t, elapsed, 2*time.Second,
+		"ListOwnedVMs took %s; one hung node should be bounded by listOwnedVMsTimeoutPerNode", elapsed)
+}
+
 func TestClone_LinkedRejectsCrossNode(t *testing.T) {
 	t.Parallel()
 	srv := mockServer(t, &captured{}, http.StatusOK, `{}`)

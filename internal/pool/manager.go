@@ -550,7 +550,12 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 // in-flight job if a runner does turn out to be registered. Defaulting
 // to Warm would hide the VM from the reconciler's matrix entirely.
 func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) (store.State, store.PoolKind, int64) {
-	power, err := m.prov.PowerState(ctx, pv)
+	// Per-VM timeout so one stuck node doesn't pin the leader-plane
+	// startup. The default-to-hot fallback below absorbs the timeout
+	// cleanly — the gh.Reconciler reclassifies on its first tick.
+	vmCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
+	defer cancel()
+	power, err := m.prov.PowerState(vmCtx, pv)
 	if err != nil {
 		m.log.Warn("adopt: power-state query failed; defaulting to hot",
 			"vmid", pv.VMID, "node", pv.Node, "err", err)
@@ -644,6 +649,14 @@ func (m *manager) runPowerPoll(ctx context.Context) {
 // Mirrors templateDiscoveryTimeoutPerNode in the provisioner package.
 // Tests may override this.
 var powerPollTimeoutPerVM = 5 * time.Second
+
+// adoptPowerStateTimeoutPerVM caps how long Adopt's per-VM PowerState
+// query may block during leader-plane startup. A bit looser than
+// powerPollTimeoutPerVM since adopt is a one-off cost paid before the
+// reconciler starts running, but still tight enough that a single
+// hung Proxmox node can't drag startup out for the full HTTP client
+// timeout times the inherited-VM count.
+var adoptPowerStateTimeoutPerVM = 10 * time.Second
 
 // powerPollOnce does a single pass over Assigned/Running rows. Exposed
 // (lower-case) so tests can drive it deterministically without spinning
