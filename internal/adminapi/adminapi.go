@@ -29,6 +29,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jellydator/ttlcache/v3"
+	realclientip "github.com/realclientip/realclientip-go"
 	"golang.org/x/time/rate"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
@@ -110,10 +111,18 @@ type Server struct {
 	// secret never hit it.
 	authFailLimiter *perIPLimiter
 
-	// trustedProxies are the parsed CIDRs from cfg.TrustedProxies.
-	// Populated in New so the realIP middleware can do O(N) prefix
-	// checks per request without re-parsing.
+	// trustedProxies are the parsed CIDRs from cfg.TrustedProxies,
+	// used by peerIsTrustedProxy to decide whether to honor forwarded
+	// headers. Populated in New so the realIP middleware can do O(N)
+	// prefix checks per request without re-parsing.
 	trustedProxies []netip.Prefix
+
+	// realIPStrategy is the chained realclientip-go strategy that
+	// extracts the client IP from forwarded headers once the immediate
+	// peer has been confirmed trusted. The chain favours the rightmost
+	// untrusted hop in X-Forwarded-For, then falls back to X-Real-IP
+	// and True-Client-IP.
+	realIPStrategy realclientip.Strategy
 }
 
 // authFail* are the per-IP throttle parameters applied to bad-bearer
@@ -191,17 +200,41 @@ func New(cfg Config, poolFn PoolAccessor, prov provisioner.Provisioner, gate Lea
 		gate = AlwaysLeader{}
 	}
 	prefixes := make([]netip.Prefix, 0, len(cfg.TrustedProxies))
+	ranges := make([]net.IPNet, 0, len(cfg.TrustedProxies))
 	for i, cidr := range cfg.TrustedProxies {
 		p, err := netip.ParsePrefix(cidr)
 		if err != nil {
 			return nil, fmt.Errorf("adminapi: trusted_proxies[%d] %q: %w", i, cidr, err)
 		}
 		prefixes = append(prefixes, p)
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("adminapi: trusted_proxies[%d] %q: %w", i, cidr, err)
+		}
+		ranges = append(ranges, *n)
+	}
+	// X-Forwarded-For is walked rightmost-untrusted via the library —
+	// chained with X-Real-IP and True-Client-IP fallbacks so the same
+	// gated semantics our hand-rolled middleware previously offered are
+	// preserved. The peer-trusted gate in realIP() decides whether
+	// the strategy is consulted at all.
+	xff, err := realclientip.NewRightmostTrustedRangeStrategy("X-Forwarded-For", ranges)
+	if err != nil {
+		return nil, fmt.Errorf("adminapi: build realIP strategy: %w", err)
+	}
+	xri, err := realclientip.NewSingleIPHeaderStrategy("X-Real-IP")
+	if err != nil {
+		return nil, fmt.Errorf("adminapi: build X-Real-IP strategy: %w", err)
+	}
+	tci, err := realclientip.NewSingleIPHeaderStrategy("True-Client-IP")
+	if err != nil {
+		return nil, fmt.Errorf("adminapi: build True-Client-IP strategy: %w", err)
 	}
 	return &Server{
 		cfg: cfg, pool: poolFn, prov: prov, gate: gate, drain: drain, log: log,
 		authFailLimiter: newPerIPLimiter(rate.Limit(authFailRPS), authFailBurst, authFailIdle),
 		trustedProxies:  prefixes,
+		realIPStrategy:  realclientip.NewChainStrategy(xff, xri, tci),
 	}, nil
 }
 
@@ -336,16 +369,14 @@ func (s *Server) Serve(ctx context.Context) error {
 //
 // The two-step "check peer, then maybe rewrite" is intentional: chi's
 // middleware.RealIP rewrites unconditionally, which is the bug
-// motivating this variant.
+// motivating this variant. Header parsing is delegated to
+// realclientip-go; the local check that gates it is what makes the
+// resulting r.RemoteAddr safe to use as a rate-limit key.
 func (s *Server) realIP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.peerIsTrustedProxy(r.RemoteAddr) {
-			if forwarded := headerFirstIP(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-				r.RemoteAddr = forwarded
-			} else if real := r.Header.Get("X-Real-IP"); real != "" {
-				r.RemoteAddr = real
-			} else if tc := r.Header.Get("True-Client-IP"); tc != "" {
-				r.RemoteAddr = tc
+			if ip := s.realIPStrategy.ClientIP(r.Header, r.RemoteAddr); ip != "" {
+				r.RemoteAddr = ip
 			}
 		}
 		next.ServeHTTP(w, r)
@@ -370,19 +401,6 @@ func (s *Server) peerIsTrustedProxy(remoteAddr string) bool {
 		}
 	}
 	return false
-}
-
-// headerFirstIP returns the first comma-separated IP from an XFF-style
-// header, trimmed of whitespace, or "" when empty. RFC 7239 says the
-// first entry is the original client.
-func headerFirstIP(hv string) string {
-	if hv == "" {
-		return ""
-	}
-	if comma := strings.IndexByte(hv, ','); comma >= 0 {
-		hv = hv[:comma]
-	}
-	return strings.TrimSpace(hv)
 }
 
 // accessLog logs every admin request with method, path, remote addr,

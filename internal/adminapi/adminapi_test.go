@@ -771,8 +771,11 @@ func TestRealIP_HonorsHeadersFromTrustedPeer(t *testing.T) {
 }
 
 // TestRealIP_XFFPrecedence: when several forwarded-for headers are
-// present from a trusted peer, X-Forwarded-For wins (RFC 7239
-// chronology) over X-Real-IP and True-Client-IP.
+// present from a trusted peer, X-Forwarded-For wins over X-Real-IP and
+// True-Client-IP. The rightmost untrusted hop in the XFF list is
+// returned — that's the closest-to-the-server IP outside the operator's
+// declared trusted_proxies, which is what defeats multi-hop XFF
+// spoofing.
 func TestRealIP_XFFPrecedence(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestServerTrustedProxies(t, "topsecret", []string{"127.0.0.0/8"})
@@ -789,8 +792,8 @@ func TestRealIP_XFFPrecedence(t *testing.T) {
 	r.Header.Set("True-Client-IP", "203.0.113.12")
 	h.ServeHTTP(httptest.NewRecorder(), r)
 
-	require.Equal(t, "203.0.113.10", seenRemote,
-		"first XFF entry should win over X-Real-IP / True-Client-IP")
+	require.Equal(t, "198.51.100.1", seenRemote,
+		"rightmost untrusted XFF entry should win over X-Real-IP / True-Client-IP")
 }
 
 // TestServe_TLS_RoundTripsBearer: when TLSConfig is set, the admin
