@@ -56,6 +56,12 @@ type fakeProv struct {
 	// destroys (e.g. block on a channel until the test releases).
 	onDestroy func()
 
+	// onClone, when set, is invoked synchronously inside Clone after
+	// recording the call but BEFORE returning the result. Used by
+	// row-deleted-mid-clone tests to delete a store row at exactly the
+	// race window that produced the bug.
+	onClone func(opts provisioner.CloneOptions)
+
 	// powerStateBy lets tests drive per-VMID PowerState replies for the
 	// power-state poller. Default (nil) returns "running" for any VMID,
 	// matching the steady-state expectation of an Assigned/Running VM.
@@ -99,10 +105,15 @@ func (f *fakeProv) Clone(ctx context.Context, opts provisioner.CloneOptions) (*p
 		}
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.clones = append(f.clones, opts)
-	if f.cloneErr != nil {
-		return nil, f.cloneErr
+	cloneErr := f.cloneErr
+	hook := f.onClone
+	f.mu.Unlock()
+	if cloneErr != nil {
+		return nil, cloneErr
+	}
+	if hook != nil {
+		hook(opts)
 	}
 	return &provisioner.VM{VMID: opts.NewVMID, Node: opts.Node, Name: opts.Name}, nil
 }
@@ -1484,6 +1495,52 @@ func TestRunClone_PanicReportsAllocatedVMID(t *testing.T) {
 
 	mgr.workerCancel()
 	mgr.wg.Wait()
+}
+
+// TestRunClone_DeletesOrphanWhenRowVanished simulates the race fixed
+// by #63: Clone succeeds on Proxmox, then a concurrent ForceDestroy /
+// stuck-state sweep deletes the store row before runClone can flip it
+// to Warm/Booting. Without the fix the just-cloned VM lived until
+// sweepProxmoxOrphans picked it up (OrphanGrace + reconcile tick).
+// The fix must destroy it immediately.
+func TestRunClone_DeletesOrphanWhenRowVanished(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	// Inside Clone, delete the store row for the just-allocated vmid.
+	// This is the race window the bug exploited.
+	fp.onClone = func(opts provisioner.CloneOptions) {
+		_ = st.Delete(opts.NewVMID)
+	}
+
+	mi, err := NewManager(Config{
+		HotSize:              1,
+		MaxConcurrentRunners: 5,
+		VMIDRange:            config.VMIDRange{Min: 73000, Max: 73099},
+		VMNamePrefix:         "gh-runner-test-",
+		TemplateNode:         "pve1",
+		BootMaxAttempts:      3,
+	}, st, fp, mustSel(t), slog.New(slog.NewTextHandler(io.Discard, nil)), observability.NewMetrics(prometheus.NewRegistry()))
+	require.NoError(t, err)
+	mgr := mi.(*manager)
+
+	mgr.kickClone(context.Background(), store.PoolKindHot, true)
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.destroys) >= 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"runClone must destroy the just-cloned VM when its row was deleted mid-clone")
+
+	mgr.workerCancel()
+	mgr.wg.Wait()
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Equal(t, 1, len(fp.clones), "exactly one Clone should have run")
+	require.Equal(t, fp.clones[0].NewVMID, fp.destroys[0],
+		"destroy must target the vmid just cloned (orphan), not a different id")
 }
 
 // panickyProv wraps a Provisioner and panics from Clone. Useful for
