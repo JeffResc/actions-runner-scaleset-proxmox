@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-github/v84/github"
+	"github.com/google/go-github/v88/github"
 	"github.com/luthermonson/go-proxmox"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -71,10 +71,12 @@ func runnersServer(t *testing.T, runners []fakeRunner) *httptest.Server {
 
 func newTestClient(t *testing.T, srv *httptest.Server) *github.Client {
 	t.Helper()
-	cli := github.NewClient(http.DefaultClient)
-	base, err := cli.BaseURL.Parse(srv.URL + "/")
+	base := srv.URL + "/"
+	cli, err := github.NewClient(
+		github.WithHTTPClient(http.DefaultClient),
+		github.WithURLs(&base, &base),
+	)
 	require.NoError(t, err)
-	cli.BaseURL = base
 	return cli
 }
 
@@ -538,7 +540,9 @@ func TestReconcile_OrphanFirstTickProtectedByGrace(t *testing.T) {
 func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T) {
 	t.Parallel()
 	mgr := &fakeManager{rows: nil}
-	r, err := New(baseCfg(), github.NewClient(nil), mgr, &stubProv{}, silentLogger(), nil)
+	ghCli, err := github.NewClient()
+	require.NoError(t, err)
+	r, err := New(baseCfg(), ghCli, mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
 
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)

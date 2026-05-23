@@ -5,21 +5,23 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/google/go-github/v84/github"
+	"github.com/google/go-github/v88/github"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakegithub"
 )
 
-// newGitHubClient builds a github.Client pointed at the fake by
-// patching BaseURL directly. The PATConfig-based path is exercised by
-// the gh reconciler tests once that helper is available.
+// newGitHubClient builds a github.Client pointed at the fake. In
+// go-github v88 the BaseURL is no longer a settable field; the URL
+// is injected via WithURLs at construction time.
 func newGitHubClient(t *testing.T, srv *fakegithub.Server) *github.Client {
 	t.Helper()
-	cli := github.NewClient(http.DefaultClient)
-	base, err := cli.BaseURL.Parse(srv.RESTBaseURL())
+	base := srv.RESTBaseURL()
+	cli, err := github.NewClient(
+		github.WithHTTPClient(http.DefaultClient),
+		github.WithURLs(&base, &base),
+	)
 	require.NoError(t, err)
-	cli.BaseURL = base
 	return cli
 }
 
