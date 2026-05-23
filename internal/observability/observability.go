@@ -88,6 +88,9 @@ type Metrics struct {
 	RunnerHookEvents     *prometheus.CounterVec
 	ReconcileErrors      *prometheus.CounterVec
 	UnroutedJobs         *prometheus.CounterVec
+	QuotaThrottled       *prometheus.CounterVec
+	PriorityAcquires     *prometheus.CounterVec
+	Preemptions          *prometheus.CounterVec
 	Leader               prometheus.Gauge
 
 	// PoolDestroyBacklogFull counts destroy requests dropped because the
@@ -279,6 +282,28 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			// metric_relabel_configs.
 			Help: "Jobs whose requested labels did not match any configured runner profile.",
 		}, []string{"labels"}),
+		QuotaThrottled: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "quota_throttled_total",
+			// scope is "org" or "repo" (matches quotas.Scope);
+			// name is the org or owner/repo bucket. Bounded by
+			// the number of distinct overrides + active orgs/repos.
+			Help: "Jobs observed exceeding their configured per-org or per-repo quota.",
+		}, []string{"scope", "name"}),
+		PriorityAcquires: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "priority_acquires_total",
+			// class is the priority.Class.Name (or "default" when
+			// no class matched). Bounded by the operator's class
+			// list.
+			Help: "Jobs paired with a runner VM, partitioned by their priority class.",
+		}, []string{"class"}),
+		Preemptions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "preemptions_total",
+			// from_class is the class of the VM that was destroyed;
+			// to_class is the class of the job that triggered the
+			// preempt (or "manual" when invoked via the admin API
+			// without a triggering job context).
+			Help: "Assigned VMs preempted to free capacity, partitioned by from_class and to_class.",
+		}, []string{"from_class", "to_class"}),
 		Leader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
@@ -297,8 +322,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors,
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
-		m.ReconcileErrors, m.UnroutedJobs, m.Leader,
+		m.ReconcileErrors, m.UnroutedJobs,
+		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
+		m.Leader,
 	)
 	return m
 }

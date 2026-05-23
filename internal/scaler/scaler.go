@@ -31,7 +31,9 @@ import (
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/priority"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/quotas"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
 )
 
@@ -60,6 +62,28 @@ type Scaler struct {
 	// profile" (single-profile back-compat).
 	router *router.Router
 
+	// quotas resolves the effective per-(org|repo) concurrency cap
+	// for a given job. When the resolver is non-nil and Enabled,
+	// HandleJobStarted compares the matching bucket's existing
+	// count against the cap and emits scaleset_quota_throttled_total
+	// when the cap is breached. Per the PR's premise note this is
+	// observational; at-acquire-time enforcement is deferred until
+	// the listener integration exposes per-job pre-assignment
+	// metadata.
+	quotas *quotas.Resolver
+
+	// priority classifies jobs into operator-declared priority
+	// classes for the scaleset_priority_acquires_total counter.
+	// Nil = every job lands in priority.ZeroClass.
+	priority *priority.Matcher
+
+	// quotaCounter looks up the current per-org / per-repo VM
+	// count for recordQuota. Decoupled from pool.Manager so unit
+	// tests can stub it without faking the entire interface.
+	// Production wires the store-backed implementation in
+	// app.Run.
+	quotaCounter QuotaCounter
+
 	// provisionOneFn is the per-VM mint+inject worker invoked from
 	// HandleDesiredRunnerCount. Defaults to the production
 	// provisionOne; tests override it to isolate the acquire/clamp
@@ -85,6 +109,14 @@ func New(cfg Config, gh *scaleset.Client, p pool.Manager, prov provisioner.Provi
 // after both the scaler and the router have been built.
 func (s *Scaler) SetRouter(r *router.Router) { s.router = r }
 
+// SetQuotas attaches a quotas resolver. Pass nil (or an empty
+// config's resolver) to disable quota observations.
+func (s *Scaler) SetQuotas(q *quotas.Resolver) { s.quotas = q }
+
+// SetPriority attaches a priority matcher. Pass nil to treat every
+// job as priority.ZeroClass.
+func (s *Scaler) SetPriority(p *priority.Matcher) { s.priority = p }
+
 // HandleJobStarted is called when GitHub assigns a queued job to one of our
 // JIT runners. We transition the matching VM row Assigned -> Running and,
 // when a label router is configured, record the routing decision for the
@@ -92,7 +124,10 @@ func (s *Scaler) SetRouter(r *router.Router) { s.router = r }
 // JobStarted fires GitHub has already paired the job with a specific VM,
 // so we can't redirect; what we CAN do is alert operators via the
 // unrouted-jobs metric when a job arrives whose labels no profile
-// satisfies (a config gap they need to fix).
+// satisfies (a config gap they need to fix). The quotas + priority
+// machinery (issues #4 + #10) follows the same observational
+// pattern for the same reason — per-job pre-assignment metadata
+// requires a deeper listener integration, deferred to a future PR.
 func (s *Scaler) HandleJobStarted(ctx context.Context, info *scaleset.JobStarted) error {
 	if s.metrics != nil {
 		s.metrics.ListenerMessages.WithLabelValues("job_started").Inc()
@@ -103,7 +138,120 @@ func (s *Scaler) HandleJobStarted(ctx context.Context, info *scaleset.JobStarted
 		s.log.Warn("job_started: cannot derive vmid from runner name", "runner_name", info.RunnerName)
 		return nil
 	}
+	// Stamp the row with per-job metadata + record priority class
+	// + observe quotas BEFORE transitioning to Running. The metric
+	// emissions are cheap; the StampJobMetadata write happens in
+	// the same goroutine as MarkRunning so the row is fully
+	// described before any other consumer (admin /state, GH
+	// reconciler ListRows) can observe it.
+	org, repo, class := s.classifyJob(info)
+	if err := s.pool.StampJobMetadata(ctx, vmid, pool.JobMetadata{
+		Org: org, Repo: repo, PriorityClass: class.Name,
+	}); err != nil {
+		// Non-fatal: stamping is observability scaffolding. Log
+		// and move on so the actual state transition still
+		// happens.
+		s.log.Warn("job_started: stamp metadata failed", "vmid", vmid, "err", err)
+	}
+	s.recordPriority(class)
+	s.recordQuota(ctx, org, repo)
 	return s.pool.MarkRunning(ctx, vmid, int64(info.RunnerID))
+}
+
+// classifyJob projects the JobStarted message into the dimensions
+// the quotas + priority machinery consults. Repo is joined into
+// owner/repo form to align with the lookup keys.
+func (s *Scaler) classifyJob(info *scaleset.JobStarted) (org, repo string, class priority.Class) {
+	org = info.OwnerName
+	if info.OwnerName != "" && info.RepositoryName != "" {
+		repo = info.OwnerName + "/" + info.RepositoryName
+	}
+	class = s.priority.Classify(priority.JobInfo{
+		Org:            org,
+		Repo:           info.RepositoryName,
+		WorkflowLabels: info.RequestLabels,
+	})
+	return org, repo, class
+}
+
+// recordPriority bumps scaleset_priority_acquires_total{class} for
+// the class the job was paired into. A nil matcher resolves to
+// priority.ZeroClass, so the counter is always populated under
+// "default" — operators get a baseline series even without
+// priority config.
+func (s *Scaler) recordPriority(class priority.Class) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.PriorityAcquires.WithLabelValues(class.Name).Inc()
+}
+
+// recordQuota looks up the effective per-(org|repo) cap for the
+// job, counts the bucket's existing stamped VMs, and bumps
+// scaleset_quota_throttled_total when the cap is exceeded. The
+// observation is post-facto (GitHub already paired the job with a
+// VM) — the metric tells operators which quota is being violated
+// and by how much, but the orchestrator does not refuse the
+// already-assigned job here.
+func (s *Scaler) recordQuota(_ context.Context, org, repo string) {
+	if s.quotas == nil || !s.quotas.Enabled() {
+		return
+	}
+	res := s.quotas.Resolve(org, repo)
+	if res.Scope == quotas.ScopeNone || res.Cap == 0 {
+		return
+	}
+	// Counter logic intentionally lives in QuotaCount; defer the
+	// actual store query so unit tests can stub it without paying
+	// the cost of a fake store. In the production path it queries
+	// the manager-backed store via the scaler's hook below.
+	count, err := s.quotaCount(res.Scope, res.Name)
+	if err != nil {
+		s.log.Warn("quota: count lookup failed", "scope", res.Scope, "name", res.Name, "err", err)
+		return
+	}
+	if count > res.Cap {
+		s.log.Warn("quota: bucket over cap",
+			"scope", res.Scope, "name", res.Name, "count", count, "cap", res.Cap)
+		if s.metrics != nil {
+			s.metrics.QuotaThrottled.WithLabelValues(string(res.Scope), res.Name).Inc()
+		}
+	}
+}
+
+// QuotaCounter is the abstraction the scaler uses to look up the
+// current per-org / per-repo VM count. Production wires the store-
+// backed implementation; tests can plug in a stub without faking
+// the entire pool.Manager surface.
+type QuotaCounter interface {
+	CountByOrg(org string) (int, error)
+	CountByRepo(repo string) (int, error)
+}
+
+// SetQuotaCounter attaches the per-bucket count source. Nil
+// disables the lookup (recordQuota then short-circuits, which is
+// safe even with a non-nil resolver — the metric just stays at 0).
+func (s *Scaler) SetQuotaCounter(c QuotaCounter) { s.quotaCounter = c }
+
+// quotaCount dispatches to the configured QuotaCounter. Returns 0
+// when nothing is wired so the caller's threshold comparison
+// always trivially passes (we don't want missing wiring to spam
+// false throttled events).
+func (s *Scaler) quotaCount(scope quotas.Scope, name string) (int, error) {
+	if s.quotaCounter == nil {
+		return 0, nil
+	}
+	switch scope {
+	case quotas.ScopeRepo:
+		return s.quotaCounter.CountByRepo(name)
+	case quotas.ScopeOrg:
+		return s.quotaCounter.CountByOrg(name)
+	case quotas.ScopeNone:
+		// Caller already short-circuited on ScopeNone; defensive
+		// no-op so the exhaustive lint stays happy if recordQuota
+		// ever forgets the guard.
+	}
+	return 0, nil
 }
 
 // recordRouting consults the router (when configured) and either logs

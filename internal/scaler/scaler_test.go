@@ -17,7 +17,9 @@ import (
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/priority"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/quotas"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
 )
 
@@ -133,10 +135,14 @@ func (f *fakePool) MarkRunning(context.Context, int, int64) error             { 
 func (f *fakePool) SetRunnerID(context.Context, int, int64) error             { return nil }
 func (f *fakePool) PromoteToRunning(context.Context, int, int64, int64) error { return nil }
 func (f *fakePool) ForceDestroy(context.Context, int, string) error           { return nil }
-func (f *fakePool) ListRows(context.Context) ([]pool.RowSnapshot, error)      { return nil, nil }
-func (f *fakePool) Adopt(context.Context) error                               { return nil }
-func (f *fakePool) Run(context.Context) error                                 { return nil }
-func (f *fakePool) SignalRefill()                                             {}
+func (f *fakePool) Preempt(context.Context, int, string) error                { return nil }
+func (f *fakePool) StampJobMetadata(context.Context, int, pool.JobMetadata) error {
+	return nil
+}
+func (f *fakePool) ListRows(context.Context) ([]pool.RowSnapshot, error) { return nil, nil }
+func (f *fakePool) Adopt(context.Context) error                          { return nil }
+func (f *fakePool) Run(context.Context) error                            { return nil }
+func (f *fakePool) SignalRefill()                                        {}
 
 func (f *fakePool) acquireCount() int {
 	f.mu.Lock()
@@ -464,4 +470,177 @@ func TestJoinLabelsForMetric_StableAcrossOrdering(t *testing.T) {
 	require.Equal(t, a, b)
 	require.Equal(t, "linux|self-hosted|x64", a)
 	require.Equal(t, "", joinLabelsForMetric(nil))
+}
+
+// ---------------------------------------------------------------------------
+// Quotas + Priority observability (PR 5 — issues #4 + #10)
+// ---------------------------------------------------------------------------
+
+// stubQuotaCounter satisfies QuotaCounter with constant return values
+// so tests can drive recordQuota's threshold comparison without
+// standing up a real store.
+type stubQuotaCounter struct {
+	repoCounts map[string]int
+	orgCounts  map[string]int
+}
+
+func (s *stubQuotaCounter) CountByRepo(repo string) (int, error) {
+	return s.repoCounts[repo], nil
+}
+func (s *stubQuotaCounter) CountByOrg(org string) (int, error) {
+	return s.orgCounts[org], nil
+}
+
+func TestHandleJobStarted_StampsJobMetadata(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	pm, err := priority.New([]priority.Class{
+		{Name: "critical", Weight: 100, Match: priority.Match{Org: "acme"}},
+	})
+	require.NoError(t, err)
+	s.SetPriority(pm)
+
+	err = s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			OwnerName:      "acme",
+			RepositoryName: "platform",
+			RequestLabels:  []string{"self-hosted", "linux"},
+		},
+		RunnerName: "gh-runner-test-10042",
+		RunnerID:   42,
+	})
+	require.NoError(t, err)
+
+	// priority_acquires_total{class="critical"} must increment.
+	require.Equal(t, 1.0,
+		counterValue(t, metrics.PriorityAcquires, "critical"),
+		"job from matching org must increment its class counter")
+}
+
+func TestHandleJobStarted_DefaultPriorityWhenNoMatcher(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	// No SetPriority — every job falls into priority.ZeroClass ("default").
+
+	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			OwnerName: "acme", RepositoryName: "platform",
+		},
+		RunnerName: "gh-runner-test-10043",
+		RunnerID:   43,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, 1.0,
+		counterValue(t, metrics.PriorityAcquires, "default"),
+		"no-priority-config baseline series under 'default'")
+}
+
+func TestHandleJobStarted_QuotaOverIncrementsThrottled(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 3})
+	require.NoError(t, err)
+	s.SetQuotas(qr)
+	// 4 VMs already stamped for acme/platform — over the cap of 3.
+	s.SetQuotaCounter(&stubQuotaCounter{
+		repoCounts: map[string]int{"acme/platform": 4},
+	})
+
+	err = s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			OwnerName: "acme", RepositoryName: "platform",
+		},
+		RunnerName: "gh-runner-test-10044",
+		RunnerID:   44,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, 1.0,
+		counterValue(t, metrics.QuotaThrottled, "repo", "acme/platform"),
+		"quota over-cap must increment scaleset_quota_throttled_total{repo}")
+}
+
+func TestHandleJobStarted_QuotaUnderCapNoThrottle(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 10})
+	require.NoError(t, err)
+	s.SetQuotas(qr)
+	s.SetQuotaCounter(&stubQuotaCounter{
+		repoCounts: map[string]int{"acme/platform": 2},
+	})
+
+	err = s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			OwnerName: "acme", RepositoryName: "platform",
+		},
+		RunnerName: "gh-runner-test-10045",
+		RunnerID:   45,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, 0.0,
+		counterValue(t, metrics.QuotaThrottled, "repo", "acme/platform"),
+		"under-cap job must NOT increment throttled counter")
+}
+
+func TestHandleJobStarted_DisabledQuotaResolverIsNoop(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+	// Empty config → Enabled()==false. Even if a counter says we're
+	// over 9000, no throttled metric is emitted.
+	qr, err := quotas.New(quotas.Config{})
+	require.NoError(t, err)
+	s.SetQuotas(qr)
+	s.SetQuotaCounter(&stubQuotaCounter{
+		repoCounts: map[string]int{"acme/platform": 9999},
+	})
+
+	err = s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			OwnerName: "acme", RepositoryName: "platform",
+		},
+		RunnerName: "gh-runner-test-10046",
+		RunnerID:   46,
+	})
+	require.NoError(t, err)
+
+	require.Equal(t, 0.0,
+		counterValue(t, metrics.QuotaThrottled, "repo", "acme/platform"),
+		"disabled quotas resolver must skip the check entirely")
+}
+
+func TestClassifyJob_RepoJoinsOwnerSlashRepo(t *testing.T) {
+	t.Parallel()
+	s := &Scaler{}
+	pm, err := priority.New([]priority.Class{
+		{Name: "repo-pinned", Match: priority.Match{Repo: "platform"}},
+	})
+	require.NoError(t, err)
+	s.SetPriority(pm)
+
+	org, repo, class := s.classifyJob(&scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			OwnerName:      "acme",
+			RepositoryName: "platform",
+		},
+	})
+	require.Equal(t, "acme", org)
+	require.Equal(t, "acme/platform", repo, "repo is joined for quota lookup alignment")
+	require.Equal(t, "repo-pinned", class.Name,
+		"priority matcher receives the bare repo name (not joined) per JobInfo contract")
 }

@@ -57,19 +57,29 @@ var AllStates = []State{
 // treated as the default profile by upstream code; the store does not
 // rewrite the value so it round-trips faithfully even when older rows
 // without a profile field are adopted.
+//
+// Org / Repo / PriorityClass are per-job metadata stamped when the
+// scaler observes JobStarted (the listener payload's first per-job
+// signal). They are empty on Hot / Warm / Assigned rows that have
+// not yet been paired with a job; quota and priority counters
+// scope by these dimensions, so empty values are filtered out of
+// per-bucket sums.
 type VM struct {
-	VMID         int
-	Node         string
-	Name         string
-	Profile      string
-	PoolKind     PoolKind
-	State        State
-	JobID        int64
-	RunnerID     int64
-	BootAttempts int
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	StateSince   time.Time
+	VMID          int
+	Node          string
+	Name          string
+	Profile       string
+	Org           string
+	Repo          string
+	PriorityClass string
+	PoolKind      PoolKind
+	State         State
+	JobID         int64
+	RunnerID      int64
+	BootAttempts  int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	StateSince    time.Time
 }
 
 // Clone returns a deep copy. memdb stores by pointer; mutating a row read
@@ -97,6 +107,10 @@ const tableVM = "vm"
 //     just the rows belonging to its profile without a full scan.
 //   - "profile_state" compound on (Profile, State) — drives per-profile
 //     stats / count helpers the multi-profile reconciler depends on.
+//   - "org" / "repo" / "priority_class" — quotas + priority. AllowMissing
+//     so the (frequent) pre-job-pairing rows whose metadata is unset
+//     skip the index instead of failing insert; lookups by non-empty
+//     values still return the matching rows.
 //
 // Other fields (JobID, RunnerID, timestamps) aren't indexed — the table
 // is bounded by max_concurrent_runners (tens to low hundreds of rows) so
@@ -137,6 +151,21 @@ func schema() *memdb.DBSchema {
 								&memdb.StringFieldIndex{Field: "State"},
 							},
 						},
+					},
+					"org": {
+						Name:         "org",
+						AllowMissing: true,
+						Indexer:      &memdb.StringFieldIndex{Field: "Org"},
+					},
+					"repo": {
+						Name:         "repo",
+						AllowMissing: true,
+						Indexer:      &memdb.StringFieldIndex{Field: "Repo"},
+					},
+					"priority_class": {
+						Name:         "priority_class",
+						AllowMissing: true,
+						Indexer:      &memdb.StringFieldIndex{Field: "PriorityClass"},
 					},
 				},
 			},

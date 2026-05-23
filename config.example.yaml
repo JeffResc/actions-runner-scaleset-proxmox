@@ -147,6 +147,52 @@ pool:
 #     warm_size: 1
 #     max_concurrent_runners: 4
 
+# Optional per-org / per-repo concurrency caps. Both blocks are
+# OBSERVATIONAL today: the actions/scaleset listener surfaces
+# per-job metadata only AFTER GitHub has paired a job with a VM,
+# so the orchestrator records over-cap events via
+# scaleset_quota_throttled_total{scope, name} rather than rejecting
+# acquisitions. Set defaults + overrides to make visibility
+# meaningful; future enforcement will reuse the same config shape.
+#
+# Each override must set exactly one of `org` or `repo`; the
+# `default_per_*` knobs apply when nothing more specific matches.
+# 0 disables a knob (an override of 0 explicitly opts a scope out
+# of the default cap — useful for an internal-tooling repo you
+# want uncapped).
+#
+# quotas:
+#   default_per_repo: 5
+#   default_per_org: 20
+#   overrides:
+#     - match: { repo: "acme/heavy-ci" }
+#       max_concurrent: 15
+#     - match: { org: "acme-platform" }
+#       max_concurrent: 30
+
+# Optional priority classes. The scaler stamps each job's matching
+# class onto the VM row and emits scaleset_priority_acquires_total
+# {class}. `preempt: true` enables the admin /admin/preempt/{vmid}
+# endpoint to destroy lower-class VMs to free capacity — Running
+# VMs are NEVER preempted, only Assigned-but-not-yet-Running ones.
+#
+# Match rules: every non-empty selector field must equal the job's
+# corresponding field. Empty selectors are wildcards. Tiebreakers
+# (same specificity) resolve by declaration order, so list your
+# classes from most-important to least-important.
+#
+# priority:
+#   classes:
+#     - name: critical
+#       match: { workflow_label: "priority:critical" }
+#       weight: 100
+#       preempt: true
+#     - name: standard
+#       weight: 10
+#     - name: best_effort
+#       match: { repo: "acme/research" }
+#       weight: 1
+
 observability:
   http_addr: ":9100"              # exposes /metrics /healthz /readyz
   log_level: info                 # debug | info | warn | error

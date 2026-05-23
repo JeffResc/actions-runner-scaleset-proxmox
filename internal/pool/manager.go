@@ -407,9 +407,6 @@ func (m *manager) SetDesiredCount(n int) {
 // Stats keeps the previous shape for backwards-compatible callers
 // (admin API, tests).
 func (m *manager) Stats(_ context.Context) (Stats, error) {
-	if m.workerCtx.Err() != nil {
-		return Stats{}, ErrManagerDeposed
-	}
 	raw, err := m.store.Stats()
 	if err != nil {
 		return Stats{}, fmt.Errorf("stats: %w", err)
@@ -572,6 +569,35 @@ func (m *manager) SetRunnerID(_ context.Context, vmid int, runnerID int64) error
 	return nil
 }
 
+// StampJobMetadata records per-job context (org/repo/class) on the
+// row without changing state. Idempotent — empty fields are
+// skipped so a partial second call doesn't blank fields the first
+// call set. A missing row is a no-op (the runner may have been
+// destroyed between JobStarted observation and this call).
+func (m *manager) StampJobMetadata(_ context.Context, vmid int, meta JobMetadata) error {
+	if meta.Org == "" && meta.Repo == "" && meta.PriorityClass == "" {
+		return nil
+	}
+	_, err := m.store.Update(vmid, func(v *store.VM) {
+		if meta.Org != "" {
+			v.Org = meta.Org
+		}
+		if meta.Repo != "" {
+			v.Repo = meta.Repo
+		}
+		if meta.PriorityClass != "" {
+			v.PriorityClass = meta.PriorityClass
+		}
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stamp job metadata: %w", err)
+	}
+	return nil
+}
+
 // MarkRunning transitions Assigned → Running and stamps the runner ID.
 func (m *manager) MarkRunning(_ context.Context, vmid int, runnerID int64) error {
 	ok, err := m.store.UpdateState(vmid, store.StateAssigned, store.StateRunning, func(v *store.VM) {
@@ -624,9 +650,6 @@ func (m *manager) PromoteToRunning(_ context.Context, vmid int, runnerID, jobID 
 // so we don't double-call prov.Destroy or burn duplicate Proxmox /
 // GitHub API budget.
 func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error {
-	if m.workerCtx.Err() != nil {
-		return ErrManagerDeposed
-	}
 	from := []store.State{
 		store.StateProvisioning,
 		store.StateWarm,
@@ -651,6 +674,47 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 	}
 	m.log.Warn("force destroy", "vmid", vmid, "reason", reason)
 	m.destroyAsync(vmid, node, profile)
+	return nil
+}
+
+// Preempt destroys an Assigned-but-not-yet-Running VM to free
+// capacity for a higher-priority job (issue #10). Refuses any row
+// not in Assigned — never preempts Running (interrupting an
+// actively-executing job is the destructive behaviour we promise
+// never to do); Hot/Warm/Booting/Provisioning rows are released
+// through the natural shrink-to-floor reconcile path, not here.
+//
+// On success the row is CAS-transitioned to Draining and an async
+// destroy is queued. Returns ErrPreemptRefused with a descriptive
+// reason (lookup miss, wrong state) when the transition is not
+// applied.
+func (m *manager) Preempt(_ context.Context, vmid int, reason string) error {
+	target, err := m.store.Get(vmid)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("%w: vmid %d not found", ErrPreemptRefused, vmid)
+		}
+		return fmt.Errorf("preempt: lookup: %w", err)
+	}
+	if target.State != store.StateAssigned {
+		return fmt.Errorf("%w: vmid %d is in state %s", ErrPreemptRefused, vmid, target.State)
+	}
+	ok, err := m.store.UpdateState(vmid, store.StateAssigned, store.StateDraining, func(v *store.VM) {
+		v.StateSince = time.Now()
+	})
+	if err != nil {
+		return fmt.Errorf("preempt: cas: %w", err)
+	}
+	if !ok {
+		// CAS lost — between our Get and the UpdateState the row
+		// transitioned to Running (the runner picked up work) or
+		// another caller force-destroyed it. Either way the right
+		// answer is "don't act"; surface as a refusal so the
+		// caller's metric reflects the no-op.
+		return fmt.Errorf("%w: vmid %d state changed during preempt", ErrPreemptRefused, vmid)
+	}
+	m.log.Warn("preempt", "vmid", vmid, "reason", reason, "from_class", target.PriorityClass)
+	m.destroyAsync(vmid, target.Node, target.Profile)
 	return nil
 }
 

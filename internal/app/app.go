@@ -32,7 +32,9 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/priority"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/quotas"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/scaler"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
@@ -244,6 +246,22 @@ func Run(ctx context.Context, opts Options) error {
 		} else {
 			sc.SetRouter(r)
 		}
+		// Wire the quotas + priority observability machinery
+		// (issues #4 + #10). Build failures are non-fatal — the
+		// scaler degrades to the no-quotas / no-priority path
+		// while logging the misconfiguration. The store-backed
+		// QuotaCounter feeds recordQuota's threshold comparison.
+		if q, err := quotasResolverFromConfig(cfg); err != nil {
+			log.Warn("quotas: resolver build failed; quotas observation disabled", "err", err)
+		} else {
+			sc.SetQuotas(q)
+			sc.SetQuotaCounter(st)
+		}
+		if pm, err := priorityMatcherFromConfig(cfg); err != nil {
+			log.Warn("priority: matcher build failed; priority observation disabled", "err", err)
+		} else {
+			sc.SetPriority(pm)
+		}
 
 		owner := cfg.GitHub.Scope.Org
 		if owner == "" {
@@ -359,6 +377,10 @@ func Run(ctx context.Context, opts Options) error {
 		log.Warn("admin drain triggered; cancelling root context")
 		cancel()
 	}, log)
+	// Surface the preempt counter from the admin endpoint —
+	// adminapi.Server doesn't take metrics in its constructor to
+	// keep the signature stable for callers that don't care.
+	admin.SetMetrics(metrics)
 
 	// Two-phase shutdown:
 	//
@@ -657,6 +679,47 @@ func ensureScaleSet(ctx context.Context, gh *scaleset.Client, cfg *config.Config
 // ApplyDefaults has already synthesised the single default profile and
 // inherited unset fields from the global pool / scaleset blocks, so
 // this projection is a straight mapping.
+// quotasResolverFromConfig projects the YAML-level QuotasConfig
+// into the internal/quotas shape. Returns nil + an error when the
+// resolver refuses construction (e.g. ambiguous override). Caller
+// is expected to log + continue without quotas, not abort startup.
+func quotasResolverFromConfig(cfg *config.Config) (*quotas.Resolver, error) {
+	overrides := make([]quotas.Override, 0, len(cfg.Quotas.Overrides))
+	for _, o := range cfg.Quotas.Overrides {
+		overrides = append(overrides, quotas.Override{
+			Org:           o.Match.Org,
+			Repo:          o.Match.Repo,
+			MaxConcurrent: o.MaxConcurrent,
+		})
+	}
+	return quotas.New(quotas.Config{
+		DefaultPerRepo: cfg.Quotas.DefaultPerRepo,
+		DefaultPerOrg:  cfg.Quotas.DefaultPerOrg,
+		Overrides:      overrides,
+	})
+}
+
+// priorityMatcherFromConfig projects the YAML-level PriorityConfig
+// into the internal/priority shape. An empty class list returns a
+// Matcher that always classifies into priority.ZeroClass — the
+// caller can still attach it without changing observed behaviour.
+func priorityMatcherFromConfig(cfg *config.Config) (*priority.Matcher, error) {
+	classes := make([]priority.Class, 0, len(cfg.Priority.Classes))
+	for _, c := range cfg.Priority.Classes {
+		classes = append(classes, priority.Class{
+			Name:    c.Name,
+			Weight:  c.Weight,
+			Preempt: c.Preempt,
+			Match: priority.Match{
+				WorkflowLabel: c.Match.WorkflowLabel,
+				Repo:          c.Match.Repo,
+				Org:           c.Match.Org,
+			},
+		})
+	}
+	return priority.New(classes)
+}
+
 // routerFromConfig projects the YAML-level profiles into the
 // router.Profile shape and constructs a Router. Returns nil + the
 // underlying error when construction fails (router.New only fails on

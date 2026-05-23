@@ -38,14 +38,13 @@ var (
 	// running job completes.
 	ErrAtCapacity = errors.New("pool: at MaxConcurrentRunners")
 
-	// ErrManagerDeposed is returned by externally-callable Manager
-	// methods (Stats, ForceDestroy) when the manager's worker context
-	// has been cancelled — i.e. this replica has been deposed and the
-	// pool is mid-tear-down. Callers (typically the admin API) should
-	// translate this into a 503 + Retry-After rather than a generic
-	// 500: the request is recoverable by retrying against the new
-	// leader.
-	ErrManagerDeposed = errors.New("pool: manager deposed")
+	// ErrPreemptRefused is returned by Manager.Preempt when the
+	// target VM is not in a preempt-eligible state — most
+	// importantly when it's Running. Distinct from ErrNoneAvailable
+	// so callers can log "we tried but the lowest-weight VM had
+	// already started its job" without conflating it with "the
+	// pool was empty".
+	ErrPreemptRefused = errors.New("pool: preempt refused (vm not in Assigned state)")
 )
 
 // Stats summarises the pool's current population.
@@ -121,6 +120,16 @@ type RunnerInfo struct {
 	Busy   bool
 }
 
+// JobMetadata is the per-job context stamped onto a VM row by
+// StampJobMetadata. Empty fields are skipped so the scaler can call
+// the method even when (e.g.) only a class is known. Repo is the
+// full "owner/repo" form for index alignment with quotas lookups.
+type JobMetadata struct {
+	Org           string
+	Repo          string
+	PriorityClass string
+}
+
 // RunnerLister returns every GitHub runner registered against this
 // scaleset's scope whose name matches the orchestrator's prefix, keyed
 // by runner name (which is also the VM name). Used by both the gh
@@ -167,6 +176,15 @@ type Manager interface {
 	// same id.
 	SetRunnerID(ctx context.Context, vmid int, runnerID int64) error
 
+	// StampJobMetadata records per-job metadata (org, repo,
+	// priority class) on the row without changing state. Called
+	// by the scaler on JobStarted before MarkRunning so the
+	// quotas + priority machinery (and admin /metrics) can scope
+	// by org/repo/class. Empty fields are left unchanged so
+	// repeated calls are safe. Idempotent; a missing row is a
+	// no-op.
+	StampJobMetadata(ctx context.Context, vmid int, meta JobMetadata) error
+
 	// MarkCompleted transitions a VM out of Running, queues it for
 	// destruction, and signals a refill. Called from HandleJobCompleted.
 	MarkCompleted(ctx context.Context, vmid int) error
@@ -182,6 +200,19 @@ type Manager interface {
 	// kicks destruction. Reason is logged for forensics — typical
 	// callers are the reconciler's stuck-row sweeper and admin API.
 	ForceDestroy(ctx context.Context, vmid int, reason string) error
+
+	// Preempt destroys an Assigned-but-not-yet-Running VM to free
+	// capacity for a higher-priority job (issue #10). It REFUSES
+	// to act on rows in Running state — preempting an actively-
+	// executing job is the destructive behaviour we explicitly
+	// promise NEVER to do. Hot/Warm/Booting/Provisioning are also
+	// refused: those rows aren't yet committed to any job and
+	// should be released via the natural reconcile path, not via
+	// preemption. Returns ErrPreemptRefused with a reason when
+	// the row is not in Assigned state; nil on success
+	// (transition + destroy queued). Reason is logged so the
+	// forensic trail mirrors ForceDestroy.
+	Preempt(ctx context.Context, vmid int, reason string) error
 
 	// ListRows returns a point-in-time snapshot of every non-terminal row.
 	// Used by the GitHub reconciler to join DB state against the runners
