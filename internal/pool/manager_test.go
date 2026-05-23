@@ -766,6 +766,49 @@ func TestReconcile_PoisonAfterMaxBootAttempts(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
+// TestReconcile_PoisonHonorsPerProfileBootMaxAttempts asserts that a
+// per-profile BootMaxAttempts override controls the poisoning threshold
+// for rows in that profile, independent of the fleet-wide value. A row
+// in profile "gpu" with its own threshold of 5 must NOT poison at 3
+// attempts even though the fleet-wide threshold is 2.
+func TestReconcile_PoisonHonorsPerProfileBootMaxAttempts(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID:         11500,
+		Node:         "pve1",
+		Name:         "gpu-warm",
+		Profile:      "gpu",
+		PoolKind:     store.PoolKindWarm,
+		State:        store.StateWarm,
+		BootAttempts: 3, // already over fleet-wide threshold (2)
+	}))
+
+	fp := &fakeProv{waitErr: errors.New("agent timeout")}
+	mgr := newTestManager(t, st, fp, Config{
+		MaxConcurrentRunners: 20,
+		BootMaxAttempts:      2,
+		Profiles: []ProfileSettings{
+			{Name: "linux-x64", HotSize: 0, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 2},
+			{Name: "gpu", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 5},
+		},
+	})
+
+	mgr.reconcileOnce(context.Background())
+
+	// The boot will fail (waitErr) and bump BootAttempts to 4 — still
+	// below gpu's per-profile threshold of 5, so the row must land in
+	// Destroying (queued for re-clone), NOT Poison.
+	require.Eventually(t, func() bool {
+		row, err := st.Get(11500)
+		return err == nil && row.State != store.StateWarm
+	}, 2*time.Second, 10*time.Millisecond)
+	row, err := st.Get(11500)
+	require.NoError(t, err)
+	require.NotEqual(t, store.StatePoison, row.State,
+		"per-profile BootMaxAttempts=5 must not poison at BootAttempts=4")
+}
+
 // TestAdopt_PoweredOff_BecomesWarm: a stopped owner-tagged VM is adopted
 // into the warm pool. Adopting (not destroying) is the load-bearing
 // invariant of the leader-takeover scenario: an in-progress job on a

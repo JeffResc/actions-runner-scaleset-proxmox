@@ -934,6 +934,24 @@ func TestProfiles_VMMaxAgePositiveAccepted(t *testing.T) {
 	require.Equal(t, 30*time.Minute, cfg.Profiles[1].VMMaxAgeD)
 }
 
+// TestProfiles_BootMaxAttemptsZeroRejected pins the per-profile
+// boot_max_attempts >= 1 validator. Accepting 0 would silently poison
+// every VM in the affected profile on its first failed boot once the
+// poisoning decision honors the per-profile threshold.
+func TestProfiles_BootMaxAttemptsZeroRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"max_concurrent_runners: 4",
+		"max_concurrent_runners: 4\n    boot_max_attempts: 0", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "boot_max_attempts")
+	require.Contains(t, err.Error(), "must be >= 1")
+}
+
 // writeSelfSignedKeypair generates a fresh self-signed cert + key on
 // disk and returns their paths. The cert is valid for "localhost" only
 // — enough for our admin-API tests, which dial loopback.

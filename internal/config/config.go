@@ -286,11 +286,13 @@ type ProfileConfig struct {
 	MaxConcurrentRunners *int `yaml:"max_concurrent_runners,omitempty" validate:"omitempty,gte=0"`
 
 	// BootMaxAttempts / VMMaxAge are per-profile recycle/poison knobs.
-	// Nil/empty inherits the global pool defaults. VMMaxAge must be a
-	// positive Go duration; zero/negative is rejected at config-load
-	// (Resolve) to avoid silently disabling age-based recycling. To
-	// inherit the fleet default, omit the field entirely.
-	BootMaxAttempts *int   `yaml:"boot_max_attempts,omitempty" validate:"omitempty,gte=0"`
+	// Nil/empty inherits the global pool defaults. BootMaxAttempts must
+	// be >= 1; accepting 0 would poison every VM in this profile on its
+	// first failed boot. VMMaxAge must be a positive Go duration;
+	// zero/negative is rejected at config-load (Resolve) to avoid
+	// silently disabling age-based recycling. To inherit the fleet
+	// default, omit the field entirely.
+	BootMaxAttempts *int   `yaml:"boot_max_attempts,omitempty" validate:"omitempty,gte=1"`
 	VMMaxAge        string `yaml:"vm_max_age"`
 
 	// VMMaxAgeD is the resolved duration (populated by Resolve).
@@ -910,6 +912,14 @@ func (c *Config) validateProfiles() error {
 		if hot+warm > maxConc {
 			return fmt.Errorf("profiles[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
 				i, p.Name, hot+warm, maxConc)
+		}
+		// BootMaxAttempts must be >= 1 — accepting 0 would poison every
+		// VM in this profile on its first failed boot. ApplyDefaults
+		// inherits the global value when the profile omits the field, so
+		// any non-nil pointer here is operator intent.
+		if p.BootMaxAttempts != nil && *p.BootMaxAttempts < 1 {
+			return fmt.Errorf("profiles[%d] %q: boot_max_attempts (%d) must be >= 1",
+				i, p.Name, *p.BootMaxAttempts)
 		}
 		sumMax += maxConc
 	}
