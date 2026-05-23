@@ -1942,6 +1942,87 @@ func TestPowerPoller_PerVMTimeout_HangingVMDoesNotStallLoop(t *testing.T) {
 	}, time.Second, 10*time.Millisecond, "completed VM must be queued for destruction even when a sibling hangs")
 }
 
+// TestPowerPoller_ErrLogThrottle pins the per-VMID Debug-log rate
+// limit added for #151: a Proxmox endpoint that returns the same
+// per-VM PowerState error on consecutive ticks must log only once
+// per VMID per powerPollErrLogInterval, with the rest counted as
+// suppressed. Without the throttle a flapping endpoint emits one
+// line per VM per tick, drowning the log stream at fleet scale.
+//
+// Not run with t.Parallel(): mutates package-level
+// powerPollErrLogInterval, just like
+// TestPowerPoller_PerVMTimeout_HangingVMDoesNotStallLoop.
+func TestPowerPoller_ErrLogThrottle(t *testing.T) {
+	prev := powerPollErrLogInterval
+	powerPollErrLogInterval = time.Hour
+	t.Cleanup(func() { powerPollErrLogInterval = prev })
+
+	st := newTestStore(t)
+	for _, vmid := range []int{72001, 72002, 72003} {
+		require.NoError(t, st.Insert(&store.VM{
+			VMID: vmid, Node: "pve1", Name: "flaky",
+			PoolKind: store.PoolKindHot, State: store.StateRunning,
+		}))
+	}
+	fp := &fakeProv{
+		powerStateErrBy: map[int]error{
+			72001: errors.New("proxmox 504"),
+			72002: errors.New("proxmox 504"),
+			72003: errors.New("proxmox 504"),
+		},
+	}
+	mgr := newTestManager(t, st, fp, Config{})
+
+	// Two consecutive ticks. With the throttle, each VMID's per-tick
+	// error must log on tick 1, then NOT log on tick 2 — the throttle
+	// only resets after powerPollErrLogInterval (set to 1h above so
+	// the second tick is always within the window).
+	mgr.powerPollOnce(context.Background())
+	require.Len(t, mgr.powerPollErrLastLog, 3,
+		"first tick must record a last-log timestamp for each errored VMID")
+	firstTickLogs := make(map[int]time.Time, len(mgr.powerPollErrLastLog))
+	for k, v := range mgr.powerPollErrLastLog {
+		firstTickLogs[k] = v
+	}
+
+	mgr.powerPollOnce(context.Background())
+	for vmid, prev := range firstTickLogs {
+		require.Equal(t, prev, mgr.powerPollErrLastLog[vmid],
+			"second tick within the throttle window must not bump last-log for vmid %d", vmid)
+	}
+}
+
+// TestPowerPoller_ErrLogThrottlePrunesAbsentVMIDs pins that the
+// per-VMID throttle map is pruned when a VMID disappears from the
+// poll set (e.g. the VM transitioned to Destroying and is no longer
+// Assigned/Running). Without pruning the map would grow unbounded
+// across VMID recycles.
+func TestPowerPoller_ErrLogThrottlePrunesAbsentVMIDs(t *testing.T) {
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 72100, Node: "pve1", Name: "transient",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	fp := &fakeProv{
+		powerStateErrBy: map[int]error{72100: errors.New("proxmox 504")},
+	}
+	mgr := newTestManager(t, st, fp, Config{})
+
+	mgr.powerPollOnce(context.Background())
+	require.Contains(t, mgr.powerPollErrLastLog, 72100)
+
+	// Take the row out of the poll set by transitioning to a state
+	// powerPollOnce ignores. The next tick must drop the stale entry.
+	_, err := st.Update(72100, func(v *store.VM) {
+		v.State = store.StateDestroying
+	})
+	require.NoError(t, err)
+
+	mgr.powerPollOnce(context.Background())
+	require.NotContains(t, mgr.powerPollErrLastLog, 72100,
+		"VMID absent from this tick's poll set must be pruned to keep the map bounded")
+}
+
 // TestSetRunnerID_StampsRowField: the scaler stamps runner_id on the row
 // immediately after GenerateJitRunnerConfig so a sub-15s job that
 // completes before the gh.Reconciler observes the runner still has a
