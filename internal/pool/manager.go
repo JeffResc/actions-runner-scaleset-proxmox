@@ -1053,18 +1053,27 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 		m.log.Warn("reconcile: stats failed", "profile", profile, "err", err)
 		return
 	}
-	// Fleet-wide pool_kind/state counts are good enough for the
-	// in-flight-clone headroom check because the VMID allocator is
-	// fleet-wide and provisioner.InFlightCloneCount() is too.
-	hotProv, err := m.store.CountByPoolKindState(store.PoolKindHot, store.StateProvisioning)
+	// Per-profile Hot/Warm Provisioning counts. Fleet-wide counts here
+	// would let sibling profiles' in-flight clones bleed into this
+	// profile's headroom — under heavy multi-profile load that produces
+	// "X under-dispatched because Y's clones were still landing" misses
+	// that converge after a tick but break single-pass test setups.
+	profileRows, err := m.store.ListByProfile(profile)
 	if err != nil {
-		m.log.Warn("reconcile: count hot-provisioning failed", "profile", profile, "err", err)
+		m.log.Warn("reconcile: list profile rows failed", "profile", profile, "err", err)
 		return
 	}
-	warmProv, err := m.store.CountByPoolKindState(store.PoolKindWarm, store.StateProvisioning)
-	if err != nil {
-		m.log.Warn("reconcile: count warm-provisioning failed", "profile", profile, "err", err)
-		return
+	hotProv, warmProv := 0, 0
+	for _, r := range profileRows {
+		if r.State != store.StateProvisioning {
+			continue
+		}
+		switch r.PoolKind {
+		case store.PoolKindHot:
+			hotProv++
+		case store.PoolKindWarm:
+			warmProv++
+		}
 	}
 	// Two reasons to clone a hot VM:
 	//   (a) Eager replacement: keep `available >= HotSize` so consuming
