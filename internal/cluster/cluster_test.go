@@ -256,6 +256,57 @@ func (s *syncBuf) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
+// TestSlogHclog_LevelMapping locks in the #71 fix: raft's own
+// INFO/WARN/ERROR records must surface at the matching slog level so
+// production log pipelines (info-and-up by default) actually see
+// election failures and peer-connect problems. The previous io.Writer
+// adapter collapsed every raft line to Debug, leaving operators with
+// zero raft diagnostics under the default log level.
+func TestSlogHclog_LevelMapping(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	mu := sync.Mutex{}
+	log := slog.New(slog.NewTextHandler(&syncBuf{w: &buf, mu: &mu}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	h := newSlogHclog(log, "raft")
+	h.Trace("trace-line")
+	h.Debug("debug-line")
+	h.Info("info-line")
+	h.Warn("warn-line")
+	h.Error("error-line")
+
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+
+	require.Contains(t, out, "level=DEBUG msg=trace-line")
+	require.Contains(t, out, "level=DEBUG msg=debug-line")
+	require.Contains(t, out, "level=INFO msg=info-line")
+	require.Contains(t, out, "level=WARN msg=warn-line")
+	require.Contains(t, out, "level=ERROR msg=error-line")
+}
+
+// TestSlogHclog_NamedAndWith confirms hclog's Named and With helpers
+// (raft calls them when annotating subsystem and key-value pairs) land
+// on the slog output. Without these survival points the adapter would
+// silently drop raft's structured fields.
+func TestSlogHclog_NamedAndWith(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	mu := sync.Mutex{}
+	log := slog.New(slog.NewTextHandler(&syncBuf{w: &buf, mu: &mu}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	base := newSlogHclog(log, "raft")
+	sub := base.Named("transport").With("peer", "n0")
+	sub.Info("dialed")
+
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+	require.Contains(t, out, "msg=dialed")
+	require.Contains(t, out, "peer=n0")
+}
+
 func TestRaft_ThreeNodesElectExactlyOneLeader(t *testing.T) {
 	t.Parallel()
 
