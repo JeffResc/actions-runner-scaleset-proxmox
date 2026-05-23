@@ -89,6 +89,11 @@ type Scaler struct {
 	// provisionOne; tests override it to isolate the acquire/clamp
 	// logic from the GitHub + Proxmox call paths.
 	provisionOneFn func(ctx context.Context, vmObj *pool.VM) bool
+
+	// injectRetry overrides the inject backoff policy. The zero value
+	// means "use defaultInjectRetry"; tests fill this in to shorten
+	// the schedule (e.g. assert MaxElapsed actually bounds runtime).
+	injectRetry injectRetryConfig
 }
 
 // New constructs a Scaler.
@@ -527,6 +532,43 @@ func (s *Scaler) cleanupStaleRunnerByName(name string) {
 // Tests may override this.
 var staleRunnerCleanupTimeout = 15 * time.Second
 
+// injectRetryConfig is the tunable retry policy for [Scaler.injectWithRetry].
+// Hoisting it to a struct keeps the retry-budget concerns out of the
+// inject body and gives tests a knob to dial the policy without rewriting
+// the call site.
+type injectRetryConfig struct {
+	InitialInterval     time.Duration
+	MaxInterval         time.Duration
+	Multiplier          float64
+	RandomizationFactor float64
+	MaxAttempts         uint
+	MaxElapsed          time.Duration
+}
+
+// build returns a fresh ExponentialBackOff configured from c. Each
+// injectWithRetry call needs its own backoff instance (it carries
+// internal state); the helper just stamps the policy onto one.
+func (c injectRetryConfig) build() *backoff.ExponentialBackOff {
+	eb := backoff.NewExponentialBackOff()
+	eb.InitialInterval = c.InitialInterval
+	eb.MaxInterval = c.MaxInterval
+	eb.Multiplier = c.Multiplier
+	eb.RandomizationFactor = c.RandomizationFactor
+	return eb
+}
+
+// defaultInjectRetry is the policy applied unless a test overrides
+// s.injectRetry. Bound by both attempts and wall-clock so a stuck VM
+// can't pin the scaler past the listener's response deadline.
+var defaultInjectRetry = injectRetryConfig{
+	InitialInterval:     2 * time.Second,
+	MaxInterval:         10 * time.Second,
+	Multiplier:          2.0,
+	RandomizationFactor: 0, // deterministic; matches the prior fixed-step schedule
+	MaxAttempts:         6,
+	MaxElapsed:          60 * time.Second,
+}
+
 // injectWithRetry calls InjectJITConfig with a longer retry budget than
 // the underlying HTTP transport for the specific "VM is not running"
 // transient error. This error is misleading — Proxmox returns it when
@@ -534,18 +576,14 @@ var staleRunnerCleanupTimeout = 15 * time.Second
 // in-VM firstboot scripts churn systemd). The VM is usually fine
 // within 10-30s; we retry the inject so an unlucky timing window
 // doesn't burn a VM.
+//
+// Retry policy comes from s.injectRetry when non-zero, otherwise
+// defaultInjectRetry.
 func (s *Scaler) injectWithRetry(ctx context.Context, vm *provisioner.VM, jit string) error {
-	// Bound by both attempts (6) and wall-clock (60s) so a stuck VM
-	// can't pin the scaler past the listener's response deadline.
-	const (
-		maxAttempts  = 6
-		maxWallClock = 60 * time.Second
-	)
-	eb := backoff.NewExponentialBackOff()
-	eb.InitialInterval = 2 * time.Second
-	eb.MaxInterval = 10 * time.Second
-	eb.Multiplier = 2.0
-	eb.RandomizationFactor = 0 // deterministic; matches the prior fixed-step schedule
+	cfg := s.injectRetry
+	if cfg == (injectRetryConfig{}) {
+		cfg = defaultInjectRetry
+	}
 	var attempts int
 	_, err := backoff.Retry(ctx, func() (struct{}, error) {
 		attempts++
@@ -559,9 +597,9 @@ func (s *Scaler) injectWithRetry(ctx context.Context, vm *provisioner.VM, jit st
 		}
 		return struct{}{}, err
 	},
-		backoff.WithBackOff(eb),
-		backoff.WithMaxTries(maxAttempts),
-		backoff.WithMaxElapsedTime(maxWallClock),
+		backoff.WithBackOff(cfg.build()),
+		backoff.WithMaxTries(cfg.MaxAttempts),
+		backoff.WithMaxElapsedTime(cfg.MaxElapsed),
 		backoff.WithNotify(func(err error, d time.Duration) {
 			s.log.Warn("jit inject failed; retrying", "vmid", vm.VMID, "attempt", attempts, "backoff", d, "err", err)
 		}),
