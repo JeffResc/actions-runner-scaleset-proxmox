@@ -14,6 +14,7 @@ import (
 
 	"github.com/luthermonson/go-proxmox"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
@@ -1353,7 +1354,7 @@ func TestDestroyOrSyncFallback_RunsSynchronouslyWhenWorkerCtxCancelled(t *testin
 	// Force the "workerCtx already cancelled" branch.
 	mgr.workerCancel()
 
-	mgr.destroyOrSyncFallback(50050, "pve1")
+	mgr.destroyOrSyncFallback(50050, "pve1", "")
 
 	fp.mu.Lock()
 	require.Contains(t, fp.destroys, 50050,
@@ -1373,7 +1374,7 @@ func TestDestroyOrSyncFallback_AsyncWhenWorkerCtxLive(t *testing.T) {
 	fp := &fakeProv{}
 	mgr := newTestManager(t, st, fp, Config{DrainTimeout: 1 * time.Second})
 
-	mgr.destroyOrSyncFallback(50051, "pve1")
+	mgr.destroyOrSyncFallback(50051, "pve1", "")
 
 	// Wait for the async destroy to land.
 	done := make(chan struct{})
@@ -1406,7 +1407,7 @@ func TestDestroyAsync_PanicInProvisionerDoesNotKillProcess(t *testing.T) {
 
 	// Drive destroyAsync directly — it spawns a goroutine, panic must
 	// be contained by recoverPanic.
-	mgr.destroyAsync(50001, "pve1")
+	mgr.destroyAsync(50001, "pve1", "")
 
 	// wg.Done should still fire (deferred in the goroutine), so a
 	// Wait completes promptly.
@@ -1453,7 +1454,7 @@ func TestDestroyAsync_BoundedByDestroySem(t *testing.T) {
 
 	// Spawn 50 destroys directly (the semaphore is what we're testing).
 	for i := range 50 {
-		mgr.destroyAsync(99000+i, "pve1")
+		mgr.destroyAsync(99000+i, "pve1", "")
 	}
 	// Give the goroutines a moment to all hit the semaphore.
 	require.Eventually(t, func() bool {
@@ -1469,6 +1470,69 @@ func TestDestroyAsync_BoundedByDestroySem(t *testing.T) {
 	// Drain wg via the public surface.
 	mgr.workerCancel()
 	mgr.wg.Wait()
+}
+
+// TestDestroyAsync_BacklogFull_DropsAndIncrementsCounter verifies the
+// bounded-dispatcher guarantee: a burst that exceeds the destroy queue
+// capacity (plus the in-flight worker cap, plus the one item the
+// dispatcher holds while blocked on the semaphore) must drop the excess
+// and surface it via PoolDestroyBacklogFull, not by spawning unbounded
+// goroutines.
+func TestDestroyAsync_BacklogFull_DropsAndIncrementsCounter(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	release := make(chan struct{})
+	defer close(release)
+	fp := &fakeProv{onDestroy: func() { <-release }}
+
+	// Build a manager with metrics we can inspect.
+	reg := prometheus.NewRegistry()
+	metrics := observability.NewMetrics(reg)
+	sel, err := nodeselector.NewSingle("pve1")
+	require.NoError(t, err)
+	cfg := Config{
+		HotSize:              0,
+		WarmSize:             0,
+		MaxConcurrentRunners: 100,
+		ReconcileInterval:    50 * time.Millisecond,
+		VMIDRange:            config.VMIDRange{Min: 10000, Max: 19999},
+		VMNamePrefix:         "gh-runner-test-",
+		TemplateNode:         "pve1",
+		BootMaxAttempts:      3,
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mi, err := NewManager(cfg, st, fp, sel, log, metrics)
+	require.NoError(t, err)
+	mgr := mi.(*manager)
+	t.Cleanup(func() {
+		mgr.workerCancel()
+		// Wait for in-flight workers (released by `defer close(release)`).
+		mgr.wg.Wait()
+	})
+
+	// Cap analysis: queue=16, sem=8, dispatcher holds 1 while blocked on
+	// Acquire. So at most 25 requests can be "live" before the next one
+	// is dropped.
+	const (
+		liveBound = destroyQueueCap + 8 + 1 // 16 + 8 + 1 = 25
+		extras    = 5
+		total     = liveBound + extras
+	)
+	for i := range total {
+		mgr.destroyAsync(60000+i, "pve1", "default")
+	}
+
+	require.Eventually(t, func() bool {
+		drops := testutil.ToFloat64(metrics.PoolDestroyBacklogFull.WithLabelValues("default"))
+		return drops >= float64(extras)
+	}, 2*time.Second, 5*time.Millisecond,
+		"expected at least %d backlog-full drops once queue + sem saturate", extras)
+
+	// And the drop count must not have ballooned past the burst size —
+	// dropped requests should be exactly the excess over the live cap.
+	drops := testutil.ToFloat64(metrics.PoolDestroyBacklogFull.WithLabelValues("default"))
+	require.LessOrEqual(t, drops, float64(total),
+		"drop count (%g) should not exceed total burst (%d)", drops, total)
 }
 
 // TestMarkCompleted_RespectsDestroySemaphore: a burst of MarkCompleted

@@ -171,6 +171,15 @@ type manager struct {
 	bootSem    *semaphore.Weighted // concurrent Start/WaitReady ops
 	wg         sync.WaitGroup      // tracks in-flight async operations
 
+	// destroyQueue is the bounded backlog for destroyAsync. A single
+	// dispatcher goroutine reads from it, acquires destroySem, and
+	// spawns the actual destroy worker. The bound keeps a destroy
+	// storm (SIGTERM during a poison sweep, mass-recycle, etc.) from
+	// spawning unbounded goroutines that sit waiting for sem slots.
+	// Overflow is surfaced as PoolDestroyBacklogFull; the row stays in
+	// a transient state and the stuck-state sweep re-enqueues it.
+	destroyQueue chan destroyRequest
+
 	// workerCtx is the parent for every async Proxmox operation (clone,
 	// destroy, boot). It is created once in NewManager rooted at
 	// context.Background and cancelled by drain() when:
@@ -244,6 +253,13 @@ func normaliseProfiles(cfg Config) []ProfileSettings {
 // literal.
 const defaultProfileName = "default"
 
+// destroyQueueCap bounds the destroy dispatcher backlog. Chosen as 2x
+// the destroy semaphore cap so steady-state bursts have slack without
+// the goroutine count growing unboundedly. Overflow surfaces as
+// PoolDestroyBacklogFull; the row stays in a transient state and the
+// stuck-state sweep re-enqueues it on the next reconcile pass.
+const destroyQueueCap = 16
+
 // NewManager constructs a Manager.
 func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel nodeselector.Selector, log *slog.Logger, metrics *observability.Metrics) (Manager, error) {
 	cfg.Profiles = normaliseProfiles(cfg)
@@ -306,6 +322,7 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 		bootSem:      semaphore.NewWeighted(maxConcurrentBoots),
 		workerCtx:    wctx,
 		workerCancel: wcancel,
+		destroyQueue: make(chan destroyRequest, destroyQueueCap),
 		profiles:     make(map[string]*profileState, len(cfg.Profiles)),
 		profileOrder: make([]string, 0, len(cfg.Profiles)),
 	}
@@ -316,6 +333,7 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 		}
 		m.profileOrder = append(m.profileOrder, p.Name)
 	}
+	go m.destroyDispatcher()
 	return m, nil
 }
 
@@ -612,9 +630,10 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 		store.StateRunning,
 		store.StatePoison,
 	}
-	var node string
+	var node, profile string
 	ok, err := m.store.UpdateStateIn(vmid, from, store.StateDraining, func(v *store.VM) {
 		node = v.Node
+		profile = v.Profile
 	})
 	if err != nil {
 		return fmt.Errorf("force destroy: cas: %w", err)
@@ -625,7 +644,7 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 		return nil
 	}
 	m.log.Warn("force destroy", "vmid", vmid, "reason", reason)
-	m.destroyAsync(vmid, node)
+	m.destroyAsync(vmid, node, profile)
 	return nil
 }
 
@@ -707,7 +726,7 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 	// destroyAsync (not a raw `go m.destroy(...)`): the latter would
 	// bypass destroySem, and a burst of completions could fire many
 	// parallel Destroy calls against Proxmox.
-	m.destroyAsync(target.VMID, target.Node)
+	m.destroyAsync(target.VMID, target.Node, target.Profile)
 	m.SignalRefill()
 	return nil
 }
@@ -1146,7 +1165,7 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 				}
 				m.log.Info("shrink: hot pool over target; destroying excess",
 					"vmid", row.VMID, "profile", profile, "hot_size", hotSize, "target", hotTarget, "current_hot", freshStats.Hot)
-				m.destroyAsync(row.VMID, row.Node)
+				m.destroyAsync(row.VMID, row.Node, profile)
 				killed++
 			}
 		}
@@ -1178,7 +1197,7 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 					v.State = store.StateDraining
 					v.StateSince = time.Now()
 				}); err == nil {
-					m.destroyAsync(o.VMID, o.Node)
+					m.destroyAsync(o.VMID, o.Node, profile)
 				}
 			}
 		}
@@ -1208,7 +1227,7 @@ func (m *manager) sweepStuckRows() {
 			v.State = store.StateDraining
 			v.StateSince = time.Now()
 		}); err == nil {
-			m.destroyAsync(s.VMID, s.Node)
+			m.destroyAsync(s.VMID, s.Node, s.Profile)
 		}
 	}
 }
@@ -1399,7 +1418,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		}); updErr != nil {
 			m.log.Warn("clone: mark destroying failed", "vmid", vmid, "err", updErr)
 		}
-		m.destroyOrSyncFallback(vmid, node)
+		m.destroyOrSyncFallback(vmid, node, profileName)
 		return
 	}
 	if m.metrics != nil {
@@ -1425,7 +1444,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 			// it up (OrphanGrace + reconcile tick). Destroy it now.
 			m.log.Info("clone: row deleted mid-clone, destroying orphan vm",
 				"vmid", vmid, "node", node)
-			m.destroyOrSyncFallback(vmid, node)
+			m.destroyOrSyncFallback(vmid, node, profileName)
 			return
 		}
 		m.log.Warn("clone: update row state failed", "vmid", vmid, "err", err)
@@ -1506,32 +1525,103 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 	}); updErr != nil {
 		m.log.Warn("poison: mark destroying failed", "vmid", row.VMID, "err", updErr)
 	}
-	m.destroyAsync(updated.VMID, updated.Node)
+	m.destroyAsync(updated.VMID, updated.Node, updated.Profile)
 }
 
-// destroyAsync queues a destruction in the background. The Proxmox-side
-// call is bounded by the destroy semaphore, but the goroutine queue
-// itself is unbounded (acquire happens inside the goroutine) so that
-// hot-path callers like MarkCompleted and the runner-hook handler never
-// block on the semaphore.
+// destroyRequest is the unit of work the destroy dispatcher consumes.
+// profile is the row's Profile (or empty, which the backlog-full metric
+// and the destroyer's downstream emit both clamp to defaultProfileName).
+type destroyRequest struct {
+	vmid    int
+	node    string
+	profile string
+}
+
+// destroyAsync enqueues a destruction. A single dispatcher goroutine
+// (destroyDispatcher) reads from the queue, acquires destroySem, and
+// spawns the actual destroy worker — so the goroutine backlog is bounded
+// by destroyQueueCap rather than by caller burst.
 //
-// Trade-off: a burst can spawn many goroutines that sit waiting for a
-// destroy slot. With max_concurrent_runners on the order of 50-100,
-// goroutine overhead is negligible — what matters is the cap on
-// concurrent Proxmox API calls, which the sem inside the goroutine
-// enforces.
-func (m *manager) destroyAsync(vmid int, node string) {
+// On a full queue the request is dropped: the row remains in a
+// transient state (caller has already transitioned to Draining /
+// Destroying) and the stuck-state sweep re-enqueues it on the next
+// reconcile pass. PoolDestroyBacklogFull surfaces the overload.
+//
+// m.wg is incremented up-front so drain() waits for queued-but-not-yet-
+// processed work in addition to in-flight destroys.
+func (m *manager) destroyAsync(vmid int, node, profile string) {
 	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		defer func() { m.logRecoveredPanic("destroyAsync", vmid, recover()) }()
-		if err := m.destroySem.Acquire(m.workerCtx, 1); err != nil {
-			m.log.Debug("destroy: cancelled before sem acquired", "vmid", vmid, "err", err)
+	select {
+	case m.destroyQueue <- destroyRequest{vmid: vmid, node: node, profile: profile}:
+		if m.metrics != nil {
+			m.metrics.PoolDestroyBacklogDepth.Set(float64(len(m.destroyQueue)))
+		}
+	default:
+		m.wg.Done()
+		label := profile
+		if label == "" {
+			label = defaultProfileName
+		}
+		if m.metrics != nil {
+			m.metrics.PoolDestroyBacklogFull.WithLabelValues(label).Inc()
+		}
+		m.log.Warn("destroy: backlog full; dropping request, sweep will re-enqueue",
+			"vmid", vmid, "profile", label, "cap", cap(m.destroyQueue))
+	}
+}
+
+// destroyDispatcher is the single consumer of destroyQueue. It serialises
+// destroySem acquisition so the goroutine count is bounded by the sem
+// (active destroys) plus the queue depth (waiting destroys), never by
+// caller burst.
+//
+// On workerCtx cancellation it drains any queued requests so the
+// matching m.wg counters held by destroyAsync get released — without
+// that, drain() would block on m.wg.Wait() for the lifetime of any
+// in-flight queue items even though no worker will ever pick them up.
+func (m *manager) destroyDispatcher() {
+	defer func() { m.logRecoveredPanic("destroyDispatcher", 0, recover()) }()
+	for {
+		select {
+		case req := <-m.destroyQueue:
+			if m.metrics != nil {
+				m.metrics.PoolDestroyBacklogDepth.Set(float64(len(m.destroyQueue)))
+			}
+			if err := m.destroySem.Acquire(m.workerCtx, 1); err != nil {
+				m.log.Debug("destroy: cancelled before sem acquired", "vmid", req.vmid, "err", err)
+				m.wg.Done()
+				m.drainDestroyQueueLocked()
+				return
+			}
+			go func(req destroyRequest) {
+				defer m.wg.Done()
+				defer m.destroySem.Release(1)
+				defer func() { m.logRecoveredPanic("destroyWorker", req.vmid, recover()) }()
+				m.destroy(m.workerCtx, req.vmid, req.node)
+			}(req)
+		case <-m.workerCtx.Done():
+			m.drainDestroyQueueLocked()
 			return
 		}
-		defer m.destroySem.Release(1)
-		m.destroy(m.workerCtx, vmid, node)
-	}()
+	}
+}
+
+// drainDestroyQueueLocked releases the wg counter for every queued-
+// but-not-yet-dispatched request. Only safe to call from the dispatcher
+// itself (no other goroutine reads from destroyQueue), since multiple
+// concurrent drainers would race over the per-request counter.
+func (m *manager) drainDestroyQueueLocked() {
+	for {
+		select {
+		case <-m.destroyQueue:
+			m.wg.Done()
+		default:
+			if m.metrics != nil {
+				m.metrics.PoolDestroyBacklogDepth.Set(0)
+			}
+			return
+		}
+	}
 }
 
 // destroyOrSyncFallback is the clone-failure destroy path. The async
@@ -1544,9 +1634,9 @@ func (m *manager) destroyAsync(vmid int, node string) {
 // workerCtx already cancelled, fall back to a synchronous destroy
 // against a fresh background context with a short cap, accepting the
 // extra drain wait against a guaranteed-leak.
-func (m *manager) destroyOrSyncFallback(vmid int, node string) {
+func (m *manager) destroyOrSyncFallback(vmid int, node, profile string) {
 	if m.workerCtx.Err() == nil {
-		m.destroyAsync(vmid, node)
+		m.destroyAsync(vmid, node, profile)
 		return
 	}
 	m.log.Warn("clone-fail destroy: workerCtx already cancelled; running synchronous fallback",
