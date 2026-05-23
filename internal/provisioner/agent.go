@@ -17,14 +17,20 @@ import (
 )
 
 // jitConfigPattern is the character set GitHub's JIT configs are known
-// to use (RFC 4648 standard base64 plus padding). Validating against this
+// to use: RFC 4648 base64, accepting both the standard (`+/`) and
+// URL-safe (`-_`) alphabets plus padding. Validating against this
 // before formatting into the systemd env-file blocks two failure modes:
 // an embedded single quote breaking the env-file syntax, and an error
 // string being misread as a config payload after a parse path elsewhere
 // changes upstream. The orchestrator's only data source today is the
 // GitHub API itself, so a mismatch implies an upstream contract break
 // — bail out rather than write a malformed file.
-var jitConfigPattern = regexp.MustCompile(`^[A-Za-z0-9+/=]+$`)
+//
+// URL-safe characters are accepted alongside standard because newer
+// GitHub APIs sometimes return URL-safe base64; either alphabet is safe
+// here because the injection concern is about quote / newline / shell
+// metacharacters, none of which appear in either.
+var jitConfigPattern = regexp.MustCompile(`^[A-Za-z0-9+/=_-]+$`)
 
 var tracer = otel.Tracer(observability.TracerName)
 
@@ -57,7 +63,7 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) er
 		return fmt.Errorf("inject jit: empty config for vm %d", vm.VMID)
 	}
 	if !jitConfigPattern.MatchString(jitConfig) {
-		return fmt.Errorf("inject jit: config for vm %d does not match expected base64 form (chars outside [A-Za-z0-9+/=])", vm.VMID)
+		return fmt.Errorf("inject jit: config for vm %d does not match expected base64 form (chars outside [A-Za-z0-9+/=_-])", vm.VMID)
 	}
 	ctx, span := tracer.Start(ctx, "provisioner.InjectJITConfig", trace.WithAttributes(
 		attribute.Int("vm.id", vm.VMID),
