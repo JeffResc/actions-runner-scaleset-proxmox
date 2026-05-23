@@ -254,6 +254,14 @@ type Manager interface {
 	// MaxConcurrentRunners. Setting back to 0 (or below HotSize) drops
 	// us back to the steady-state floor on the next reconcile pass.
 	SetDesiredCount(n int)
+
+	// SetTargetSizes mutates the live hot/warm pool sizes for the
+	// named profile (issue #9 — schedule overrides). Reconcile reads
+	// the per-profile atomics on every tick, so a fresh value
+	// applies on the next reconcile pass. Sizes are clamped to the
+	// profile's MaxConcurrentRunners (hot trimmed last). Returns
+	// ErrUnknownProfile when the name doesn't match.
+	SetTargetSizes(name string, hot, warm int) error
 }
 
 // validateConfig returns a descriptive error if poolConfig + maxConcurrent

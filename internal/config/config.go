@@ -36,6 +36,7 @@ import (
 	koanffile "github.com/knadh/koanf/providers/file"
 	koanfrawbytes "github.com/knadh/koanf/providers/rawbytes"
 	"github.com/knadh/koanf/v2"
+	"github.com/robfig/cron/v3"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
 )
@@ -384,6 +385,13 @@ type PoolConfig struct {
 	// "5m"; must be > 0.
 	CloneInflightGrace string `yaml:"clone_inflight_grace"`
 
+	// Schedules is the default schedule set inherited by the
+	// synthesised "default" profile when no profiles: block is
+	// declared. Operators that declare profiles set schedules
+	// per-profile instead — this field is ignored in that case
+	// to keep the override boundary explicit.
+	Schedules []ScheduleConfig `yaml:"schedules,omitempty"`
+
 	// Resolved durations (populated by Resolve).
 	ReconcileIntervalD  time.Duration `yaml:"-"`
 	VMMaxAgeD           time.Duration `yaml:"-"`
@@ -475,6 +483,64 @@ type ProfileConfig struct {
 	// which the auto-revert fires. 0.0 disables the auto-revert
 	// (operator opts for manual control). Range [0.0, 1.0].
 	CanaryMaxFailureRate float64 `yaml:"canary_max_failure_rate" validate:"gte=0,lte=1"`
+
+	// Schedules is an ordered list of cron-driven hot/warm size
+	// overrides for this profile (issue #9). On each fire the
+	// runner calls pool.Manager.SetTargetSizes with the
+	// schedule's HotSize / WarmSize; the override stays in
+	// effect for Duration, then reverts to the profile's
+	// configured HotSize/WarmSize (unless another schedule is
+	// still inside its own window — last-fired wins). Empty
+	// means no schedule overrides.
+	Schedules []ScheduleConfig `yaml:"schedules,omitempty"`
+}
+
+// ScheduleConfig is one cron-driven override. The cron expression
+// uses robfig/cron/v3's standard 5-field syntax (minute hour
+// day-of-month month day-of-week); Timezone defaults to the
+// orchestrator's local time when omitted. Both sizes must be
+// declared explicitly even when the operator only wants to
+// override one — a missing value is too easy to misread as
+// "leave the other alone" (it doesn't; the runner always sets
+// both).
+type ScheduleConfig struct {
+	// Name identifies the schedule for metrics, log lines, and
+	// admin-state output. Required; must be unique within the
+	// owning profile.
+	Name string `yaml:"name" validate:"required"`
+
+	// Cron is the standard 5-field robfig/cron expression.
+	// Examples: "0 8 * * 1-5" (8am weekdays),
+	// "0 0 * * *" (midnight every day).
+	Cron string `yaml:"cron" validate:"required"`
+
+	// Duration is how long after each fire the override stays
+	// active. Must be a positive Go duration string ("10h",
+	// "30m"). When the window closes the runner reverts to
+	// the profile baseline unless another schedule's window
+	// is still open (last-fired wins).
+	Duration string `yaml:"duration" validate:"required"`
+
+	// Timezone is an IANA tz name (e.g. "America/New_York").
+	// Empty means UTC — schedules-as-code that read sensibly
+	// under DST shifts.
+	Timezone string `yaml:"timezone,omitempty"`
+
+	// HotSize / WarmSize replace the profile's configured pool
+	// sizes for Duration. Both must be >= 0; the
+	// hot+warm <= max_concurrent_runners invariant is enforced
+	// against the profile's MaxConcurrentRunners at load time.
+	HotSize  int `yaml:"hot_size" validate:"gte=0"`
+	WarmSize int `yaml:"warm_size" validate:"gte=0"`
+
+	// DurationD, Location, and CronSchedule are populated by
+	// Resolve. CronSchedule is the parsed cron expression —
+	// exposed so consumers (the schedule runner in
+	// internal/app) don't have to re-parse and can't drift on
+	// the parser configuration.
+	DurationD    time.Duration  `yaml:"-"`
+	Location     *time.Location `yaml:"-"`
+	CronSchedule cron.Schedule  `yaml:"-"`
 }
 
 // ProfileNetworkConfig overrides the global Proxmox network for
@@ -1038,6 +1104,7 @@ func (c *Config) ApplyDefaults() {
 			MaxConcurrentRunners: intp(c.ScaleSet.MaxConcurrentRunners),
 			BootMaxAttempts:      intp(c.Pool.BootMaxAttempts),
 			VMMaxAge:             c.Pool.VMMaxAge,
+			Schedules:            append([]ScheduleConfig(nil), c.Pool.Schedules...),
 		}}
 	} else {
 		// Each profile inherits unset sizing knobs from the global
@@ -1190,6 +1257,15 @@ func (c *Config) Resolve() error {
 			return fmt.Errorf("profiles[%q].vm_max_age must be positive (got %q)", p.Name, p.VMMaxAge)
 		}
 		p.VMMaxAgeD = d
+	}
+	// Profile schedules: parse Duration + Timezone + validate cron
+	// expression so misconfiguration surfaces at load rather than at
+	// the first cron tick.
+	for i := range c.Profiles {
+		p := &c.Profiles[i]
+		if err := resolveSchedules(p.Schedules, fmt.Sprintf("profiles[%d] %q", i, p.Name)); err != nil {
+			return err
+		}
 	}
 	// Cluster.
 	if err := c.resolveCluster(); err != nil {
@@ -1511,6 +1587,15 @@ func (c *Config) validateProfiles() error {
 			return fmt.Errorf("profiles[%d] %q: boot_max_attempts (%d) must be >= 1",
 				i, p.Name, *p.BootMaxAttempts)
 		}
+		// Schedule sizes must not exceed the profile's
+		// max_concurrent_runners — otherwise a fired schedule would
+		// permanently exceed the cap. Reject at load time.
+		for j, s := range p.Schedules {
+			if s.HotSize+s.WarmSize > maxConc {
+				return fmt.Errorf("profiles[%d] %q.schedules[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
+					i, p.Name, j, s.Name, s.HotSize+s.WarmSize, maxConc)
+			}
+		}
 		sumMax += maxConc
 	}
 	if c.Pool.GlobalMax > 0 && sumMax > c.Pool.GlobalMax {
@@ -1523,6 +1608,54 @@ func (c *Config) validateProfiles() error {
 	// load time is a much better operator experience.
 	if gaps := uncoveredScaleSetLabels(c.ScaleSet.Labels, c.Profiles); len(gaps) > 0 {
 		return fmt.Errorf("profiles: no profile covers scaleset labels %v — add the labels to a profile or remove them from scaleset.labels", gaps)
+	}
+	return nil
+}
+
+// scheduleParser is the cron parser used to validate schedule
+// expressions at load time. Standard 5-field syntax (minute hour
+// dom month dow) — matches the issue's examples and is the form
+// operators write by hand. Descriptor support (@hourly etc.) is
+// included as a small convenience.
+var scheduleParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+
+// resolveSchedules parses each schedule's Duration / Timezone /
+// Cron expression in place. prefix is included in any error
+// message so the operator can find the offending entry (e.g.
+// "profiles[0] \"cpu\".schedules[1] \"night-mode\"").
+func resolveSchedules(schedules []ScheduleConfig, prefix string) error {
+	seen := make(map[string]int, len(schedules))
+	for i := range schedules {
+		s := &schedules[i]
+		if prev, dup := seen[s.Name]; dup {
+			return fmt.Errorf("%s.schedules: duplicate name %q at indexes %d and %d", prefix, s.Name, prev, i)
+		}
+		seen[s.Name] = i
+
+		d, err := time.ParseDuration(s.Duration)
+		if err != nil {
+			return fmt.Errorf("%s.schedules[%d] %q.duration: %w", prefix, i, s.Name, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("%s.schedules[%d] %q.duration must be positive (got %q)", prefix, i, s.Name, s.Duration)
+		}
+		s.DurationD = d
+
+		loc := time.UTC
+		if s.Timezone != "" {
+			l, err := time.LoadLocation(s.Timezone)
+			if err != nil {
+				return fmt.Errorf("%s.schedules[%d] %q.timezone: %w", prefix, i, s.Name, err)
+			}
+			loc = l
+		}
+		s.Location = loc
+
+		sched, err := scheduleParser.Parse(s.Cron)
+		if err != nil {
+			return fmt.Errorf("%s.schedules[%d] %q.cron: %w", prefix, i, s.Name, err)
+		}
+		s.CronSchedule = sched
 	}
 	return nil
 }

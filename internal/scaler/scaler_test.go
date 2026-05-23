@@ -172,6 +172,7 @@ func (f *fakePool) ListRows(context.Context) ([]pool.RowSnapshot, error) { retur
 func (f *fakePool) Adopt(context.Context) error                          { return nil }
 func (f *fakePool) Run(context.Context) error                            { return nil }
 func (f *fakePool) SignalRefill()                                        {}
+func (f *fakePool) SetTargetSizes(string, int, int) error                { return nil }
 
 func (f *fakePool) acquireCount() int {
 	f.mu.Lock()

@@ -39,6 +39,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/quotas"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/scaler"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/schedule"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
 )
 
@@ -332,8 +333,27 @@ func Run(ctx context.Context, opts Options) error {
 			return fmt.Errorf("build gh reconciler: %w", err)
 		}
 
+		// Build the schedule runner if any profile declared
+		// cron-driven hot/warm overrides (issue #9). A nil runner
+		// means no schedules — skip the goroutine spawn. Errors
+		// are non-fatal: the orchestrator continues with the
+		// profile baseline sizes.
+		schedRunner, serr := scheduleRunnerFromConfig(cfg, mgr, log, metrics)
+		if serr != nil {
+			log.Warn("schedule: runner build failed; schedules disabled", "err", serr)
+		}
+
 		g, ctxg := errgroup.WithContext(leaderCtx)
 		g.Go(func() error { return mgr.Run(ctxg) })
+		if schedRunner != nil {
+			g.Go(func() error {
+				err := schedRunner.Run(ctxg)
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return err
+			})
+		}
 		g.Go(func() error {
 			err := rec.Run(ctxg)
 			if errors.Is(err, context.Canceled) {
@@ -757,6 +777,61 @@ func ensureScaleSet(ctx context.Context, gh *scaleset.Client, cfg *config.Config
 		return nil, fmt.Errorf("create runner scale set: %w", err)
 	}
 	return created, nil
+}
+
+// scheduleMetricsAdapter adapts the orchestrator's Prometheus
+// Metrics into the schedule.Metrics interface (which is
+// intentionally narrow so the schedule package stays free of
+// the observability import).
+type scheduleMetricsAdapter struct{ m *observability.Metrics }
+
+func (a scheduleMetricsAdapter) IncFire(profile, sched string) {
+	a.m.ScheduleFires.WithLabelValues(profile, sched).Inc()
+}
+
+func (a scheduleMetricsAdapter) SetActive(profile, sched string) {
+	// Encode the per-profile state as one time series per
+	// (profile, schedule) — clear the previous schedule's
+	// active=1 by setting it to 0, then mark the new one. The
+	// baseline state (sched == "") gets recorded so dashboards
+	// can show "currently no override" explicitly rather than
+	// reading the absence of metrics.
+	a.m.ScheduleActive.DeletePartialMatch(map[string]string{"profile": profile})
+	a.m.ScheduleActive.WithLabelValues(profile, sched).Set(1)
+}
+
+// scheduleRunnerFromConfig builds a schedule.Runner from every
+// profile's Schedules block. Returns (nil, nil) when no profile
+// declared a schedule — caller skips the goroutine spawn.
+func scheduleRunnerFromConfig(cfg *config.Config, mgr pool.Manager, log *slog.Logger, metrics *observability.Metrics) (*schedule.Runner, error) {
+	var entries []schedule.Entry
+	for _, p := range cfg.Profiles {
+		baseHot := p.HotSizeOrDefault(cfg.Pool.HotSize)
+		baseWarm := p.WarmSizeOrDefault(cfg.Pool.WarmSize)
+		for _, s := range p.Schedules {
+			entries = append(entries, schedule.Entry{
+				Name:         s.Name,
+				Profile:      p.Name,
+				Spec:         s.Cron,
+				Cron:         s.CronSchedule,
+				Duration:     s.DurationD,
+				Location:     s.Location,
+				HotSize:      s.HotSize,
+				WarmSize:     s.WarmSize,
+				BaselineHot:  baseHot,
+				BaselineWarm: baseWarm,
+			})
+		}
+	}
+	if len(entries) == 0 {
+		return nil, nil //nolint:nilnil // "no schedules" is signalled by (nil, nil); caller skips the goroutine spawn
+	}
+	apply := func(profile string, hot, warm int) {
+		if err := mgr.SetTargetSizes(profile, hot, warm); err != nil {
+			log.Warn("schedule: SetTargetSizes failed", "profile", profile, "err", err)
+		}
+	}
+	return schedule.NewRunner(entries, apply, schedule.RealClock{}, log, scheduleMetricsAdapter{m: metrics})
 }
 
 // canaryControllerFromConfig projects per-profile canary fields
