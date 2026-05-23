@@ -92,6 +92,13 @@ type Server struct {
 	gate    LeaderGate
 	log     *slog.Logger
 	metrics *observability.Metrics
+	// canary is consulted by POST /admin/template/promote to
+	// atomically swap a profile's candidate template into the
+	// stable slot. Nil (or an accessor that returns nil)
+	// disables the endpoint (returns 404). The deferred
+	// accessor lets the admin server (built once at startup)
+	// be wired to the per-leader-election canary controller.
+	canary CanaryAccessor
 
 	// drain is invoked from POST /admin/drain. Typically wired by main()
 	// to cancel the orchestrator's root context, which triggers graceful
@@ -198,6 +205,27 @@ func New(cfg Config, poolFn PoolAccessor, prov provisioner.Provisioner, gate Lea
 	}, nil
 }
 
+// CanaryPromoter is the subset of *canary.Controller the admin
+// server consults. Reproduced here (with the same method set) so
+// this package stays free of the canary import. Any pointer type
+// with a `Promote(profile string) error` method satisfies it,
+// including *canary.Controller from app.Run.
+type CanaryPromoter interface {
+	Promote(profile string) error
+}
+
+// CanaryAccessor returns the current canary promoter — typically
+// backed by an atomic.Pointer that the leader-plane code stores
+// to on election and clears on deposal. The admin server calls
+// the function on each request so a stale standby can't promote
+// against a deposed controller. Returning nil makes the
+// /admin/template/promote handler return 503.
+type CanaryAccessor func() CanaryPromoter
+
+// SetCanary attaches a deferred canary lookup. Nil disables the
+// /admin/template/promote endpoint. Wired by app.Run.
+func (s *Server) SetCanary(c CanaryAccessor) { s.canary = c }
+
 // SetMetrics attaches the orchestrator's Prometheus metric set so
 // handlers (preempt currently; future ones can join) can emit
 // counters from operator-driven actions. Nil disables the metric
@@ -251,6 +279,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	r.Post("/admin/drain", s.handleDrain)
 	r.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
 	r.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
+	r.Post("/admin/template/promote/{profile}", s.handlePromoteTemplate)
 
 	srv := &http.Server{
 		Addr:              s.cfg.HTTPAddr,
@@ -526,6 +555,44 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 		// levels (issue #147).
 		s.log.Warn("admin drain: response write failed",
 			"endpoint", "POST /admin/drain", "remote_addr", r.RemoteAddr, "err", err)
+	}
+}
+
+// handlePromoteTemplate atomically swaps a profile's canary
+// candidate template into the stable slot via the canary
+// controller's Promote method. The change is in-process only —
+// operators that want the promotion to survive a restart should
+// also update `template_vmid` in their config (the orchestrator
+// log warning at startup if the YAML hasn't caught up). Returns
+// 404 when no canary controller is wired, 409 when the profile
+// has no candidate to promote, and 202 on success.
+func (s *Server) handlePromoteTemplate(w http.ResponseWriter, r *http.Request) {
+	if s.canary == nil {
+		http.Error(w, "canary controller not configured", http.StatusNotFound)
+		return
+	}
+	c := s.canary()
+	if c == nil {
+		// Standby replica (or pre-election leader) — surface
+		// as 503 so callers retry against the current leader.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "canary controller not active (leader transition in progress)", http.StatusServiceUnavailable)
+		return
+	}
+	profile := chi.URLParam(r, "profile")
+	if profile == "" {
+		http.Error(w, "missing profile", http.StatusBadRequest)
+		return
+	}
+	if err := c.Promote(profile); err != nil {
+		s.log.Warn("admin promote: refused", "profile", profile, "err", err)
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.log.Warn("admin: promoted canary template to stable", "profile", profile)
+	w.WriteHeader(http.StatusAccepted)
+	if _, err := w.Write([]byte("promoted")); err != nil {
+		s.log.Debug("admin promote: response write failed", "err", err)
 	}
 }
 

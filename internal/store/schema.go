@@ -72,14 +72,19 @@ type VM struct {
 	Org           string
 	Repo          string
 	PriorityClass string
-	PoolKind      PoolKind
-	State         State
-	JobID         int64
-	RunnerID      int64
-	BootAttempts  int
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	StateSince    time.Time
+	// Template records which template VMID this clone used —
+	// "stable" or "canary" — for canary failure-rate
+	// attribution (issue #5). Empty on rows that pre-date the
+	// canary controller or that the manager couldn't classify.
+	Template     string
+	PoolKind     PoolKind
+	State        State
+	JobID        int64
+	RunnerID     int64
+	BootAttempts int
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	StateSince   time.Time
 }
 
 // Clone returns a deep copy. memdb stores by pointer; mutating a row read

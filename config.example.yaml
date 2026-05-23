@@ -179,6 +179,20 @@ pool:
 #     hot_size: 0                   # explicit 0 — no idle pool, clone on demand
 #     warm_size: 1
 #     max_concurrent_runners: 4
+#     # Optional template-canary rollout (issue #5). When
+#     # canary_template_vmid is set, canary_percent% of new clones
+#     # use the candidate template; the rest use template_vmid.
+#     # Boot failures on canary clones feed a running failure
+#     # rate; once the rate exceeds canary_max_failure_rate the
+#     # orchestrator auto-reverts canary_percent to 0 in-process
+#     # and emits scaleset_canary_reverted_total{profile=...}.
+#     # POST /admin/template/promote/<profile> atomically swaps
+#     # candidate into stable. Both are in-process only — update
+#     # template_vmid in YAML for the promotion to survive
+#     # restart.
+#     canary_template_vmid: 9101    # staging template
+#     canary_percent: 10            # 10% of clones use the candidate
+#     canary_max_failure_rate: 0.2  # auto-revert at 20% canary boot failures
 #     network:
 #       bridge: vmbr1               # GPU VLAN
 #       vlan_tag: 30

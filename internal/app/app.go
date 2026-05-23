@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/adminapi"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/canary"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/cluster"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/gh"
@@ -186,6 +187,12 @@ func Run(ctx context.Context, opts Options) error {
 		return *p
 	})
 
+	// poolCanary mirrors poolPtr for the canary controller — same
+	// per-leader-election lifecycle, looked up by the admin
+	// /admin/template/promote handler at request time so a
+	// deposed standby can't promote against a stale controller.
+	var poolCanary atomic.Pointer[canary.Controller]
+
 	runLeaderPlane := func(leaderCtx context.Context) error {
 		rss, err := ensureScaleSet(leaderCtx, ghClient, cfg, log)
 		if err != nil {
@@ -194,6 +201,21 @@ func Run(ctx context.Context, opts Options) error {
 		sysInfo.ScaleSetID = rss.ID
 		ghClient.SetSystemInfo(sysInfo)
 		log.Info("runner scale set ready", "name", rss.Name, "id", rss.ID)
+
+		// Build the per-profile canary controller. Errors are
+		// non-fatal — log + degrade to no-canary (every clone
+		// uses the profile's stable TemplateVMID).
+		canaryCtrl, cerr := canaryControllerFromConfig(cfg)
+		if cerr != nil {
+			log.Warn("canary: controller build failed; canary rollout disabled", "err", cerr)
+			canaryCtrl = nil
+		}
+		// Stash the per-leader controller in the atomic pointer
+		// the admin server's CanaryAccessor reads from.
+		// Clearing on defer ensures a deposed replica's stale
+		// controller can't be promoted against.
+		poolCanary.Store(canaryCtrl)
+		defer poolCanary.Store(nil)
 
 		mgr, err := pool.NewManager(pool.Config{
 			HotSize:              cfg.Pool.HotSize,
@@ -205,6 +227,7 @@ func Run(ctx context.Context, opts Options) error {
 			DrainTimeout:         cfg.Pool.DrainTimeoutD,
 			BootMaxAttempts:      cfg.Pool.BootMaxAttempts,
 			Profiles:             profileSettingsFromConfig(cfg),
+			Canary:               canaryCtrl,
 			ScaleSetName:         cfg.ScaleSet.Name,
 			VMNamePrefix:         prefix,
 			VMIDRange:            cfg.Proxmox.VMIDRange,
@@ -385,6 +408,18 @@ func Run(ctx context.Context, opts Options) error {
 	// adminapi.Server doesn't take metrics in its constructor to
 	// keep the signature stable for callers that don't care.
 	admin.SetMetrics(metrics)
+	// Wire the deferred canary accessor — admin is built once
+	// (now) but the controller it points at is rebuilt per
+	// leader-election in runLeaderPlane. Returning nil from the
+	// accessor (standby / pre-election leader) makes the
+	// /admin/template/promote handler return 503.
+	admin.SetCanary(adminapi.CanaryAccessor(func() adminapi.CanaryPromoter {
+		c := poolCanary.Load()
+		if c == nil {
+			return nil
+		}
+		return c
+	}))
 
 	// Two-phase shutdown:
 	//
@@ -713,6 +748,30 @@ func ensureScaleSet(ctx context.Context, gh *scaleset.Client, cfg *config.Config
 		return nil, fmt.Errorf("create runner scale set: %w", err)
 	}
 	return created, nil
+}
+
+// canaryControllerFromConfig projects per-profile canary fields
+// into the canary.Controller shape. A profile with
+// canary_template_vmid == 0 contributes a stable-only entry so
+// Pick still has a registered profile to query (avoiding
+// ErrUnknownProfile in the hot path). Returns nil + the
+// underlying error from canary.New on validation failures.
+func canaryControllerFromConfig(cfg *config.Config) (*canary.Controller, error) {
+	cfgs := make([]canary.ProfileConfig, 0, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		stable := p.TemplateVMID
+		if stable == 0 {
+			stable = cfg.Proxmox.TemplateVMID
+		}
+		cfgs = append(cfgs, canary.ProfileConfig{
+			Name:                  p.Name,
+			StableTemplateVMID:    stable,
+			CandidateTemplateVMID: p.CanaryTemplateVMID,
+			Percent:               p.CanaryPercent,
+			MaxFailureRate:        p.CanaryMaxFailureRate,
+		})
+	}
+	return canary.New(cfgs)
 }
 
 // profileSettingsFromConfig projects the YAML-level config.ProfileConfig

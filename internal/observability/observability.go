@@ -91,6 +91,7 @@ type Metrics struct {
 	QuotaThrottled       *prometheus.CounterVec
 	PriorityAcquires     *prometheus.CounterVec
 	Preemptions          *prometheus.CounterVec
+	CanaryReverts        *prometheus.CounterVec
 	Leader               prometheus.Gauge
 
 	// PoolDestroyBacklogFull counts destroy requests dropped because the
@@ -304,6 +305,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			// without a triggering job context).
 			Help: "Assigned VMs preempted to free capacity, partitioned by from_class and to_class.",
 		}, []string{"from_class", "to_class"}),
+		CanaryReverts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "canary_reverted_total",
+			// Increments each time the canary controller auto-
+			// reverts a profile's canary_percent to 0 because
+			// the cumulative canary failure rate exceeded the
+			// configured threshold. Bounded by profile count.
+			Help: "Canary template rollouts auto-reverted to 0% due to failure rate exceeding threshold.",
+		}, []string{"profile"}),
 		Leader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
@@ -323,7 +332,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
 		m.ReconcileErrors, m.UnroutedJobs,
-		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions,
+		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions, m.CanaryReverts,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
 		m.Leader,
 	)
