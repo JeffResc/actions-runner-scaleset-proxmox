@@ -125,8 +125,17 @@ type Manager interface {
 	// Acquire atomically transitions one Hot VM to Assigned, associates
 	// it with the given job ID, and returns it. Returns ErrNoneAvailable
 	// if no Hot VM is ready; ErrAtCapacity if the orchestrator is at its
-	// max-concurrent ceiling.
-	Acquire(ctx context.Context, jobID int64) (*VM, error)
+	// max-concurrent ceiling or if the per-call maxBusy cap is hit.
+	//
+	// maxBusy is a per-call clamp on total busy (Assigned + Running)
+	// enforced inside the same write transaction that performs the
+	// Hot -> Assigned CAS. Callers that already know how many runners
+	// they want to satisfy in this burst pass it as maxBusy so the
+	// store can refuse mid-burst when a concurrent goroutine has
+	// pushed busy past the requested target. Pass 0 to disable the
+	// per-call clamp (only the orchestrator-wide
+	// MaxConcurrentRunners cap applies).
+	Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, error)
 
 	// MarkRunning transitions a VM from Assigned to Running. Called from
 	// the scaleset listener's HandleJobStarted callback.

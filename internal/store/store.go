@@ -320,8 +320,15 @@ func (s *Store) UpdateState(vmid int, from, to State, mutate func(*VM)) (bool, e
 
 // AcquireHot atomically claims the oldest Hot VM by transitioning it to
 // Assigned, but only if total busy (Assigned + Running) is strictly less
-// than maxConcurrent. Returns ErrAtCapacity if the cap would be exceeded
-// or ErrNoneAvailable if no Hot rows exist.
+// than maxConcurrent and (when maxBusy > 0) also strictly less than
+// maxBusy. Returns ErrAtCapacity if either cap would be exceeded or
+// ErrNoneAvailable if no Hot rows exist.
+//
+// maxBusy is a per-call cap layered on top of the orchestrator-wide
+// maxConcurrent ceiling: callers that already know how many runners
+// they're prepared to satisfy in this burst pass it to clamp inside
+// the same transaction. Pass 0 (or any non-positive value) to disable
+// the per-call clamp.
 //
 // The cap check and the CAS happen inside the same write transaction so
 // concurrent Acquire callers cannot all see "busy < cap" against the
@@ -330,7 +337,7 @@ func (s *Store) UpdateState(vmid int, from, to State, mutate func(*VM)) (bool, e
 //
 // Oldest-Hot-first selection is preserved (closest to vm_max_age recycle
 // goes first).
-func (s *Store) AcquireHot(jobID int64, maxConcurrent int) (*VM, error) {
+func (s *Store) AcquireHot(jobID int64, maxConcurrent, maxBusy int) (*VM, error) {
 	txn := s.db.Txn(true)
 	defer txn.Abort()
 
@@ -347,6 +354,9 @@ func (s *Store) AcquireHot(jobID int64, maxConcurrent int) (*VM, error) {
 		}
 	}
 	if busy >= maxConcurrent {
+		return nil, ErrAtCapacity
+	}
+	if maxBusy > 0 && busy >= maxBusy {
 		return nil, ErrAtCapacity
 	}
 
