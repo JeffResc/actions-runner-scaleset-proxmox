@@ -89,6 +89,16 @@ type Metrics struct {
 	ReconcileErrors      *prometheus.CounterVec
 	UnroutedJobs         *prometheus.CounterVec
 	Leader               prometheus.Gauge
+
+	// PoolDestroyBacklogFull counts destroy requests dropped because the
+	// pool's destroy dispatcher queue was at capacity. Each drop is
+	// recoverable — the next reconcile pass re-finds the row in a
+	// transient state and re-enqueues — but a non-zero rate is a signal
+	// that destroy throughput is the bottleneck.
+	PoolDestroyBacklogFull *prometheus.CounterVec
+	// PoolDestroyBacklogDepth tracks the live depth of the destroy
+	// dispatcher queue. The bound is 2 * the destroy semaphore cap.
+	PoolDestroyBacklogDepth prometheus.Gauge
 }
 
 // ProxmoxOpUnknown is the fallback for off-list values of the
@@ -273,6 +283,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
 		}),
+		PoolDestroyBacklogFull: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "pool_destroy_backlog_full_total",
+			Help: "Destroy requests dropped because the dispatcher queue was at capacity, by profile.",
+		}, []string{"profile"}),
+		PoolDestroyBacklogDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns, Name: "pool_destroy_backlog_depth",
+			Help: "Current depth of the pool destroy dispatcher queue.",
+		}),
 	}
 	reg.MustRegister(
 		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
@@ -280,6 +298,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
 		m.ReconcileErrors, m.UnroutedJobs, m.Leader,
+		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
 	)
 	return m
 }
