@@ -284,7 +284,7 @@ func TestAcquire_PromotesHotToAssigned(t *testing.T) {
 	seedHot(t, st, 1)
 	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 1})
 
-	got, err := mgr.Acquire(context.Background(), 4242)
+	got, err := mgr.Acquire(context.Background(), 4242, 0)
 	require.NoError(t, err)
 	require.Equal(t, 20000, got.VMID)
 
@@ -299,7 +299,7 @@ func TestAcquire_NoHotAvailable(t *testing.T) {
 	st := newTestStore(t)
 	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 1})
 
-	_, err := mgr.Acquire(context.Background(), 1)
+	_, err := mgr.Acquire(context.Background(), 1, 0)
 	require.ErrorIs(t, err, ErrNoneAvailable)
 }
 
@@ -318,7 +318,7 @@ func TestAcquire_RaceOnlyOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func(jobID int64) {
 			defer wg.Done()
-			if _, err := mgr.Acquire(context.Background(), jobID); err == nil {
+			if _, err := mgr.Acquire(context.Background(), jobID, 0); err == nil {
 				mu.Lock()
 				wins++
 				mu.Unlock()
@@ -335,7 +335,7 @@ func TestMarkRunning_AssignedToRunning(t *testing.T) {
 	seedHot(t, st, 1)
 	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 1})
 
-	_, err := mgr.Acquire(context.Background(), 42)
+	_, err := mgr.Acquire(context.Background(), 42, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, mgr.MarkRunning(context.Background(), 20000, 9999))
@@ -352,7 +352,7 @@ func TestMarkCompleted_DestroysAndSignals(t *testing.T) {
 	fp := &fakeProv{}
 	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
 
-	_, err := mgr.Acquire(context.Background(), 1)
+	_, err := mgr.Acquire(context.Background(), 1, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, mgr.MarkCompleted(context.Background(), 20000))
@@ -431,7 +431,7 @@ func TestPromoteToRunning_FromAssigned(t *testing.T) {
 	seedHot(t, st, 1)
 	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 1})
 
-	_, err := mgr.Acquire(context.Background(), 0)
+	_, err := mgr.Acquire(context.Background(), 0, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, mgr.PromoteToRunning(context.Background(), 20000, 555, 9999))
@@ -466,7 +466,7 @@ func TestPromoteToRunning_NoopOnRunning(t *testing.T) {
 	seedHot(t, st, 1)
 	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 1})
 
-	_, err := mgr.Acquire(context.Background(), 0)
+	_, err := mgr.Acquire(context.Background(), 0, 0)
 	require.NoError(t, err)
 	require.NoError(t, mgr.PromoteToRunning(context.Background(), 20000, 1, 1))
 	require.NoError(t, mgr.PromoteToRunning(context.Background(), 20000, 1, 1))
@@ -486,7 +486,7 @@ func TestForceDestroy_FromAssigned(t *testing.T) {
 	fp := &fakeProv{}
 	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
 
-	_, err := mgr.Acquire(context.Background(), 0)
+	_, err := mgr.Acquire(context.Background(), 0, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, mgr.ForceDestroy(context.Background(), 20000, "test: stuck assigned"))
@@ -521,7 +521,7 @@ func TestForceDestroy_ConcurrentCallsDedupe(t *testing.T) {
 	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
 
 	// Acquire so the row is in Assigned (the realistic stuck-row state).
-	_, err := mgr.Acquire(context.Background(), 0)
+	_, err := mgr.Acquire(context.Background(), 0, 0)
 	require.NoError(t, err)
 
 	// Fire ten concurrent ForceDestroy calls for the same vmid.
@@ -1010,7 +1010,7 @@ func TestAcquire_OldestHotFirst(t *testing.T) {
 	}))
 
 	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 3})
-	got, err := mgr.Acquire(context.Background(), 1)
+	got, err := mgr.Acquire(context.Background(), 1, 0)
 	require.NoError(t, err)
 	require.Equal(t, 20101, got.VMID, "oldest Hot must be acquired first")
 }

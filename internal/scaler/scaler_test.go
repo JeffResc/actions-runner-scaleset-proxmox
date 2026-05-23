@@ -74,9 +74,12 @@ type fakePool struct {
 	desiredHistory []int
 }
 
-func (f *fakePool) Acquire(_ context.Context, _ int64) (*pool.VM, error) {
+func (f *fakePool) Acquire(_ context.Context, _ int64, maxBusy int) (*pool.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if maxBusy > 0 && f.busy >= maxBusy {
+		return nil, pool.ErrAtCapacity
+	}
 	if f.available <= 0 {
 		return nil, pool.ErrNoneAvailable
 	}
@@ -320,4 +323,34 @@ func TestHandleDesiredRunnerCount_PartialProvisionFailureReleasesVMs(t *testing.
 	delivered, err = s.HandleDesiredRunnerCount(ctx, 3)
 	require.NoError(t, err)
 	require.Equal(t, 3, delivered, "retry after failures must succeed; clamp must see busy=0")
+}
+
+// TestHandleDesiredRunnerCount_BusyRaceClampsViaMaxBusy locks in the
+// #69 fix: the maxBusy parameter must clamp inside the same atomic
+// operation that observes busy, so a goroutine bumping busy between
+// the scaler's Stats read and its Acquire loop can't sneak past the
+// requested target count.
+//
+// We simulate the race by pre-loading busy=2 in the fakePool BEFORE
+// HandleDesiredRunnerCount(count=3) runs. The scaler reads busy=2 and
+// would attempt need=1 acquires. With maxBusy=count=3 plumbed in, the
+// first acquire succeeds (busy becomes 3); a hypothetical concurrent
+// extra acquire by the loop would refuse with ErrAtCapacity.
+func TestHandleDesiredRunnerCount_BusyRaceClampsViaMaxBusy(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{available: 5, busy: 2}
+	s := quietScaler(t, fp, nil)
+
+	// count=3, busy=2, need=1. With maxBusy=3 the loop must STOP after
+	// the first acquire because busy becomes 3 inside the fake's check.
+	delivered, err := s.HandleDesiredRunnerCount(context.Background(), 3)
+	require.NoError(t, err)
+	require.Equal(t, 1, delivered, "exactly 1 new runner must be acquired (3 desired - 2 already busy)")
+	require.Equal(t, 1, fp.acquireCount(),
+		"maxBusy clamp must prevent additional acquires; got %d acquires", fp.acquireCount())
+
+	// Re-asserted desired with already-satisfied busy is a clean no-op.
+	delivered, err = s.HandleDesiredRunnerCount(context.Background(), 3)
+	require.NoError(t, err)
+	require.Equal(t, 0, delivered, "desired already satisfied; no further acquires")
 }

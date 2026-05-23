@@ -248,15 +248,16 @@ func (m *manager) Stats(_ context.Context) (Stats, error) {
 // oldest-Hot-first (preferring VMs near max-age recycle so we don't carry
 // stale VMs forever).
 //
-// The cap check (busy < MaxConcurrentRunners) and the Hot→Assigned CAS
-// happen inside the same store write transaction, so concurrent Acquire
-// callers cannot over-provision past the cap.
-func (m *manager) Acquire(ctx context.Context, jobID int64) (*VM, error) {
+// The cap check (busy < MaxConcurrentRunners; additionally busy < maxBusy
+// when maxBusy > 0) and the Hot→Assigned CAS happen inside the same store
+// write transaction, so concurrent Acquire callers cannot over-provision
+// past either ceiling.
+func (m *manager) Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, error) {
 	ctx, span := tracer.Start(ctx, "pool.Acquire",
 		trace.WithAttributes(attribute.Int64("job.id", jobID)))
 	defer span.End()
 	_ = ctx
-	row, err := m.store.AcquireHot(jobID, m.cfg.MaxConcurrentRunners)
+	row, err := m.store.AcquireHot(jobID, m.cfg.MaxConcurrentRunners, maxBusy)
 	switch {
 	case errors.Is(err, store.ErrAtCapacity):
 		span.SetStatus(codes.Ok, "at_capacity")

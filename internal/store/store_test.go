@@ -518,7 +518,7 @@ func TestAcquireHot_OldestFirst(t *testing.T) {
 		State: store.StateHot, CreatedAt: now.Add(-time.Minute),
 	}))
 
-	row, err := s.AcquireHot(42, 10)
+	row, err := s.AcquireHot(42, 10, 0)
 	require.NoError(t, err)
 	require.Equal(t, 20001, row.VMID, "oldest Hot must be acquired first")
 	require.Equal(t, store.StateAssigned, row.State)
@@ -542,7 +542,7 @@ func TestAcquireHot_AtCapacity(t *testing.T) {
 	}))
 
 	// 2 busy, cap=2 → AtCapacity, no row claimed.
-	_, err = s.AcquireHot(1, 2)
+	_, err = s.AcquireHot(1, 2, 0)
 	require.ErrorIs(t, err, store.ErrAtCapacity)
 
 	// The Hot row must remain Hot — AcquireHot must not have CAS'd it.
@@ -558,8 +558,44 @@ func TestAcquireHot_NoneAvailable(t *testing.T) {
 	s, err := store.New()
 	require.NoError(t, err)
 
-	_, err = s.AcquireHot(1, 10)
+	_, err = s.AcquireHot(1, 10, 0)
 	require.ErrorIs(t, err, store.ErrNoneAvailable)
+}
+
+// TestAcquireHot_MaxBusyCap locks in the #69 fix: the per-call maxBusy
+// clamp must reject acquires once total busy (Assigned+Running) reaches
+// maxBusy, even when maxConcurrent leaves headroom. Same txn-level
+// guarantee as the maxConcurrent ceiling, so concurrent acquires can't
+// race past the cap.
+func TestAcquireHot_MaxBusyCap(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+
+	// 1 Assigned (counts as busy) + 3 Hot rows ready to claim.
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 22000, Node: "pve1", PoolKind: store.PoolKindHot, State: store.StateAssigned,
+	}))
+	for i := range 3 {
+		require.NoError(t, s.Insert(&store.VM{
+			VMID: 22001 + i, Node: "pve1", PoolKind: store.PoolKindHot, State: store.StateHot,
+		}))
+	}
+
+	// maxConcurrent=10 (plenty of headroom), but maxBusy=2 — only 1
+	// more acquire allowed before we hit the per-call cap.
+	row, err := s.AcquireHot(1, 10, 2)
+	require.NoError(t, err)
+	require.Equal(t, store.StateAssigned, row.State)
+	// busy is now 2; the next acquire with maxBusy=2 must refuse.
+	_, err = s.AcquireHot(2, 10, 2)
+	require.ErrorIs(t, err, store.ErrAtCapacity)
+
+	// maxBusy=0 disables the per-call clamp — the orchestrator-wide
+	// ceiling is the only check.
+	row, err = s.AcquireHot(3, 10, 0)
+	require.NoError(t, err)
+	require.Equal(t, store.StateAssigned, row.State)
 }
 
 // TestAcquireHot_RaceRespectsCapacity is the load-bearing test for the
@@ -595,7 +631,7 @@ func TestAcquireHot_RaceRespectsCapacity(t *testing.T) {
 	for i := range racers {
 		go func(jobID int64) {
 			defer wg.Done()
-			_, err := s.AcquireHot(jobID, cap)
+			_, err := s.AcquireHot(jobID, cap, 0)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {

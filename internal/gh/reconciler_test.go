@@ -125,7 +125,7 @@ func (f *fakeManager) ForceDestroy(_ context.Context, vmid int, reason string) e
 }
 
 // The rest of pool.Manager is unused by the reconciler.
-func (f *fakeManager) Acquire(context.Context, int64) (*pool.VM, error) {
+func (f *fakeManager) Acquire(context.Context, int64, int) (*pool.VM, error) {
 	return nil, pool.ErrNoneAvailable
 }
 func (f *fakeManager) MarkRunning(context.Context, int, int64) error { return nil }

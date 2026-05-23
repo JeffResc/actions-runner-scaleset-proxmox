@@ -39,7 +39,7 @@ type fakePool struct {
 	forceDestroyed  []int
 }
 
-func (f *fakePool) Acquire(_ context.Context, _ int64) (*pool.VM, error) {
+func (f *fakePool) Acquire(_ context.Context, _ int64, _ int) (*pool.VM, error) {
 	return nil, pool.ErrNoneAvailable
 }
 func (f *fakePool) MarkRunning(_ context.Context, _ int, _ int64) error { return nil }

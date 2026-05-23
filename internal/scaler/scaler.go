@@ -156,10 +156,15 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	// Pre-acquire serially: Acquire is cheap (single store write
 	// transaction), and serialising it surfaces pool exhaustion fast so
 	// we don't spin up worker goroutines for VMs we'll never get.
+	// Pass maxBusy=count so the store refuses an Acquire that would
+	// push total busy past the listener's requested count — guards
+	// against the race where another goroutine bumps busy between our
+	// Stats read above and this loop, which would otherwise let us
+	// over-acquire (bounded by MaxConcurrentRunners but still wasteful).
 	vms := make([]*pool.VM, 0, need)
 	for range need {
 		const jobID int64 = 0 // not yet known; JobStarted callback updates
-		vmObj, err := s.pool.Acquire(ctx, jobID)
+		vmObj, err := s.pool.Acquire(ctx, jobID, count)
 		if err != nil {
 			if errors.Is(err, pool.ErrNoneAvailable) || errors.Is(err, pool.ErrAtCapacity) {
 				// Expected back-pressure; refill is already signalled.
