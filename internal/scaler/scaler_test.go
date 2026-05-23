@@ -833,3 +833,54 @@ func TestClassifyJob_RepoJoinsOwnerSlashRepo(t *testing.T) {
 	require.Equal(t, "repo-pinned", class.Name,
 		"priority matcher receives the bare repo name (not joined) per JobInfo contract")
 }
+
+// transientInjectProv always returns the transient sentinel so
+// injectWithRetry runs its full retry budget. count records how many
+// attempts the scaler made before giving up.
+type transientInjectProv struct {
+	stubProvForScaler
+	count int
+}
+
+func (p *transientInjectProv) InjectJITConfig(context.Context, *provisioner.VM, string) error {
+	p.count++
+	return provisioner.ErrGuestAgentNotReady
+}
+
+// TestInjectWithRetry_HonorsCustomConfig pins that the per-Scaler
+// injectRetry override controls both the wall-clock budget and the
+// attempt cap. A non-default config with a tiny MaxElapsed must bound
+// runtime to that budget instead of falling back to the production
+// default's 60s.
+func TestInjectWithRetry_HonorsCustomConfig(t *testing.T) {
+	t.Parallel()
+	prov := &transientInjectProv{}
+	s := New(
+		Config{},
+		nil, // no scaleset client needed
+		nil, // no pool needed
+		prov,
+		nil, // default slog
+		nil, // no metrics
+	)
+	// Tiny budget — should give up well under a second.
+	s.injectRetry = injectRetryConfig{
+		InitialInterval: time.Millisecond,
+		MaxInterval:     5 * time.Millisecond,
+		Multiplier:      2.0,
+		MaxAttempts:     3,
+		MaxElapsed:      50 * time.Millisecond,
+	}
+	start := time.Now()
+	err := s.injectWithRetry(t.Context(), &provisioner.VM{VMID: 42, Node: "pve1"}, "jit")
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, provisioner.ErrGuestAgentNotReady)
+	require.LessOrEqual(t, elapsed, 500*time.Millisecond,
+		"custom config must bound wall-clock; saw %s", elapsed)
+	require.LessOrEqual(t, prov.count, 4,
+		"custom config must bound attempts (MaxAttempts=3 + initial); saw %d", prov.count)
+	require.GreaterOrEqual(t, prov.count, 2,
+		"at least one retry must have run before giving up; saw %d", prov.count)
+}
