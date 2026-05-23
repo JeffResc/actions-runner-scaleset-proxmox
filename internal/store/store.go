@@ -33,6 +33,14 @@ var ErrAtCapacity = errors.New("store: at capacity")
 // in the Hot state. The caller should kick a refill and back off.
 var ErrNoneAvailable = errors.New("store: no hot vm available")
 
+// ErrImmutableFieldChanged is returned by Update / UpdateState /
+// UpdateStateIn when the caller's mutate callback altered a field that
+// the store treats as set-once or as an index key. The specific field
+// is named in the error message; the sentinel lets callers and tests
+// match the condition with errors.Is. See enforceImmutable for the
+// invariant set and rationale.
+var ErrImmutableFieldChanged = errors.New("store: mutator changed immutable field")
+
 // Store wraps a memdb.MemDB with typed helpers for the orchestrator's
 // VM table.
 type Store struct {
@@ -395,6 +403,9 @@ func (s *Store) UpdateState(vmid int, from, to State, mutate func(*VM)) (bool, e
 	if mutate != nil {
 		mutate(cp)
 	}
+	if err := enforceImmutable(cur, cp); err != nil {
+		return false, err
+	}
 	if err := txn.Insert(tableVM, cp); err != nil {
 		return false, fmt.Errorf("store: cas: write %d: %w", vmid, err)
 	}
@@ -534,6 +545,9 @@ func (s *Store) UpdateStateIn(vmid int, from []State, to State, mutate func(*VM)
 	if mutate != nil {
 		mutate(cp)
 	}
+	if err := enforceImmutable(cur, cp); err != nil {
+		return false, err
+	}
 	if err := txn.Insert(tableVM, cp); err != nil {
 		return false, fmt.Errorf("store: cas: write %d: %w", vmid, err)
 	}
@@ -556,15 +570,46 @@ func updateInTxn(txn *memdb.Txn, vmid int, mutate func(*VM)) (*VM, error) {
 	if raw == nil {
 		return nil, ErrNotFound
 	}
-	cur := raw.(*VM).Clone()
+	before := raw.(*VM)
+	cur := before.Clone()
 	if mutate != nil {
 		mutate(cur)
+	}
+	if err := enforceImmutable(before, cur); err != nil {
+		return nil, err
 	}
 	cur.UpdatedAt = time.Now()
 	if err := txn.Insert(tableVM, cur); err != nil {
 		return nil, fmt.Errorf("store: update %d: %w", vmid, err)
 	}
 	return cur, nil
+}
+
+// enforceImmutable verifies a mutator did not change fields that drive
+// indexes or that the store treats as set-once. The current invariants:
+//
+//   - VMID is the primary key. Changing it silently re-keys the row,
+//     breaking every subsequent lookup-by-id.
+//   - Profile drives the per-profile secondary indexes
+//     (ListByProfileAndStates, StatsByProfile). Silently changing it
+//     splits the row across two index buckets and produces hard-to-
+//     debug accounting drift.
+//   - CreatedAt is set once at Insert; nothing legitimately re-stamps
+//     it post-creation.
+//
+// Returning a typed error rather than panicking lets the caller decide
+// (the manager logs and continues; tests assert on errors.Is).
+func enforceImmutable(before, after *VM) error {
+	if before.VMID != after.VMID {
+		return fmt.Errorf("%w: VMID %d -> %d", ErrImmutableFieldChanged, before.VMID, after.VMID)
+	}
+	if before.Profile != after.Profile {
+		return fmt.Errorf("%w: Profile %q -> %q (vmid %d)", ErrImmutableFieldChanged, before.Profile, after.Profile, before.VMID)
+	}
+	if !before.CreatedAt.Equal(after.CreatedAt) {
+		return fmt.Errorf("%w: CreatedAt (vmid %d)", ErrImmutableFieldChanged, before.VMID)
+	}
+	return nil
 }
 
 // collect drains an iterator into a slice of cloned VMs. Cloning insulates
