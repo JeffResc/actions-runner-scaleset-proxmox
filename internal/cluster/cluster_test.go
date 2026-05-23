@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,6 +196,64 @@ func TestRaft_SingleNodeElectsSelf(t *testing.T) {
 		3*time.Second, 20*time.Millisecond, "single-node cluster never elected itself")
 	require.Eventually(t, rc.elected[0].Load,
 		2*time.Second, 20*time.Millisecond, "OnElected never fired")
+}
+
+// TestRaft_LeaderLeaseClampLogsWarn locks in the #70 fix: silently
+// clamping LeaderLeaseTimeout to HeartbeatTimeout was surprising. With
+// a 50ms heartbeat (newRaftCluster's default), DefaultConfig's 500ms
+// lease has to be clamped down — and the operator now sees a warn
+// line with both the original and clamped values.
+func TestRaft_LeaderLeaseClampLogsWarn(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	mu := sync.Mutex{}
+	w := &syncBuf{w: &buf, mu: &mu}
+	log := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	addr, tr := raft.NewInmemTransport("")
+	cfg := RaftConfig{
+		NodeID: "n0",
+		Peers: []RaftPeer{
+			{NodeID: "n0", RaftAddr: string(addr), HTTPAddr: "127.0.0.1:9100"},
+		},
+		Bootstrap:        true,
+		HeartbeatTimeout: 50 * time.Millisecond, // forces the clamp
+		TestTransport:    tr,
+		TestLocalAddr:    addr,
+	}
+	c, err := NewRaft(cfg, Callbacks{}, log)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	cancel()
+	<-done
+
+	mu.Lock()
+	out := buf.String()
+	mu.Unlock()
+	require.Contains(t, out, "clamping LeaderLeaseTimeout to HeartbeatTimeout",
+		"clamp must emit a warn line; got logs:\n%s", out)
+	require.Contains(t, out, "heartbeat=50ms",
+		"warn must include the clamped value; got logs:\n%s", out)
+	require.Contains(t, out, "original_lease=",
+		"warn must include the original value for operator triage; got logs:\n%s", out)
+}
+
+// syncBuf wraps a *bytes.Buffer with a mutex so the slog handler
+// goroutine and the test goroutine can read/write without -race
+// flagging the underlying append.
+type syncBuf struct {
+	w  *bytes.Buffer
+	mu *sync.Mutex
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 func TestRaft_ThreeNodesElectExactlyOneLeader(t *testing.T) {

@@ -255,8 +255,13 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 	// LeaderLeaseTimeout must be <= HeartbeatTimeout per raft
 	// invariants. When the operator tightens heartbeat we tighten
 	// lease the same way so DefaultConfig's 500ms doesn't trip
-	// raft's startup validation.
+	// raft's startup validation. Log a warn when the clamp fires so
+	// an operator who shrank heartbeat thinking the 500ms lease
+	// still applies can see the actual value in production logs.
 	if rcfg.LeaderLeaseTimeout > rcfg.HeartbeatTimeout {
+		log.Warn("cluster: clamping LeaderLeaseTimeout to HeartbeatTimeout",
+			"original_lease", rcfg.LeaderLeaseTimeout,
+			"heartbeat", rcfg.HeartbeatTimeout)
 		rcfg.LeaderLeaseTimeout = rcfg.HeartbeatTimeout
 	}
 
