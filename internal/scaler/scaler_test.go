@@ -2,6 +2,7 @@ package scaler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -79,6 +80,23 @@ type fakePool struct {
 	acquireCalls []int
 
 	desiredHistory []int
+
+	// markedRunning records every (vmid, runnerID) pair seen via
+	// MarkRunning so the JobStarted tests can assert on the handler's
+	// downstream call. markRunningErr lets a single test inject a
+	// pool-side failure.
+	markedRunning  []markedRunningCall
+	markRunningErr error
+
+	// markedCompleted records every vmid seen via MarkCompleted.
+	// markCompletedErr injects a pool-side failure.
+	markedCompleted  []int
+	markCompletedErr error
+}
+
+type markedRunningCall struct {
+	VMID     int
+	RunnerID int64
 }
 
 func (f *fakePool) AcquireForProfile(ctx context.Context, jobID int64, _ string, maxBusy int) (*pool.VM, error) {
@@ -116,9 +134,13 @@ func (f *fakePool) SetDesiredCount(n int) {
 	f.desiredHistory = append(f.desiredHistory, n)
 }
 
-func (f *fakePool) MarkCompleted(context.Context, int) error {
+func (f *fakePool) MarkCompleted(_ context.Context, vmid int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.markedCompleted = append(f.markedCompleted, vmid)
+	if f.markCompletedErr != nil {
+		return f.markCompletedErr
+	}
 	if f.busy > 0 {
 		f.busy--
 	}
@@ -130,8 +152,15 @@ func (f *fakePool) MarkCompleted(context.Context, int) error {
 	return nil
 }
 
-// Unused by HandleDesiredRunnerCount.
-func (f *fakePool) MarkRunning(context.Context, int, int64) error             { return nil }
+// MarkRunning records the (vmid, runnerID) pair so JobStarted tests
+// can assert on the downstream call. markRunningErr lets a single
+// test inject a pool-side failure.
+func (f *fakePool) MarkRunning(_ context.Context, vmid int, runnerID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.markedRunning = append(f.markedRunning, markedRunningCall{VMID: vmid, RunnerID: runnerID})
+	return f.markRunningErr
+}
 func (f *fakePool) SetRunnerID(context.Context, int, int64) error             { return nil }
 func (f *fakePool) PromoteToRunning(context.Context, int, int64, int64) error { return nil }
 func (f *fakePool) ForceDestroy(context.Context, int, string) error           { return nil }
@@ -622,6 +651,165 @@ func TestHandleJobStarted_DisabledQuotaResolverIsNoop(t *testing.T) {
 	require.Equal(t, 0.0,
 		counterValue(t, metrics.QuotaThrottled, "repo", "acme/platform"),
 		"disabled quotas resolver must skip the check entirely")
+}
+
+// ---------------------------------------------------------------------------
+// JobStarted / JobCompleted handler coverage (issue #136)
+// ---------------------------------------------------------------------------
+
+// TestHandleJobStarted_MarksRunning is the happy-path assertion: a
+// well-formed JobStarted message routes through to pool.MarkRunning
+// with the vmid parsed from RunnerName and the int64-widened
+// RunnerID.
+func TestHandleJobStarted_MarksRunning(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{}
+	s := quietScaler(t, fp, nil)
+
+	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		RunnerName: "gh-runner-test-10042",
+		RunnerID:   42,
+	})
+	require.NoError(t, err)
+	require.Equal(t,
+		[]markedRunningCall{{VMID: 10042, RunnerID: 42}},
+		fp.markedRunning,
+		"the vmid in the runner name must be propagated to MarkRunning")
+}
+
+// TestHandleJobStarted_MalformedRunnerNameAbsorbed pins the
+// silent-absorb contract: a runner name that doesn't match the prefix
+// produces a warn log and a nil return, NOT a pool call or an error
+// surfaced to the listener. The listener treats handler errors as
+// fatal for the worker, so a malformed payload must not take the
+// session down.
+func TestHandleJobStarted_MalformedRunnerNameAbsorbed(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		runnerName string
+	}{
+		{"empty", ""},
+		{"missing prefix", "totally-unrelated-name"},
+		{"non-numeric suffix", "gh-runner-test-notanumber"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fp := &fakePool{}
+			s := quietScaler(t, fp, nil)
+			err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+				RunnerName: tc.runnerName,
+				RunnerID:   42,
+			})
+			require.NoError(t, err, "malformed runner name must NOT surface as an error")
+			require.Empty(t, fp.markedRunning, "no MarkRunning call on malformed name")
+		})
+	}
+}
+
+// TestHandleJobStarted_PoolErrorPropagates pins that an error from
+// pool.MarkRunning bubbles up to the listener. Stamp failures are
+// non-fatal (the in-handler warn-and-continue path), but MarkRunning
+// is the load-bearing transition — the listener needs to see a
+// failure to re-deliver.
+func TestHandleJobStarted_PoolErrorPropagates(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{markRunningErr: errors.New("store: row missing")}
+	s := quietScaler(t, fp, nil)
+
+	err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		RunnerName: "gh-runner-test-10042",
+		RunnerID:   42,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "row missing")
+}
+
+// TestHandleJobCompleted_MarksCompleted is the happy-path: a
+// well-formed JobCompleted message routes through to
+// pool.MarkCompleted with the parsed vmid.
+func TestHandleJobCompleted_MarksCompleted(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{}
+	s := quietScaler(t, fp, nil)
+
+	err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerName: "gh-runner-test-10099",
+		RunnerID:   99,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []int{10099}, fp.markedCompleted)
+}
+
+// TestHandleJobCompleted_MalformedRunnerNameAbsorbed mirrors the
+// JobStarted absorb contract: a runner name we can't parse must be
+// dropped at warn-level without surfacing to the listener as an
+// error.
+func TestHandleJobCompleted_MalformedRunnerNameAbsorbed(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		runnerName string
+	}{
+		{"empty", ""},
+		{"missing prefix", "different-prefix-10099"},
+		{"non-numeric suffix", "gh-runner-test-xx"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fp := &fakePool{}
+			s := quietScaler(t, fp, nil)
+			err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+				RunnerName: tc.runnerName,
+			})
+			require.NoError(t, err)
+			require.Empty(t, fp.markedCompleted)
+		})
+	}
+}
+
+// TestHandleJobCompleted_PoolErrorPropagates pins error propagation
+// from pool.MarkCompleted to the listener so an idempotent re-delivery
+// can be requested by the listener layer.
+func TestHandleJobCompleted_PoolErrorPropagates(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{markCompletedErr: errors.New("store: row missing")}
+	s := quietScaler(t, fp, nil)
+
+	err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerName: "gh-runner-test-10099",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "row missing")
+}
+
+// TestHandlers_OutOfOrderDelivery: JobCompleted arriving before
+// JobStarted for the same runner is observable in production when the
+// session refresh re-emits the queue. The handlers must absorb both —
+// in order — without aborting on the unexpected sequence. The fake
+// pool models the production behaviour (MarkCompleted on a row that
+// was never MarkRunning'd is still recorded; production has the same
+// idempotent-on-completed semantics).
+func TestHandlers_OutOfOrderDelivery(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{}
+	s := quietScaler(t, fp, nil)
+	ctx := context.Background()
+
+	require.NoError(t, s.HandleJobCompleted(ctx, &scaleset.JobCompleted{
+		RunnerName: "gh-runner-test-10042",
+	}))
+	require.NoError(t, s.HandleJobStarted(ctx, &scaleset.JobStarted{
+		RunnerName: "gh-runner-test-10042",
+		RunnerID:   42,
+	}))
+
+	require.Equal(t, []int{10042}, fp.markedCompleted)
+	require.Equal(t,
+		[]markedRunningCall{{VMID: 10042, RunnerID: 42}},
+		fp.markedRunning)
 }
 
 func TestClassifyJob_RepoJoinsOwnerSlashRepo(t *testing.T) {
