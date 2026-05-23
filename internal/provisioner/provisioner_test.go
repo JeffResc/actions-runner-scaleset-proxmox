@@ -264,8 +264,9 @@ func TestDiscoverTemplateNode_OneHungNodeDoesNotBlock(t *testing.T) {
 // timeout per tick. Mirrors the per-node-timeout guarantee already in
 // place for discoverTemplateNode.
 func TestListOwnedVMs_OneHungNodeDoesNotBlock(t *testing.T) {
-	t.Parallel()
-
+	// Mutates the package-level listOwnedVMsTimeoutPerNode, which
+	// other ListOwnedVMs tests read — keep this test serial so
+	// -race doesn't flag the unsynchronised var.
 	prev := listOwnedVMsTimeoutPerNode
 	listOwnedVMsTimeoutPerNode = 200 * time.Millisecond
 	t.Cleanup(func() { listOwnedVMsTimeoutPerNode = prev })

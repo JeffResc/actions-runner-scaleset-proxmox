@@ -112,13 +112,19 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		// metric.
 		CloneDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "clone_duration_seconds",
-			Help:    "Time to clone a VM from template.",
-			Buckets: prometheus.ExponentialBuckets(0.5, 2, 9), // 0.5s .. ~128s
+			Help: "Time to clone a VM from template.",
+			// 0.5s .. ~1024s — wide enough to keep p99 meaningful when
+			// Proxmox is slow. The narrower 9-bucket range used to top
+			// out at ~128s, collapsing high-end percentiles into +Inf
+			// exactly when operators most needed to see the latency.
+			Buckets: prometheus.ExponentialBuckets(0.5, 2, 12),
 		}, []string{"linked", "node"}),
 		BootDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "boot_duration_seconds",
-			Help:    "Time from VM start to guest-agent ready.",
-			Buckets: prometheus.ExponentialBuckets(1, 2, 8),
+			Help: "Time from VM start to guest-agent ready.",
+			// 1s .. ~1024s — same widening as CloneDuration. Real VM
+			// boots can run several minutes when Proxmox is loaded.
+			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
 		}, []string{"node"}),
 		AcquireDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "acquire_duration_seconds",

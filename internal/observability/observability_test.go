@@ -108,6 +108,45 @@ func TestNewMetrics_RegistersAll(t *testing.T) {
 	}
 }
 
+// TestCloneBootBuckets_CoverSlowProxmox locks in the #74 fix: the
+// CloneDuration and BootDuration histogram buckets must extend high
+// enough that p99 stays meaningful when Proxmox is slow. The previous
+// upper bucket was ~128s for CloneDuration and ~256s for BootDuration;
+// both collapsed into +Inf on the production failure mode operators
+// most needed to dashboard.
+func TestCloneBootBuckets_CoverSlowProxmox(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m := observability.NewMetrics(reg)
+
+	// Single observation past the old upper bucket but inside the new
+	// one. If the buckets are too tight this observation lands in +Inf;
+	// if they're wide enough, the largest non-Inf bucket includes it.
+	m.CloneDuration.WithLabelValues("true", "pve1").Observe(600)
+	m.BootDuration.WithLabelValues("pve1").Observe(600)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+
+	for _, f := range families {
+		name := *f.Name
+		if name != "scaleset_clone_duration_seconds" && name != "scaleset_boot_duration_seconds" {
+			continue
+		}
+		require.NotEmpty(t, f.Metric, "no metric for %s", name)
+		// Find the largest finite bucket and confirm it covers 600.
+		var maxFinite float64
+		for _, b := range f.Metric[0].Histogram.Bucket {
+			if b.UpperBound != nil && *b.UpperBound > maxFinite {
+				maxFinite = *b.UpperBound
+			}
+		}
+		require.Greaterf(t, maxFinite, 600.0,
+			"%s upper bucket %g must be > 600 so p99 is meaningful when proxmox is slow",
+			name, maxFinite)
+	}
+}
+
 // TestLeaderGauge_Transitions confirms the gauge flips 0 → 1 → 0 as
 // the app's leader callbacks fire. The gauge is the assertable signal
 // e2e tests use to identify which replica currently holds the lease.
