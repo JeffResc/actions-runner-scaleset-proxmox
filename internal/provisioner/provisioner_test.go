@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -585,6 +586,100 @@ func TestAgentExecWait_HonoursCtxCancel(t *testing.T) {
 	// generous to avoid CI flakes.
 	require.Less(t, elapsed, 2*time.Second,
 		"agentExecWait returned in %s — ctx cancel must propagate promptly", elapsed)
+}
+
+// TestWaitReady_CtxCancelUnwindsPromptly covers the case the pool's
+// promote path most cares about: the guest agent is unresponsive and
+// the caller's deadline has to unwind WaitReady before the lib's
+// internal budget could expire. Without this test the only WaitReady
+// coverage was error-classification — the timeout-firing path itself
+// was untested (#145).
+//
+// The fake responds OK to the status/current lookup (so getVM
+// succeeds), then hangs on /agent/get-osinfo until r.Context fires.
+// We pass a 200ms ctx deadline + a generous 60s lib-side timeout so
+// the assertion is unambiguously about ctx-deadline propagation
+// rather than the lib's own polling budget. The whole call must
+// unwind well inside the caller's deadline so the pool's bootSem
+// stays moving across the fleet.
+func TestWaitReady_CtxCancelUnwindsPromptly(t *testing.T) {
+	t.Parallel()
+
+	var agentCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// p.cli.Node(ctx, "pve1") in getVM hits /nodes/{node}/status.
+		case r.URL.Path == "/nodes/pve1/status":
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		// templateNode.VirtualMachine(...) hits status/current to populate
+		// the VirtualMachine struct, then config to enrich it.
+		case strings.HasSuffix(r.URL.Path, "/status/current"):
+			_, _ = io.WriteString(w, `{"data":{"vmid":9999,"name":"runner","status":"running"}}`)
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		case strings.Contains(r.URL.Path, "/agent/get-osinfo"):
+			agentCalls.Add(1)
+			// Hang until the request's ctx is cancelled by the caller.
+			// This simulates a QGA that has accepted the call but is
+			// itself stuck — the failure mode the issue calls out as
+			// most operationally relevant.
+			<-r.Context().Done()
+		default:
+			t.Logf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestProvisioner(t, srv, "pve1")
+
+	// Tight ctx deadline + generous library timeout so the assertion
+	// is unambiguously about ctx-deadline propagation, not the lib's
+	// internal polling budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := p.WaitReady(ctx, &VM{VMID: 9999, Node: "pve1"}, 60*time.Second)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	// Bounded so a regression that ignored ctx would fail loudly
+	// rather than slow CI down silently. Generous headroom for
+	// retryablehttp's first-attempt backoff before the lib gives up.
+	require.Less(t, elapsed, 10*time.Second,
+		"WaitReady ctx-cancel must unwind in ~200ms; took %s — bootSem would back up across the pool", elapsed)
+	require.Positive(t, agentCalls.Load(),
+		"the test must actually exercise the agent poll path; got 0 calls")
+}
+
+// TestClone_CtxCancelledClearsInFlight is the timeout-firing twin of
+// TestClone_ClearsInFlightOnError. The latter covers "PVE returns
+// 500"; this covers "caller's ctx expires mid-Clone". Both shapes
+// must clear the in-flight tracker via the defer at Clone's entry
+// — otherwise a recurring orchestrator cancellation (e.g. drain
+// during a clone burst) permanently mutes untagged-orphan warnings
+// for that VMID, and operators never learn the VM is actually stuck.
+func TestClone_CtxCancelledClearsInFlight(t *testing.T) {
+	t.Parallel()
+	// Server hangs on every request until r.Context is cancelled. With
+	// an already-cancelled ctx, every HTTP call short-circuits — but
+	// the in-flight tracker should still get cleared by Clone's defer.
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	p := newTestProvisioner(t, srv, "pve1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled when Clone is called
+
+	_, err := p.Clone(ctx, CloneOptions{NewVMID: 10043, Node: "pve1", Name: "x"})
+	require.Error(t, err, "Clone against a cancelled ctx must surface the cancellation")
+
+	require.False(t, p.inFlightClones.Has(10043),
+		"ctx-cancellation during Clone must still clear the in-flight entry — repeated cancellations would permanently mute orphan warnings for the VMID")
 }
 
 // TestWaitReady_ClassifiesVMNotFound: when go-proxmox surfaces an error
