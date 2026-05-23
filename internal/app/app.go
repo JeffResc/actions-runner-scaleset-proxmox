@@ -137,8 +137,8 @@ func Run(ctx context.Context, opts Options) error {
 
 	vmNamePrefix := fmt.Sprintf("gh-runner-%s-", cfg.ScaleSet.Name)
 	prov, err := provisioner.New(ctx, cfg.Proxmox, cfg.ScaleSet.Name, vmNamePrefix, provisioner.Options{
-		CloneInflightTTL:     cfg.Pool.CloneInflightGraceD,
-		RecentlyDestroyedTTL: cfg.Pool.VMIDReuseCooldownD * 4,
+		CloneInflightTTL:     cfg.Pool.CloneInflightGrace.D(),
+		RecentlyDestroyedTTL: cfg.Pool.VMIDReuseCooldown.D() * 4,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("init provisioner: %w", err)
@@ -231,10 +231,10 @@ func Run(ctx context.Context, opts Options) error {
 			HotSize:              cfg.Pool.HotSize,
 			WarmSize:             cfg.Pool.WarmSize,
 			MaxConcurrentRunners: cfg.ScaleSet.MaxConcurrentRunners,
-			ReconcileInterval:    cfg.Pool.ReconcileIntervalD,
-			PowerPollInterval:    cfg.Pool.PowerPollIntervalD,
-			VMMaxAge:             cfg.Pool.VMMaxAgeD,
-			DrainTimeout:         cfg.Pool.DrainTimeoutD,
+			ReconcileInterval:    cfg.Pool.ReconcileInterval.D(),
+			PowerPollInterval:    cfg.Pool.PowerPollInterval.D(),
+			VMMaxAge:             cfg.Pool.VMMaxAge.D(),
+			DrainTimeout:         cfg.Pool.DrainTimeout.D(),
 			BootMaxAttempts:      cfg.Pool.BootMaxAttempts,
 			Profiles:             profileSettingsFromConfig(cfg),
 			Canary:               canaryCtrl,
@@ -243,7 +243,7 @@ func Run(ctx context.Context, opts Options) error {
 			VMIDRange:            cfg.Proxmox.VMIDRange,
 			LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
 			TemplateNode:         prov.TemplateNode(),
-			VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldownD,
+			VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
 			OnRunnerOrphaned:     ghClient.RemoveRunner,
 			RunnerLister:         gh.NewRunnerLister(restCli, scope, prefix, log),
 		}, st, prov, sel, log, metrics)
@@ -322,11 +322,11 @@ func Run(ctx context.Context, opts Options) error {
 
 		rec, err := gh.New(gh.Config{
 			Scope:                scope,
-			PollInterval:         cfg.GitHub.PollIntervalD,
-			AssignedGrace:        cfg.GitHub.AssignedGraceD,
-			RunningIdleGrace:     cfg.GitHub.RunningIdleGraceD,
-			AssignedOfflineGrace: cfg.GitHub.AssignedOfflineGraceD,
-			OrphanGrace:          cfg.Pool.OrphanGraceD,
+			PollInterval:         cfg.GitHub.PollInterval.D(),
+			AssignedGrace:        cfg.GitHub.AssignedGrace.D(),
+			RunningIdleGrace:     cfg.GitHub.RunningIdleGrace.D(),
+			AssignedOfflineGrace: cfg.GitHub.AssignedOfflineGrace.D(),
+			OrphanGrace:          cfg.Pool.OrphanGrace.D(),
 			RunnerNamePrefix:     prefix,
 		}, restCli, mgr, prov, log, metrics)
 		if err != nil {
@@ -554,9 +554,9 @@ func buildCoordinator(cfg *config.Config, cb cluster.Callbacks, log *slog.Logger
 		AdminHost:        host,
 		Peers:            peers,
 		Bootstrap:        cfg.Cluster.Raft.Bootstrap,
-		HeartbeatTimeout: cfg.Cluster.Raft.HeartbeatTimeoutD,
-		ElectionTimeout:  cfg.Cluster.Raft.ElectionTimeoutD,
-		CommitTimeout:    cfg.Cluster.Raft.CommitTimeoutD,
+		HeartbeatTimeout: cfg.Cluster.Raft.HeartbeatTimeout.D(),
+		ElectionTimeout:  cfg.Cluster.Raft.ElectionTimeout.D(),
+		CommitTimeout:    cfg.Cluster.Raft.CommitTimeout.D(),
 		TestTransport:    opts.RaftTransport,
 		TestLocalAddr:    opts.RaftLocalAddr,
 	}
@@ -814,7 +814,7 @@ func scheduleRunnerFromConfig(cfg *config.Config, mgr pool.Manager, log *slog.Lo
 				Profile:      p.Name,
 				Spec:         s.Cron,
 				Cron:         s.CronSchedule,
-				Duration:     s.DurationD,
+				Duration:     s.Duration.D(),
 				Location:     s.Location,
 				HotSize:      s.HotSize,
 				WarmSize:     s.WarmSize,
@@ -932,7 +932,7 @@ func profileSettingsFromConfig(cfg *config.Config) []pool.ProfileSettings {
 			WarmSize:             p.WarmSizeOrDefault(cfg.Pool.WarmSize),
 			MaxConcurrentRunners: p.MaxConcurrentRunnersOrDefault(cfg.ScaleSet.MaxConcurrentRunners),
 			BootMaxAttempts:      p.BootMaxAttemptsOrDefault(cfg.Pool.BootMaxAttempts),
-			VMMaxAge:             p.VMMaxAgeD,
+			VMMaxAge:             p.VMMaxAge.D(),
 			TemplateVMID:         p.TemplateVMID,
 			CPUCores:             p.CPUCores,
 			MemoryMB:             p.MemoryMB,
