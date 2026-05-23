@@ -33,6 +33,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/scaler"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
 )
@@ -231,6 +232,18 @@ func Run(ctx context.Context, opts Options) error {
 			WorkFolder: "_work",
 			NamePrefix: prefix,
 		}, ghClient, mgr, prov, log, metrics)
+
+		// Wire the label router so HandleJobStarted can record
+		// per-job routing decisions and surface unrouted jobs via
+		// the scaleset_unrouted_jobs_total counter. Config
+		// validation has already guaranteed every scaleset label is
+		// covered by at least one profile, so a non-nil router
+		// build is safe.
+		if r, err := routerFromConfig(cfg); err != nil {
+			log.Warn("router: build failed; routing observations disabled", "err", err)
+		} else {
+			sc.SetRouter(r)
+		}
 
 		owner := cfg.GitHub.Scope.Org
 		if owner == "" {
@@ -644,6 +657,22 @@ func ensureScaleSet(ctx context.Context, gh *scaleset.Client, cfg *config.Config
 // ApplyDefaults has already synthesised the single default profile and
 // inherited unset fields from the global pool / scaleset blocks, so
 // this projection is a straight mapping.
+// routerFromConfig projects the YAML-level profiles into the
+// router.Profile shape and constructs a Router. Returns nil + the
+// underlying error when construction fails (router.New only fails on
+// duplicate / empty profile names, which config validation already
+// rejects).
+func routerFromConfig(cfg *config.Config) (*router.Router, error) {
+	profiles := make([]router.Profile, 0, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		profiles = append(profiles, router.Profile{
+			Name:   p.Name,
+			Labels: append([]string(nil), p.Labels...),
+		})
+	}
+	return router.New(profiles)
+}
+
 func profileSettingsFromConfig(cfg *config.Config) []pool.ProfileSettings {
 	out := make([]pool.ProfileSettings, 0, len(cfg.Profiles))
 	for _, p := range cfg.Profiles {

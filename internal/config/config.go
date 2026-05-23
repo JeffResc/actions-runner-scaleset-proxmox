@@ -916,7 +916,34 @@ func (c *Config) validateProfiles() error {
 	if c.Pool.GlobalMax > 0 && sumMax > c.Pool.GlobalMax {
 		return fmt.Errorf("pool.global_max (%d) is below the sum of profile.max_concurrent_runners (%d)", c.Pool.GlobalMax, sumMax)
 	}
+	// Label-routing safety: every label the scaleset advertises must
+	// be present on at least one profile, otherwise a job arriving
+	// with that label has nowhere to go. The router (issue #7) will
+	// reject such jobs at runtime; catching the misconfiguration at
+	// load time is a much better operator experience.
+	if gaps := uncoveredScaleSetLabels(c.ScaleSet.Labels, c.Profiles); len(gaps) > 0 {
+		return fmt.Errorf("profiles: no profile covers scaleset labels %v — add the labels to a profile or remove them from scaleset.labels", gaps)
+	}
 	return nil
+}
+
+// uncoveredScaleSetLabels returns the labels in scaleSetLabels that
+// no profile's label set contains. Used by Validate to enforce the
+// label-routing coverage invariant.
+func uncoveredScaleSetLabels(scaleSetLabels []string, profiles []ProfileConfig) []string {
+	union := make(map[string]struct{})
+	for _, p := range profiles {
+		for _, l := range p.Labels {
+			union[l] = struct{}{}
+		}
+	}
+	var gaps []string
+	for _, l := range scaleSetLabels {
+		if _, ok := union[l]; !ok {
+			gaps = append(gaps, l)
+		}
+	}
+	return gaps
 }
 
 // BuildServerTLS returns a *tls.Config suitable for an

@@ -762,7 +762,7 @@ pool:
 
 profiles:
   - name: linux-x64
-    labels: [self-hosted, linux, x64]
+    labels: [self-hosted, linux, proxmox, x64]
     template_vmid: 9001
     cpu: 4
     memory_mb: 8192
@@ -770,7 +770,7 @@ profiles:
     warm_size: 10
     max_concurrent_runners: 20
   - name: gpu
-    labels: [self-hosted, linux, gpu]
+    labels: [self-hosted, linux, proxmox, gpu]
     template_vmid: 9100
     cpu: 8
     memory_mb: 32768
@@ -811,7 +811,7 @@ func TestProfiles_ExplicitBlockParses(t *testing.T) {
 	require.Len(t, cfg.Profiles, 2)
 	x64 := cfg.Profiles[0]
 	require.Equal(t, "linux-x64", x64.Name)
-	require.Equal(t, []string{"self-hosted", "linux", "x64"}, x64.Labels)
+	require.Equal(t, []string{"self-hosted", "linux", "proxmox", "x64"}, x64.Labels)
 	require.Equal(t, 9001, x64.TemplateVMID)
 	require.Equal(t, 4, x64.CPUCores)
 	require.Equal(t, 8192, x64.MemoryMB)
@@ -865,6 +865,25 @@ func TestProfiles_InvalidNameRejected(t *testing.T) {
 	_, err := config.Parse([]byte(bad))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must match")
+}
+
+func TestProfiles_UncoveredScaleSetLabelRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	// Strip "proxmox" off both profiles so neither covers the
+	// scaleset's declared `proxmox` label. The router-coverage
+	// invariant must reject this at config load time rather than
+	// surfacing it as a per-job ErrNoMatchingProfile in production.
+	uncovered := strings.ReplaceAll(validProfileYAML,
+		"[self-hosted, linux, proxmox, x64]", "[self-hosted, linux, x64]")
+	uncovered = strings.ReplaceAll(uncovered,
+		"[self-hosted, linux, proxmox, gpu]", "[self-hosted, linux, gpu]")
+	_, err := config.Parse([]byte(uncovered))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no profile covers scaleset labels")
+	require.Contains(t, err.Error(), "proxmox")
 }
 
 func TestProfiles_HotPlusWarmExceedsMaxRejected(t *testing.T) {

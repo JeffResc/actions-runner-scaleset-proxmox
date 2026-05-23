@@ -87,6 +87,7 @@ type Metrics struct {
 	GHStateMismatch      *prometheus.CounterVec
 	RunnerHookEvents     *prometheus.CounterVec
 	ReconcileErrors      *prometheus.CounterVec
+	UnroutedJobs         *prometheus.CounterVec
 	Leader               prometheus.Gauge
 }
 
@@ -258,6 +259,16 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "reconcile_errors_total",
 			Help: "Errors raised inside the gh.Reconciler when applying state transitions, by operation.",
 		}, []string{"op"}),
+		UnroutedJobs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "unrouted_jobs_total",
+			// labels is the sorted, pipe-joined RequestLabels of the
+			// job that could not be routed. Cardinality is bounded
+			// by the distinct label sets workflows actually use
+			// (typically << 100). Operators concerned about
+			// cardinality can drop the label via Prometheus
+			// metric_relabel_configs.
+			Help: "Jobs whose requested labels did not match any configured runner profile.",
+		}, []string{"labels"}),
 		Leader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
@@ -268,7 +279,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors,
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
-		m.ReconcileErrors, m.Leader,
+		m.ReconcileErrors, m.UnroutedJobs, m.Leader,
 	)
 	return m
 }

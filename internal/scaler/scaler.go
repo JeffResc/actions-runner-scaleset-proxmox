@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
 )
 
 // Compile-time assertion that *Scaler satisfies the listener.Scaler contract.
@@ -52,6 +54,12 @@ type Scaler struct {
 	log     *slog.Logger
 	metrics *observability.Metrics
 
+	// router maps a job's RequestLabels to the profile the scaler
+	// would ideally serve it from. Nil disables routing entirely —
+	// the scaler then records every JobStarted as "routed to default
+	// profile" (single-profile back-compat).
+	router *router.Router
+
 	// provisionOneFn is the per-VM mint+inject worker invoked from
 	// HandleDesiredRunnerCount. Defaults to the production
 	// provisionOne; tests override it to isolate the acquire/clamp
@@ -72,18 +80,63 @@ func New(cfg Config, gh *scaleset.Client, p pool.Manager, prov provisioner.Provi
 	return s
 }
 
+// SetRouter attaches a label router. Pass nil to disable routing
+// observations. Called once at construction by the caller (app.Run)
+// after both the scaler and the router have been built.
+func (s *Scaler) SetRouter(r *router.Router) { s.router = r }
+
 // HandleJobStarted is called when GitHub assigns a queued job to one of our
-// JIT runners. We transition the matching VM row Assigned -> Running.
+// JIT runners. We transition the matching VM row Assigned -> Running and,
+// when a label router is configured, record the routing decision for the
+// job's RequestLabels. Routing here is observational — by the time
+// JobStarted fires GitHub has already paired the job with a specific VM,
+// so we can't redirect; what we CAN do is alert operators via the
+// unrouted-jobs metric when a job arrives whose labels no profile
+// satisfies (a config gap they need to fix).
 func (s *Scaler) HandleJobStarted(ctx context.Context, info *scaleset.JobStarted) error {
 	if s.metrics != nil {
 		s.metrics.ListenerMessages.WithLabelValues("job_started").Inc()
 	}
+	s.recordRouting(info.RequestLabels)
 	vmid, ok := vmidFromRunnerName(info.RunnerName, s.cfg.NamePrefix)
 	if !ok {
 		s.log.Warn("job_started: cannot derive vmid from runner name", "runner_name", info.RunnerName)
 		return nil
 	}
 	return s.pool.MarkRunning(ctx, vmid, int64(info.RunnerID))
+}
+
+// recordRouting consults the router (when configured) and either logs
+// the resolved profile or emits the unrouted-jobs counter. Cheap
+// enough to run on every JobStarted; no I/O.
+func (s *Scaler) recordRouting(jobLabels []string) {
+	if s.router == nil {
+		return
+	}
+	profile, err := s.router.Route(jobLabels)
+	if err != nil {
+		s.log.Warn("router: no profile satisfies job labels", "labels", jobLabels, "err", err)
+		if s.metrics != nil {
+			s.metrics.UnroutedJobs.WithLabelValues(joinLabelsForMetric(jobLabels)).Inc()
+		}
+		return
+	}
+	s.log.Debug("router: job routed", "profile", profile, "labels", jobLabels)
+}
+
+// joinLabelsForMetric renders a job's RequestLabels into a single
+// stable string suitable as a Prometheus label value. Sort + join so
+// the same logical label set always hashes to the same series — and
+// so the cardinality is bounded by distinct label sets, not by
+// arrival order.
+func joinLabelsForMetric(labels []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	cp := make([]string, len(labels))
+	copy(cp, labels)
+	sort.Strings(cp)
+	return strings.Join(cp, "|")
 }
 
 // HandleJobCompleted is called when a job finishes. We destroy the VM.
