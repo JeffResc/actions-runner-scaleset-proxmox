@@ -119,6 +119,41 @@ func TestNewAppFromFile_ReadsPEM(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestNewAppFromFile_RejectsLoosePerms locks in the mode-bit half of
+// the PEM hardening (#148): any bit in 0o077 (group / other) must be
+// rejected by NewAppFromFile. The underlying check moved into
+// fileperm.CheckMode (where it has its own unit tests), but the
+// integration through NewAppFromFile was previously untested — every
+// existing test wrote 0o600.
+//
+// kubectl-mounted secrets and ConfigMap-projected files commonly land
+// at 0o644 by default; this is the most likely operator misconfig and
+// the most important failure mode to lock in.
+func TestNewAppFromFile_RejectsLoosePerms(t *testing.T) {
+	t.Parallel()
+	cases := []os.FileMode{
+		0o644, // group + world readable (most common kubectl default)
+		0o640, // group readable
+		0o604, // world readable
+		0o660, // group writable
+	}
+	for _, mode := range cases {
+		t.Run(mode.String(), func(t *testing.T) {
+			t.Parallel()
+			p := filepath.Join(t.TempDir(), "app.pem")
+			require.NoError(t, os.WriteFile(p, []byte(fakePEM), 0o600))
+			// Force mode via Chmod — os.WriteFile honors umask which
+			// would otherwise tighten 0o644 down to 0o600 under a 022
+			// umask.
+			require.NoError(t, os.Chmod(p, mode))
+
+			_, err := githubauth.NewAppFromFile("Iv23", 1, p)
+			require.Error(t, err, "PEM at mode %#o must be rejected", mode)
+			require.Contains(t, err.Error(), "insecure mode")
+		})
+	}
+}
+
 // TestPAT_NewScaleSetClient_BuildsWithoutNetwork verifies the PAT path
 // produces a *scaleset.Client without making any HTTP requests (the
 // constructor only configures internal state; the first network hit happens
