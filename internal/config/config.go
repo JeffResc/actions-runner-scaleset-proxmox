@@ -252,10 +252,54 @@ func (c CloneConfig) LinkedOrDefault() bool {
 }
 
 // NodesConfig selects the cluster placement strategy.
+//
+// Affinity, when non-empty, layers a profile-keyed filter over the
+// chosen Strategy: each rule pins or excludes nodes for a runner
+// profile before the underlying selector (single / round_robin /
+// least_loaded) gets a say. See internal/nodeselector for the
+// matching semantics; the rules here are the YAML surface.
 type NodesConfig struct {
-	Strategy   string   `yaml:"strategy" validate:"required,oneof=single round_robin least_loaded"`
-	Members    []string `yaml:"members"`
-	SingleNode string   `yaml:"single_node"`
+	Strategy   string         `yaml:"strategy" validate:"required,oneof=single round_robin least_loaded"`
+	Members    []string       `yaml:"members"`
+	SingleNode string         `yaml:"single_node"`
+	Affinity   []AffinityRule `yaml:"affinity"`
+}
+
+// AffinityRule pins or excludes nodes for a given runner profile.
+// Rules are applied in declaration order; the first rule whose
+// Match.Profile equals the cloning row's profile wins.
+type AffinityRule struct {
+	// Match selects which clones this rule applies to. An empty
+	// Profile is a wildcard (catch-all default rule). Today only
+	// the Profile dimension is supported.
+	Match AffinityMatch `yaml:"match"`
+
+	// PreferNodes restricts candidate nodes to this list. Combined
+	// with Require=true the rule is a hard pin; with Require=false
+	// it's a soft preference (fall back to the full eligible set
+	// if no preferred node is available).
+	PreferNodes []string `yaml:"prefer_nodes"`
+
+	// Require turns PreferNodes into a hard pin. The clone fails
+	// with ErrAffinityRequireUnsatisfiable when no preferred node
+	// has capacity — operators use this for "GPU profile MUST
+	// land on a GPU-equipped node".
+	Require bool `yaml:"require"`
+
+	// AntiAffinityWith excludes nodes that already host a tracked
+	// VM whose attributes match this selector. The canonical use
+	// case from issue #8 is "untrusted-PR runners must never
+	// co-schedule with prod runners on the same node".
+	AntiAffinityWith AffinityMatch `yaml:"anti_affinity_with"`
+}
+
+// AffinityMatch is the selector both Match (which jobs the rule
+// applies to) and AntiAffinityWith (which existing VMs block a
+// node) consult. Kept as a struct so future dimensions (repo / org
+// once those land on the nodeselector hint) can be added without
+// breaking the YAML shape.
+type AffinityMatch struct {
+	Profile string `yaml:"profile,omitempty"`
 }
 
 // PoolConfig configures pool sizes and timing.
@@ -966,6 +1010,54 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validatePriority(); err != nil {
 		return err
+	}
+	if err := c.validateNodeAffinity(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateNodeAffinity enforces that every affinity rule's
+// match.profile / anti_affinity_with.profile (when set) names a
+// declared profile, and that prefer_nodes entries (when set) name
+// nodes the operator actually advertised in nodes.members or
+// nodes.single_node. Catches the canonical typo where an operator
+// adds a `match: { profile: gpus }` rule for a profile they
+// actually named `gpu` — the rule would silently never fire.
+func (c *Config) validateNodeAffinity() error {
+	if len(c.Nodes.Affinity) == 0 {
+		return nil
+	}
+	knownProfiles := make(map[string]struct{}, len(c.Profiles))
+	for _, p := range c.Profiles {
+		knownProfiles[p.Name] = struct{}{}
+	}
+	knownNodes := make(map[string]struct{}, len(c.Nodes.Members)+1)
+	for _, n := range c.Nodes.Members {
+		knownNodes[n] = struct{}{}
+	}
+	if c.Nodes.SingleNode != "" {
+		knownNodes[c.Nodes.SingleNode] = struct{}{}
+	}
+	for i, r := range c.Nodes.Affinity {
+		if r.Match.Profile != "" {
+			if _, ok := knownProfiles[r.Match.Profile]; !ok {
+				return fmt.Errorf("nodes.affinity[%d].match.profile %q is not a declared profile", i, r.Match.Profile)
+			}
+		}
+		if r.AntiAffinityWith.Profile != "" {
+			if _, ok := knownProfiles[r.AntiAffinityWith.Profile]; !ok {
+				return fmt.Errorf("nodes.affinity[%d].anti_affinity_with.profile %q is not a declared profile", i, r.AntiAffinityWith.Profile)
+			}
+		}
+		for j, n := range r.PreferNodes {
+			if _, ok := knownNodes[n]; !ok {
+				return fmt.Errorf("nodes.affinity[%d].prefer_nodes[%d] %q is not a declared node", i, j, n)
+			}
+		}
+		if r.Require && len(r.PreferNodes) == 0 {
+			return fmt.Errorf("nodes.affinity[%d]: require=true is only meaningful with prefer_nodes (otherwise there is nothing to require)", i)
+		}
 	}
 	return nil
 }
