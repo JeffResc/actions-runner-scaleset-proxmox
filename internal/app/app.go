@@ -209,7 +209,10 @@ func Run(ctx context.Context, opts Options) error {
 		}
 
 		if err := mgr.Adopt(leaderCtx); err != nil {
-			log.Error("adopt: list-owned-vms failed; starting with empty pool", "err", err)
+			// Warn, not Error: the code deliberately continues with an
+			// empty pool. Pager-grade Error would page on a condition
+			// the orchestrator itself decided is tolerable.
+			log.Warn("adopt: list-owned-vms failed; starting with empty pool", "err", err)
 		}
 		health.MarkRecoveryDone()
 		health.MarkProxmoxOK()

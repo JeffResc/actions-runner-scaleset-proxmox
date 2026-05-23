@@ -386,6 +386,15 @@ func Serve(ctx context.Context, addr string, reg *prometheus.Registry, h *Health
 func ServeOn(ctx context.Context, ln net.Listener, reg *prometheus.Registry, h *Health, log *slog.Logger) error {
 	r := chi.NewRouter()
 	r.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg}))
+	// Liveness is intentionally "process exists and serves HTTP" —
+	// /healthz always returns 200. Readiness ("process can serve real
+	// traffic": leader role + Proxmox reachable + recovery done) lives
+	// on /readyz. This split is deliberate: a k8s livenessProbe wired
+	// to a Proxmox-dependent check would restart every pod during a
+	// Proxmox outage, turning a degraded-but-recoverable cluster into a
+	// restart storm. Operators who DO want pod restarts on prolonged
+	// Proxmox outages should wire that behavior into /readyz +
+	// readinessProbe + a separate watchdog, not into /healthz.
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		if _, err := io.WriteString(w, "ok"); err != nil {
 			log.Debug("healthz write failed", "err", err)
