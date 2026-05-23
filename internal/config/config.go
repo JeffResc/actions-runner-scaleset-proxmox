@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/go-viper/mapstructure/v2"
 	koanfyaml "github.com/knadh/koanf/parsers/yaml"
 	koanfenv "github.com/knadh/koanf/providers/env/v2"
 	koanffile "github.com/knadh/koanf/providers/file"
@@ -40,6 +41,58 @@ import (
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
 )
+
+// Duration is a [time.Duration] that decodes from a Go duration string
+// (e.g. "15s", "5m", "1h") via koanf's mapstructure pipeline. The zero
+// value represents "field not set" — distinct from an explicit "0s",
+// which Set() reports as true with D() == 0. ApplyDefaults populates
+// any field still unset; Resolve then rejects explicit non-positive
+// values on knobs that must be positive.
+type Duration struct {
+	d   time.Duration
+	set bool
+}
+
+// UnmarshalText parses a Go duration string. The empty string leaves
+// the value unset so ApplyDefaults can substitute the default.
+func (d *Duration) UnmarshalText(text []byte) error {
+	s := strings.TrimSpace(string(text))
+	if s == "" {
+		return nil
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	d.d = v
+	d.set = true
+	return nil
+}
+
+// D returns the duration value as a [time.Duration]. Unset values
+// return 0.
+func (d Duration) D() time.Duration { return d.d }
+
+// Set reports whether the field was supplied — by YAML, env override,
+// or ApplyDefaults.
+func (d Duration) Set() bool { return d.set }
+
+// OrDefault returns d's value when set, otherwise def.
+func (d Duration) OrDefault(def time.Duration) time.Duration {
+	if !d.set {
+		return def
+	}
+	return d.d
+}
+
+// setDefault populates d with def when still unset. ApplyDefaults
+// uses this so post-defaults reads via D() are always meaningful.
+func (d *Duration) setDefault(def time.Duration) {
+	if !d.set {
+		d.d = def
+		d.set = true
+	}
+}
 
 // envPrefix is the prefix every config-overriding env var must carry.
 // Chosen to namespace this orchestrator's vars against unrelated env on
@@ -164,28 +217,22 @@ type GitHubConfig struct {
 	// PollInterval is how often the reconciler queries the runners API.
 	// 15s is a good default — well under the rate limit and fast enough
 	// to catch missed JobCompleted within one job's worth of wall clock.
-	PollInterval string `yaml:"poll_interval"`
+	PollInterval Duration `yaml:"poll_interval"`
 
 	// AssignedGrace is how long a VM may sit in `assigned` (JIT
 	// injected, waiting for the runner to pick up work) before the
 	// reconciler declares it dead and destroys it.
-	AssignedGrace string `yaml:"assigned_grace"`
+	AssignedGrace Duration `yaml:"assigned_grace"`
 
 	// RunningIdleGrace is how long a VM may sit in `running` with its
 	// runner observed online + idle on GitHub before the reconciler
 	// destroys it (catches missed JobCompleted callbacks).
-	RunningIdleGrace string `yaml:"running_idle_grace"`
+	RunningIdleGrace Duration `yaml:"running_idle_grace"`
 
 	// AssignedOfflineGrace is the same as AssignedGrace but for the
 	// runner-went-offline subcase; shorter because offline is a
 	// stronger failure signal.
-	AssignedOfflineGrace string `yaml:"assigned_offline_grace"`
-
-	// Resolved durations (populated by Resolve).
-	PollIntervalD         time.Duration `yaml:"-"`
-	AssignedGraceD        time.Duration `yaml:"-"`
-	RunningIdleGraceD     time.Duration `yaml:"-"`
-	AssignedOfflineGraceD time.Duration `yaml:"-"`
+	AssignedOfflineGrace Duration `yaml:"assigned_offline_grace"`
 }
 
 // GitHubAppConfig configures GitHub App authentication. Exactly one of
@@ -347,13 +394,13 @@ type AffinityMatch struct {
 // when set, caps the sum of per-profile MaxConcurrentRunners so an
 // operator can put a fleet-wide ceiling above the per-profile arithmetic.
 type PoolConfig struct {
-	HotSize           int    `yaml:"hot_size" validate:"gte=0"`
-	WarmSize          int    `yaml:"warm_size" validate:"gte=0"`
-	GlobalMax         int    `yaml:"global_max" validate:"gte=0"`
-	ReconcileInterval string `yaml:"reconcile_interval"`
-	VMMaxAge          string `yaml:"vm_max_age"`
-	DrainTimeout      string `yaml:"drain_timeout"`
-	BootMaxAttempts   int    `yaml:"boot_max_attempts" validate:"gte=1"`
+	HotSize           int      `yaml:"hot_size" validate:"gte=0"`
+	WarmSize          int      `yaml:"warm_size" validate:"gte=0"`
+	GlobalMax         int      `yaml:"global_max" validate:"gte=0"`
+	ReconcileInterval Duration `yaml:"reconcile_interval"`
+	VMMaxAge          Duration `yaml:"vm_max_age"`
+	DrainTimeout      Duration `yaml:"drain_timeout"`
+	BootMaxAttempts   int      `yaml:"boot_max_attempts" validate:"gte=1"`
 
 	// PowerPollInterval is how often the manager polls Proxmox for the
 	// power state of Assigned/Running VMs. When a row's VM is observed
@@ -362,28 +409,28 @@ type PoolConfig struct {
 	// the previous in-VM runner-hook callback channel — Proxmox is
 	// the single source of truth for "is the job over".
 	// Default "3s"; must be > 0.
-	PowerPollInterval string `yaml:"power_poll_interval"`
+	PowerPollInterval Duration `yaml:"power_poll_interval"`
 
 	// VMIDReuseCooldown is the minimum time after a destroy completes
 	// before the allocator may reissue the same VMID. Protects against
 	// PVE-side qmdestroy task settle / lock-file contention when a fresh
 	// clone targets a VMID that Proxmox is still tearing down. Default
 	// "30s"; must be > 0.
-	VMIDReuseCooldown string `yaml:"vmid_reuse_cooldown"`
+	VMIDReuseCooldown Duration `yaml:"vmid_reuse_cooldown"`
 
 	// OrphanGrace is how long a Proxmox VM may exist without a matching
 	// store row before the GitHub reconciler's sweepProxmoxOrphans
 	// destroys it. Must exceed the typical Clone → guest-agent-ready →
 	// JIT-inject worst case; otherwise the reconciler will destroy
 	// VMs the pool worker is still booting. Default "60s"; must be > 0.
-	OrphanGrace string `yaml:"orphan_grace"`
+	OrphanGrace Duration `yaml:"orphan_grace"`
 
 	// CloneInflightGrace is the TTL safety net for the Provisioner's
 	// in-flight clone tracker. Entries older than this are pruned in
 	// case Clone hangs and never returns to clear them. Should be
 	// comfortably longer than the worst-case Clone latency; default
 	// "5m"; must be > 0.
-	CloneInflightGrace string `yaml:"clone_inflight_grace"`
+	CloneInflightGrace Duration `yaml:"clone_inflight_grace"`
 
 	// Schedules is the default schedule set inherited by the
 	// synthesised "default" profile when no profiles: block is
@@ -391,15 +438,6 @@ type PoolConfig struct {
 	// per-profile instead — this field is ignored in that case
 	// to keep the override boundary explicit.
 	Schedules []ScheduleConfig `yaml:"schedules,omitempty"`
-
-	// Resolved durations (populated by Resolve).
-	ReconcileIntervalD  time.Duration `yaml:"-"`
-	VMMaxAgeD           time.Duration `yaml:"-"`
-	DrainTimeoutD       time.Duration `yaml:"-"`
-	PowerPollIntervalD  time.Duration `yaml:"-"`
-	VMIDReuseCooldownD  time.Duration `yaml:"-"`
-	OrphanGraceD        time.Duration `yaml:"-"`
-	CloneInflightGraceD time.Duration `yaml:"-"`
 }
 
 // ProfileConfig defines a runner profile — a named bundle of hardware
@@ -451,11 +489,8 @@ type ProfileConfig struct {
 	// zero/negative is rejected at config-load (Resolve) to avoid
 	// silently disabling age-based recycling. To inherit the fleet
 	// default, omit the field entirely.
-	BootMaxAttempts *int   `yaml:"boot_max_attempts,omitempty" validate:"omitempty,gte=1"`
-	VMMaxAge        string `yaml:"vm_max_age"`
-
-	// VMMaxAgeD is the resolved duration (populated by Resolve).
-	VMMaxAgeD time.Duration `yaml:"-"`
+	BootMaxAttempts *int     `yaml:"boot_max_attempts,omitempty" validate:"omitempty,gte=1"`
+	VMMaxAge        Duration `yaml:"vm_max_age"`
 
 	// Network, when non-nil, overrides the global proxmox.network
 	// block for clones of this profile (bridge, VLAN tag, MTU,
@@ -519,7 +554,7 @@ type ScheduleConfig struct {
 	// "30m"). When the window closes the runner reverts to
 	// the profile baseline unless another schedule's window
 	// is still open (last-fired wins).
-	Duration string `yaml:"duration" validate:"required"`
+	Duration Duration `yaml:"duration" validate:"required"`
 
 	// Timezone is an IANA tz name (e.g. "America/New_York").
 	// Empty means UTC — schedules-as-code that read sensibly
@@ -533,12 +568,11 @@ type ScheduleConfig struct {
 	HotSize  int `yaml:"hot_size" validate:"gte=0"`
 	WarmSize int `yaml:"warm_size" validate:"gte=0"`
 
-	// DurationD, Location, and CronSchedule are populated by
-	// Resolve. CronSchedule is the parsed cron expression —
-	// exposed so consumers (the schedule runner in
-	// internal/app) don't have to re-parse and can't drift on
-	// the parser configuration.
-	DurationD    time.Duration  `yaml:"-"`
+	// Location and CronSchedule are populated by Resolve.
+	// CronSchedule is the parsed cron expression — exposed so
+	// consumers (the schedule runner in internal/app) don't
+	// have to re-parse and can't drift on the parser
+	// configuration.
 	Location     *time.Location `yaml:"-"`
 	CronSchedule cron.Schedule  `yaml:"-"`
 }
@@ -762,9 +796,9 @@ type ClusterRaftConfig struct {
 	// detects existing state and skips re-bootstrap.
 	Bootstrap bool `yaml:"bootstrap"`
 
-	HeartbeatTimeout string `yaml:"heartbeat_timeout"` // default 1s
-	ElectionTimeout  string `yaml:"election_timeout"`  // default 1s
-	CommitTimeout    string `yaml:"commit_timeout"`    // default 50ms
+	HeartbeatTimeout Duration `yaml:"heartbeat_timeout"` // default 1s
+	ElectionTimeout  Duration `yaml:"election_timeout"`  // default 1s
+	CommitTimeout    Duration `yaml:"commit_timeout"`    // default 50ms
 
 	// TLS, when set, enables a TLS stream layer on the raft TCP
 	// transport so peer-to-peer raft RPCs (AppendEntries, etc.) are
@@ -866,7 +900,22 @@ func loadInto(yamlProvider koanf.Provider) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{Tag: "yaml"}); err != nil {
+	if err := k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{
+		Tag: "yaml",
+		DecoderConfig: &mapstructure.DecoderConfig{
+			// TextUnmarshallerHookFunc lets the [Duration] type
+			// parse its YAML string itself; without the hook
+			// mapstructure would try to descend into Duration's
+			// unexported fields and silently produce zero values.
+			DecodeHook: mapstructure.ComposeDecodeHookFunc(
+				mapstructure.TextUnmarshallerHookFunc(),
+				mapstructure.StringToTimeDurationHookFunc(),
+				mapstructure.StringToSliceHookFunc(","),
+			),
+			Result:           &cfg,
+			WeaklyTypedInput: true,
+		},
+	}); err != nil {
 		return nil, fmt.Errorf("config: unmarshal: %w", err)
 	}
 	cfg.unknownEnvOverrides = unknownEnv
@@ -1021,30 +1070,16 @@ const defaultProfileName = "default"
 // ApplyDefaults fills in sane defaults for optional fields.
 func (c *Config) ApplyDefaults() {
 	// Pool
-	if c.Pool.ReconcileInterval == "" {
-		c.Pool.ReconcileInterval = "10s"
-	}
-	if c.Pool.VMMaxAge == "" {
-		c.Pool.VMMaxAge = "24h"
-	}
-	if c.Pool.DrainTimeout == "" {
-		c.Pool.DrainTimeout = "30m"
-	}
+	c.Pool.ReconcileInterval.setDefault(10 * time.Second)
+	c.Pool.VMMaxAge.setDefault(24 * time.Hour)
+	c.Pool.DrainTimeout.setDefault(30 * time.Minute)
 	if c.Pool.BootMaxAttempts == 0 {
 		c.Pool.BootMaxAttempts = 3
 	}
-	if c.Pool.PowerPollInterval == "" {
-		c.Pool.PowerPollInterval = "3s"
-	}
-	if c.Pool.VMIDReuseCooldown == "" {
-		c.Pool.VMIDReuseCooldown = "30s"
-	}
-	if c.Pool.OrphanGrace == "" {
-		c.Pool.OrphanGrace = "60s"
-	}
-	if c.Pool.CloneInflightGrace == "" {
-		c.Pool.CloneInflightGrace = "5m"
-	}
+	c.Pool.PowerPollInterval.setDefault(3 * time.Second)
+	c.Pool.VMIDReuseCooldown.setDefault(30 * time.Second)
+	c.Pool.OrphanGrace.setDefault(60 * time.Second)
+	c.Pool.CloneInflightGrace.setDefault(5 * time.Minute)
 	// Observability
 	if c.Observability.HTTPAddr == "" {
 		c.Observability.HTTPAddr = ":9100"
@@ -1057,32 +1092,18 @@ func (c *Config) ApplyDefaults() {
 	}
 	// GitHub reconciler defaults — tuned around the production failure
 	// mode (over-provisioned runners that GitHub never assigns).
-	if c.GitHub.PollInterval == "" {
-		c.GitHub.PollInterval = "15s"
-	}
-	if c.GitHub.AssignedGrace == "" {
-		c.GitHub.AssignedGrace = "5m"
-	}
-	if c.GitHub.RunningIdleGrace == "" {
-		c.GitHub.RunningIdleGrace = "30s"
-	}
-	if c.GitHub.AssignedOfflineGrace == "" {
-		c.GitHub.AssignedOfflineGrace = "2m"
-	}
+	c.GitHub.PollInterval.setDefault(15 * time.Second)
+	c.GitHub.AssignedGrace.setDefault(5 * time.Minute)
+	c.GitHub.RunningIdleGrace.setDefault(30 * time.Second)
+	c.GitHub.AssignedOfflineGrace.setDefault(2 * time.Minute)
 	// Proxmox.Clone default is captured in CloneConfig.LinkedOrDefault.
 	// Cluster
 	if c.Cluster.Mode == "" {
 		c.Cluster.Mode = "standalone"
 	}
-	if c.Cluster.Raft.HeartbeatTimeout == "" {
-		c.Cluster.Raft.HeartbeatTimeout = "1s"
-	}
-	if c.Cluster.Raft.ElectionTimeout == "" {
-		c.Cluster.Raft.ElectionTimeout = "1s"
-	}
-	if c.Cluster.Raft.CommitTimeout == "" {
-		c.Cluster.Raft.CommitTimeout = "50ms"
-	}
+	c.Cluster.Raft.HeartbeatTimeout.setDefault(1 * time.Second)
+	c.Cluster.Raft.ElectionTimeout.setDefault(1 * time.Second)
+	c.Cluster.Raft.CommitTimeout.setDefault(50 * time.Millisecond)
 	// Admin API: default trusted-proxy list to loopback. Operators
 	// terminating TLS via an in-cluster proxy can override; raft
 	// deployments where the Forwarder lives on the same pod are
@@ -1127,7 +1148,7 @@ func (c *Config) ApplyDefaults() {
 			if p.BootMaxAttempts == nil {
 				p.BootMaxAttempts = intp(c.Pool.BootMaxAttempts)
 			}
-			if p.VMMaxAge == "" {
+			if !p.VMMaxAge.Set() {
 				p.VMMaxAge = c.Pool.VMMaxAge
 			}
 		}
@@ -1183,80 +1204,33 @@ func (c *Config) Resolve() error {
 			return fmt.Errorf("nodes.members is required when strategy=%s", c.Nodes.Strategy)
 		}
 	}
-	// Durations.
-	var err error
-	c.Pool.ReconcileIntervalD, err = time.ParseDuration(c.Pool.ReconcileInterval)
-	if err != nil {
-		return fmt.Errorf("pool.reconcile_interval: %w", err)
-	}
-	c.Pool.VMMaxAgeD, err = time.ParseDuration(c.Pool.VMMaxAge)
-	if err != nil {
-		return fmt.Errorf("pool.vm_max_age: %w", err)
-	}
-	c.Pool.DrainTimeoutD, err = time.ParseDuration(c.Pool.DrainTimeout)
-	if err != nil {
-		return fmt.Errorf("pool.drain_timeout: %w", err)
-	}
-	c.Pool.PowerPollIntervalD, err = time.ParseDuration(c.Pool.PowerPollInterval)
-	if err != nil {
-		return fmt.Errorf("pool.power_poll_interval: %w", err)
-	}
-	if c.Pool.PowerPollIntervalD <= 0 {
+	// Duration knobs that must be strictly positive. ApplyDefaults
+	// already substituted defaults for unset fields; the only way to
+	// fail here is an explicit non-positive value in YAML/env (e.g.
+	// `power_poll_interval: 0s`).
+	if c.Pool.PowerPollInterval.D() <= 0 {
 		return errors.New("pool.power_poll_interval must be positive")
 	}
-	c.Pool.VMIDReuseCooldownD, err = time.ParseDuration(c.Pool.VMIDReuseCooldown)
-	if err != nil {
-		return fmt.Errorf("pool.vmid_reuse_cooldown: %w", err)
-	}
-	if c.Pool.VMIDReuseCooldownD <= 0 {
+	if c.Pool.VMIDReuseCooldown.D() <= 0 {
 		return errors.New("pool.vmid_reuse_cooldown must be positive")
 	}
-	c.Pool.OrphanGraceD, err = time.ParseDuration(c.Pool.OrphanGrace)
-	if err != nil {
-		return fmt.Errorf("pool.orphan_grace: %w", err)
-	}
-	if c.Pool.OrphanGraceD <= 0 {
+	if c.Pool.OrphanGrace.D() <= 0 {
 		return errors.New("pool.orphan_grace must be positive")
 	}
-	c.Pool.CloneInflightGraceD, err = time.ParseDuration(c.Pool.CloneInflightGrace)
-	if err != nil {
-		return fmt.Errorf("pool.clone_inflight_grace: %w", err)
-	}
-	if c.Pool.CloneInflightGraceD <= 0 {
+	if c.Pool.CloneInflightGrace.D() <= 0 {
 		return errors.New("pool.clone_inflight_grace must be positive")
 	}
-	c.GitHub.PollIntervalD, err = time.ParseDuration(c.GitHub.PollInterval)
-	if err != nil {
-		return fmt.Errorf("github.poll_interval: %w", err)
-	}
-	c.GitHub.AssignedGraceD, err = time.ParseDuration(c.GitHub.AssignedGrace)
-	if err != nil {
-		return fmt.Errorf("github.assigned_grace: %w", err)
-	}
-	c.GitHub.RunningIdleGraceD, err = time.ParseDuration(c.GitHub.RunningIdleGrace)
-	if err != nil {
-		return fmt.Errorf("github.running_idle_grace: %w", err)
-	}
-	c.GitHub.AssignedOfflineGraceD, err = time.ParseDuration(c.GitHub.AssignedOfflineGrace)
-	if err != nil {
-		return fmt.Errorf("github.assigned_offline_grace: %w", err)
-	}
-	// Profiles: parse per-profile vm_max_age now so callers don't have
-	// to re-parse on the hot path. Empty inherits from pool (already
-	// applied in ApplyDefaults, so this normally just round-trips).
+	// Profiles: per-profile vm_max_age must be positive when set.
+	// Empty inherits from pool (already applied in ApplyDefaults, so
+	// the inherit normally round-trips a positive default).
 	for i := range c.Profiles {
 		p := &c.Profiles[i]
-		if p.VMMaxAge == "" {
+		if !p.VMMaxAge.Set() {
 			continue
 		}
-		d, err := time.ParseDuration(p.VMMaxAge)
-		if err != nil {
-			return fmt.Errorf("profiles[%d].vm_max_age: %w", i, err)
+		if p.VMMaxAge.D() <= 0 {
+			return fmt.Errorf("profiles[%d] %q: vm_max_age must be positive", i, p.Name)
 		}
-		if d <= 0 {
-			return fmt.Errorf("profiles[%q].vm_max_age must be positive (got %q)", p.Name, p.VMMaxAge)
-		}
-		p.VMMaxAgeD = d
 	}
 	// Profile schedules: parse Duration + Timezone + validate cron
 	// expression so misconfiguration surfaces at load rather than at
@@ -1286,19 +1260,9 @@ func (c *Config) resolveCluster() error {
 			r.NodeID = host
 		}
 	}
-	var err error
-	r.HeartbeatTimeoutD, err = time.ParseDuration(r.HeartbeatTimeout)
-	if err != nil {
-		return fmt.Errorf("cluster.raft.heartbeat_timeout: %w", err)
-	}
-	r.ElectionTimeoutD, err = time.ParseDuration(r.ElectionTimeout)
-	if err != nil {
-		return fmt.Errorf("cluster.raft.election_timeout: %w", err)
-	}
-	r.CommitTimeoutD, err = time.ParseDuration(r.CommitTimeout)
-	if err != nil {
-		return fmt.Errorf("cluster.raft.commit_timeout: %w", err)
-	}
+	// Raft timing knobs are parsed by the Duration type's
+	// UnmarshalText; ApplyDefaults supplies defaults when omitted.
+	// No additional parsing needed here.
 	if c.Cluster.Mode != "raft" {
 		return nil
 	}
@@ -1632,14 +1596,9 @@ func resolveSchedules(schedules []ScheduleConfig, prefix string) error {
 		}
 		seen[s.Name] = i
 
-		d, err := time.ParseDuration(s.Duration)
-		if err != nil {
-			return fmt.Errorf("%s.schedules[%d] %q.duration: %w", prefix, i, s.Name, err)
+		if s.Duration.D() <= 0 {
+			return fmt.Errorf("%s.schedules[%d] %q.duration must be positive", prefix, i, s.Name)
 		}
-		if d <= 0 {
-			return fmt.Errorf("%s.schedules[%d] %q.duration must be positive (got %q)", prefix, i, s.Name, s.Duration)
-		}
-		s.DurationD = d
 
 		loc := time.UTC
 		if s.Timezone != "" {

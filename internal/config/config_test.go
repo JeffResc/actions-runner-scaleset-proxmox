@@ -84,9 +84,9 @@ func TestParse_ValidPAT(t *testing.T) {
 	require.Equal(t, "testsecret", cfg.Proxmox.Auth.TokenSecret)
 
 	// Durations parsed.
-	require.Equal(t, 5*time.Second, cfg.Pool.ReconcileIntervalD)
-	require.Equal(t, 12*time.Hour, cfg.Pool.VMMaxAgeD)
-	require.Equal(t, 15*time.Minute, cfg.Pool.DrainTimeoutD)
+	require.Equal(t, 5*time.Second, cfg.Pool.ReconcileInterval.D())
+	require.Equal(t, 12*time.Hour, cfg.Pool.VMMaxAge.D())
+	require.Equal(t, 15*time.Minute, cfg.Pool.DrainTimeout.D())
 }
 
 // TestParse_EnvOverridesYAML covers the koanf env layer winning over a
@@ -310,9 +310,9 @@ pool: {}
 	cfg, err := config.Parse([]byte(minimal))
 	require.NoError(t, err)
 
-	require.Equal(t, 10*time.Second, cfg.Pool.ReconcileIntervalD)
-	require.Equal(t, 24*time.Hour, cfg.Pool.VMMaxAgeD)
-	require.Equal(t, 30*time.Minute, cfg.Pool.DrainTimeoutD)
+	require.Equal(t, 10*time.Second, cfg.Pool.ReconcileInterval.D())
+	require.Equal(t, 24*time.Hour, cfg.Pool.VMMaxAge.D())
+	require.Equal(t, 30*time.Minute, cfg.Pool.DrainTimeout.D())
 	require.Equal(t, 3, cfg.Pool.BootMaxAttempts)
 	require.Equal(t, ":9100", cfg.Observability.HTTPAddr)
 	require.Equal(t, "info", cfg.Observability.LogLevel)
@@ -323,18 +323,18 @@ pool: {}
 	// GitHub reconciler defaults: the production failure mode this whole
 	// package was built for (over-provisioned runners that GitHub never
 	// assigns) only resolves cleanly if these have sensible fallbacks.
-	require.Equal(t, 15*time.Second, cfg.GitHub.PollIntervalD)
-	require.Equal(t, 5*time.Minute, cfg.GitHub.AssignedGraceD)
-	require.Equal(t, 30*time.Second, cfg.GitHub.RunningIdleGraceD)
-	require.Equal(t, 2*time.Minute, cfg.GitHub.AssignedOfflineGraceD)
+	require.Equal(t, 15*time.Second, cfg.GitHub.PollInterval.D())
+	require.Equal(t, 5*time.Minute, cfg.GitHub.AssignedGrace.D())
+	require.Equal(t, 30*time.Second, cfg.GitHub.RunningIdleGrace.D())
+	require.Equal(t, 2*time.Minute, cfg.GitHub.AssignedOfflineGrace.D())
 
 	// Power-state poller default.
-	require.Equal(t, 3*time.Second, cfg.Pool.PowerPollIntervalD)
+	require.Equal(t, 3*time.Second, cfg.Pool.PowerPollInterval.D())
 
 	// Race-fix grace/cooldown defaults (pre-existing race bug fixes).
-	require.Equal(t, 30*time.Second, cfg.Pool.VMIDReuseCooldownD)
-	require.Equal(t, 60*time.Second, cfg.Pool.OrphanGraceD)
-	require.Equal(t, 5*time.Minute, cfg.Pool.CloneInflightGraceD)
+	require.Equal(t, 30*time.Second, cfg.Pool.VMIDReuseCooldown.D())
+	require.Equal(t, 60*time.Second, cfg.Pool.OrphanGrace.D())
+	require.Equal(t, 5*time.Minute, cfg.Pool.CloneInflightGrace.D())
 }
 
 // TestPool_RaceGraceKnobs_AcceptOverrides confirms the three pool grace
@@ -363,9 +363,9 @@ pool:
 	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
 	cfg, err := config.Parse([]byte(yaml))
 	require.NoError(t, err)
-	require.Equal(t, 45*time.Second, cfg.Pool.VMIDReuseCooldownD)
-	require.Equal(t, 90*time.Second, cfg.Pool.OrphanGraceD)
-	require.Equal(t, 10*time.Minute, cfg.Pool.CloneInflightGraceD)
+	require.Equal(t, 45*time.Second, cfg.Pool.VMIDReuseCooldown.D())
+	require.Equal(t, 90*time.Second, cfg.Pool.OrphanGrace.D())
+	require.Equal(t, 10*time.Minute, cfg.Pool.CloneInflightGrace.D())
 }
 
 // TestPool_RaceGraceKnobs_RejectZeroOrNegative locks down the
@@ -438,10 +438,10 @@ pool: {}
 	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
 	cfg, err := config.Parse([]byte(src))
 	require.NoError(t, err)
-	require.Equal(t, 7*time.Second, cfg.GitHub.PollIntervalD)
-	require.Equal(t, 99*time.Minute, cfg.GitHub.AssignedGraceD)
-	require.Equal(t, 11*time.Second, cfg.GitHub.RunningIdleGraceD)
-	require.Equal(t, 45*time.Second, cfg.GitHub.AssignedOfflineGraceD)
+	require.Equal(t, 7*time.Second, cfg.GitHub.PollInterval.D())
+	require.Equal(t, 99*time.Minute, cfg.GitHub.AssignedGrace.D())
+	require.Equal(t, 11*time.Second, cfg.GitHub.RunningIdleGrace.D())
+	require.Equal(t, 45*time.Second, cfg.GitHub.AssignedOfflineGrace.D())
 }
 
 func TestParse_AppAuthRequiresAppBlock(t *testing.T) {
@@ -621,9 +621,9 @@ func TestCluster_DefaultsToStandalone(t *testing.T) {
 	cfg, err := config.Parse([]byte(validPATYAML))
 	require.NoError(t, err)
 	require.Equal(t, "standalone", cfg.Cluster.Mode)
-	require.Equal(t, time.Second, cfg.Cluster.Raft.HeartbeatTimeoutD)
-	require.Equal(t, time.Second, cfg.Cluster.Raft.ElectionTimeoutD)
-	require.Equal(t, 50*time.Millisecond, cfg.Cluster.Raft.CommitTimeoutD)
+	require.Equal(t, time.Second, cfg.Cluster.Raft.HeartbeatTimeout.D())
+	require.Equal(t, time.Second, cfg.Cluster.Raft.ElectionTimeout.D())
+	require.Equal(t, 50*time.Millisecond, cfg.Cluster.Raft.CommitTimeout.D())
 }
 
 // Raft mode parses a complete peer list and confirms this replica is
@@ -943,8 +943,7 @@ func TestProfiles_ExplicitBlockParses(t *testing.T) {
 	require.Equal(t, 0, gpu.HotSizeOrDefault(99))
 	require.Equal(t, 1, gpu.WarmSizeOrDefault(99))
 	// Per-profile override takes precedence over global pool.vm_max_age.
-	require.Equal(t, "6h", gpu.VMMaxAge)
-	require.Equal(t, 6*time.Hour, gpu.VMMaxAgeD)
+	require.Equal(t, 6*time.Hour, gpu.VMMaxAge.D())
 }
 
 func TestProfiles_GlobalMaxRejectsOversum(t *testing.T) {
@@ -1046,7 +1045,7 @@ func TestProfiles_VMMaxAgePositiveAccepted(t *testing.T) {
 	ok := strings.Replace(validProfileYAML, "vm_max_age: 6h", "vm_max_age: 30m", 1)
 	cfg, err := config.Parse([]byte(ok))
 	require.NoError(t, err)
-	require.Equal(t, 30*time.Minute, cfg.Profiles[1].VMMaxAgeD)
+	require.Equal(t, 30*time.Minute, cfg.Profiles[1].VMMaxAge.D())
 }
 
 // TestProfiles_BootMaxAttemptsZeroRejected pins the per-profile
@@ -1501,7 +1500,7 @@ func TestSchedules_ProfileScheduleParses(t *testing.T) {
 	s := x64.Schedules[0]
 	require.Equal(t, "business-hours", s.Name)
 	require.Equal(t, "0 8 * * 1-5", s.Cron)
-	require.Equal(t, 10*time.Hour, s.DurationD)
+	require.Equal(t, 10*time.Hour, s.Duration.D())
 	require.NotNil(t, s.Location)
 	require.Equal(t, "America/New_York", s.Location.String())
 	require.Equal(t, 5, s.HotSize)
@@ -1589,4 +1588,65 @@ func TestSchedules_PoolSchedulesInheritsIntoDefaultProfile(t *testing.T) {
 	require.Len(t, cfg.Profiles, 1)
 	require.Len(t, cfg.Profiles[0].Schedules, 1)
 	require.Equal(t, "night", cfg.Profiles[0].Schedules[0].Name)
+}
+
+// TestDuration_UnmarshalText pins the parsing semantics: empty leaves
+// the value unset, a valid string sets it, a malformed string returns
+// a wrapped error naming the offending input. Tests the type itself,
+// independent of the full Parse pipeline, so a regression in the
+// koanf wiring is easy to bisect.
+func TestDuration_UnmarshalText(t *testing.T) {
+	t.Run("empty leaves unset", func(t *testing.T) {
+		var d config.Duration
+		require.NoError(t, d.UnmarshalText([]byte("")))
+		require.False(t, d.Set())
+		require.Equal(t, time.Duration(0), d.D())
+	})
+	t.Run("whitespace leaves unset", func(t *testing.T) {
+		var d config.Duration
+		require.NoError(t, d.UnmarshalText([]byte("  \t\n")))
+		require.False(t, d.Set())
+	})
+	t.Run("valid duration sets value", func(t *testing.T) {
+		var d config.Duration
+		require.NoError(t, d.UnmarshalText([]byte("15s")))
+		require.True(t, d.Set())
+		require.Equal(t, 15*time.Second, d.D())
+	})
+	t.Run("malformed duration returns wrapped error", func(t *testing.T) {
+		var d config.Duration
+		err := d.UnmarshalText([]byte("nope"))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), `"nope"`)
+		require.False(t, d.Set())
+	})
+}
+
+// TestDuration_OrDefault pins the read-side helper: unset returns the
+// supplied default, set returns the parsed value (even when the parsed
+// value is the zero duration).
+func TestDuration_OrDefault(t *testing.T) {
+	var unset config.Duration
+	require.Equal(t, 7*time.Second, unset.OrDefault(7*time.Second))
+
+	var set config.Duration
+	require.NoError(t, set.UnmarshalText([]byte("3s")))
+	require.Equal(t, 3*time.Second, set.OrDefault(7*time.Second))
+
+	// Explicit "0s" reports Set() and D() == 0 — the orchestrator uses
+	// this to reject explicit zero on knobs that must be positive.
+	var zero config.Duration
+	require.NoError(t, zero.UnmarshalText([]byte("0s")))
+	require.True(t, zero.Set())
+	require.Equal(t, time.Duration(0), zero.D())
+}
+
+// TestParse_MalformedDuration covers the load-level error path: a bad
+// duration string in YAML produces an error wrapping the offending
+// input value so the operator can locate it.
+func TestParse_MalformedDuration(t *testing.T) {
+	bad := strings.Replace(validPATYAML, "reconcile_interval: 5s", "reconcile_interval: nope", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `"nope"`)
 }
