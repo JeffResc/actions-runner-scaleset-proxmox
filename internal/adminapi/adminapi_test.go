@@ -91,7 +91,7 @@ func (f *fakePool) ListRows(_ context.Context) ([]pool.RowSnapshot, error) {
 func newTestServer(t *testing.T, secret string) (*Server, *fakePool) {
 	t.Helper()
 	fp := &fakePool{stats: pool.Stats{Hot: 3, Warm: 2}}
-	s := New(
+	s, err := New(
 		Config{HTTPAddr: "ignored", SharedSecret: secret},
 		func() pool.Manager { return fp },
 		nil, // provisioner unused in these tests
@@ -99,6 +99,7 @@ func newTestServer(t *testing.T, secret string) (*Server, *fakePool) {
 		nil, // drain callback unused
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	require.NoError(t, err)
 	return s, fp
 }
 
@@ -293,7 +294,7 @@ func TestLeaderGate_NonLeaderForwardsBeforeAuth(t *testing.T) {
 			w.WriteHeader(http.StatusTeapot) // distinctive marker
 		},
 	}
-	s := New(
+	s, err := New(
 		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
 		func() pool.Manager { return fp },
 		nil,
@@ -301,6 +302,7 @@ func TestLeaderGate_NonLeaderForwardsBeforeAuth(t *testing.T) {
 		nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	require.NoError(t, err)
 	h := chiHandler(s)
 
 	// No Authorization header — a leader would 401, but the standby
@@ -328,7 +330,7 @@ func TestLeaderGate_LeaderServesLocally(t *testing.T) {
 			t.Fatal("Forward must not be called when IsLeader returns true")
 		},
 	}
-	s := New(
+	s, err := New(
 		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
 		func() pool.Manager { return fp },
 		nil,
@@ -336,6 +338,7 @@ func TestLeaderGate_LeaderServesLocally(t *testing.T) {
 		nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	require.NoError(t, err)
 	h := chiHandler(s)
 
 	w := httptest.NewRecorder()
@@ -351,7 +354,7 @@ func TestLeaderGate_LeaderServesLocally(t *testing.T) {
 // Retry-After rather than crash with a nil-deref.
 func TestLeaderGate_LeaderWithoutPoolReturns503(t *testing.T) {
 	t.Parallel()
-	s := New(
+	s, err := New(
 		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
 		func() pool.Manager { return nil },
 		nil,
@@ -359,6 +362,7 @@ func TestLeaderGate_LeaderWithoutPoolReturns503(t *testing.T) {
 		nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	require.NoError(t, err)
 	h := chiHandler(s)
 
 	w := httptest.NewRecorder()
@@ -465,7 +469,7 @@ func TestDrain_TriggersCallback(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{}
 	drained := make(chan struct{}, 1)
-	s := New(
+	s, err := New(
 		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
 		func() pool.Manager { return fp },
 		nil,
@@ -473,6 +477,7 @@ func TestDrain_TriggersCallback(t *testing.T) {
 		func() { drained <- struct{}{} },
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	require.NoError(t, err)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/drain", nil)
@@ -499,11 +504,33 @@ func TestDrain_NoCallbackReturns501(t *testing.T) {
 func TestServe_NoAddrIsNoOp(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{}
-	s := New(Config{HTTPAddr: ""}, func() pool.Manager { return fp }, nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err := New(Config{HTTPAddr: ""}, func() pool.Manager { return fp }, nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := s.Serve(ctx)
-	require.NoError(t, err)
+	require.NoError(t, s.Serve(ctx))
+}
+
+// TestNew_RejectsMalformedTrustedProxyCIDR pins the fail-loud behaviour
+// of New: a TrustedProxies entry that fails netip.ParsePrefix must
+// surface an error at startup instead of being silently dropped, so any
+// future drift between the config validator and the consumer doesn't
+// degrade the admin API's IP-trust boundary in production.
+func TestNew_RejectsMalformedTrustedProxyCIDR(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{}
+	s, err := New(
+		Config{TrustedProxies: []string{"10.0.0.0/8", "192.168.0.0./24", "127.0.0.0/8"}},
+		func() pool.Manager { return fp },
+		nil,
+		AlwaysLeader{},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	require.Error(t, err)
+	require.Nil(t, s)
+	require.Contains(t, err.Error(), "trusted_proxies[1]")
+	require.Contains(t, err.Error(), "192.168.0.0./24")
 }
 
 // newTestServerTrustedProxies is like newTestServer but populates the
@@ -512,7 +539,7 @@ func TestServe_NoAddrIsNoOp(t *testing.T) {
 func newTestServerTrustedProxies(t *testing.T, secret string, trusted []string) (*Server, *fakePool) {
 	t.Helper()
 	fp := &fakePool{stats: pool.Stats{Hot: 3, Warm: 2}}
-	s := New(
+	s, err := New(
 		Config{HTTPAddr: "ignored", SharedSecret: secret, TrustedProxies: trusted},
 		func() pool.Manager { return fp },
 		nil,
@@ -520,6 +547,7 @@ func newTestServerTrustedProxies(t *testing.T, secret string, trusted []string) 
 		nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	require.NoError(t, err)
 	return s, fp
 }
 
@@ -613,7 +641,7 @@ func TestServe_TLS_RoundTripsBearer(t *testing.T) {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 
-	s := New(
+	s, err := New(
 		Config{
 			HTTPAddr:     addr,
 			SharedSecret: "topsecret",
@@ -627,6 +655,7 @@ func TestServe_TLS_RoundTripsBearer(t *testing.T) {
 		nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -731,8 +760,9 @@ func TestPreempt_QueuesPreemptionAndIncrementsMetric(t *testing.T) {
 	fp := &fakePool{}
 	registry := prometheus.NewRegistry()
 	metrics := observability.NewMetrics(registry)
-	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
+	s, err := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
 		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	require.NoError(t, err)
 	s.SetMetrics(metrics)
 	h := preemptHandler(s)
 
@@ -751,8 +781,9 @@ func TestPreempt_QueuesPreemptionAndIncrementsMetric(t *testing.T) {
 func TestPreempt_RefusedReturnsConflict(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{preemptErr: pool.ErrPreemptRefused}
-	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
+	s, err := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
 		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	require.NoError(t, err)
 	h := preemptHandler(s)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/12345", nil)
@@ -766,8 +797,9 @@ func TestPreempt_RefusedReturnsConflict(t *testing.T) {
 func TestPreempt_InvalidVMID(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{}
-	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
+	s, err := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
 		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	require.NoError(t, err)
 	h := preemptHandler(s)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/not-a-number", nil)
@@ -780,8 +812,9 @@ func TestPreempt_InvalidVMID(t *testing.T) {
 
 func TestPreempt_NoLeaderReturns503(t *testing.T) {
 	t.Parallel()
-	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return nil },
+	s, err := New(Config{SharedSecret: "tk"}, func() pool.Manager { return nil },
 		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	require.NoError(t, err)
 	h := preemptHandler(s)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/12345", nil)
