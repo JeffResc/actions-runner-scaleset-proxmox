@@ -798,15 +798,21 @@ func TestReconcile_PoisonHonorsPerProfileBootMaxAttempts(t *testing.T) {
 
 	// The boot will fail (waitErr) and bump BootAttempts to 4 — still
 	// below gpu's per-profile threshold of 5, so the row must land in
-	// Destroying (queued for re-clone), NOT Poison.
+	// Destroying and the destroy goroutine must reach the provisioner,
+	// NOT short-circuit to Poison. Asserting on fp.destroys (rather than
+	// re-fetching the row) is race-free against the destroy completing
+	// and removing the row from the store before the assertion runs.
 	require.Eventually(t, func() bool {
-		row, err := st.Get(11500)
-		return err == nil && row.State != store.StateWarm
-	}, 2*time.Second, 10*time.Millisecond)
-	row, err := st.Get(11500)
-	require.NoError(t, err)
-	require.NotEqual(t, store.StatePoison, row.State,
-		"per-profile BootMaxAttempts=5 must not poison at BootAttempts=4")
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		for _, vmid := range fp.destroys {
+			if vmid == 11500 {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond,
+		"per-profile BootMaxAttempts=5 must destroy (not poison) at BootAttempts=4")
 }
 
 // TestAdopt_PoweredOff_BecomesWarm: a stopped owner-tagged VM is adopted
