@@ -865,7 +865,6 @@ func (m *manager) Run(ctx context.Context) error {
 		defer close(pollerDone)
 		m.runPowerPoll(ctx)
 	}()
-	defer func() { <-pollerDone }()
 
 	// Per-profile reconcile loops. Each profile's reconcile is
 	// independent — one profile's saturated clone budget doesn't
@@ -887,8 +886,18 @@ func (m *manager) Run(ctx context.Context) error {
 	}()
 
 	<-ctx.Done()
-	m.drain()
+	// CRITICAL: wait for the producers of destroyAsync (power
+	// poller + profile reconcile loops) to fully exit BEFORE
+	// entering drain(). Both can call m.wg.Add(1) from their
+	// in-flight iteration after ctx.Done() fires; if drain()'s
+	// internal wg.Wait() observes wg=0 in that window and then a
+	// late Add(1) lands, sync.WaitGroup panics with
+	// "WaitGroup is reused before previous Wait has returned" — and
+	// even when it doesn't panic the race detector flags it
+	// (Add after Wait hit zero is undefined per sync docs).
+	<-pollerDone
 	<-loopsDone
+	m.drain()
 	return nil
 }
 
