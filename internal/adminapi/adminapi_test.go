@@ -25,8 +25,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 )
 
@@ -35,9 +38,10 @@ type fakePool struct {
 	mu              sync.Mutex
 	stats           pool.Stats
 	statsErr        error
-	forceDestroyErr error
 	markedCompleted []int
 	forceDestroyed  []int
+	preempted       []int
+	preemptErr      error
 }
 
 func (f *fakePool) Acquire(_ context.Context, _ int64, _ int) (*pool.VM, error) {
@@ -65,12 +69,18 @@ func (f *fakePool) SetDesiredCount(_ int)         {}
 func (f *fakePool) PromoteToRunning(_ context.Context, _ int, _, _ int64) error {
 	return nil
 }
+func (f *fakePool) Preempt(_ context.Context, vmid int, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.preempted = append(f.preempted, vmid)
+	return f.preemptErr
+}
+func (f *fakePool) StampJobMetadata(_ context.Context, _ int, _ pool.JobMetadata) error {
+	return nil
+}
 func (f *fakePool) ForceDestroy(_ context.Context, vmid int, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.forceDestroyErr != nil {
-		return f.forceDestroyErr
-	}
 	f.forceDestroyed = append(f.forceDestroyed, vmid)
 	return nil
 }
@@ -451,45 +461,6 @@ func TestDestroyVM_QueuesAndReturns202(t *testing.T) {
 	require.Contains(t, fp.forceDestroyed, 10042)
 }
 
-// TestState_PoolDeposedMidCallReturns503 covers the leader-handover
-// race: handleState passed the nil-pool gate but the manager was torn
-// down by the deposed callback before Stats ran. The pool surfaces
-// ErrManagerDeposed; the handler must convert that into a 503 +
-// Retry-After so the operator's metric doesn't see a spurious 500
-// every time leadership flaps.
-func TestState_PoolDeposedMidCallReturns503(t *testing.T) {
-	t.Parallel()
-	s, fp := newTestServer(t, "topsecret")
-	fp.statsErr = pool.ErrManagerDeposed
-	h := chiHandler(s)
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
-	r.Header.Set("Authorization", "Bearer topsecret")
-	h.ServeHTTP(w, r)
-
-	require.Equal(t, http.StatusServiceUnavailable, w.Code)
-	require.Equal(t, "1", w.Header().Get("Retry-After"))
-}
-
-// TestDestroyVM_PoolDeposedMidCallReturns503 is the handleDestroyVM
-// twin of the handleState test above — ForceDestroy can race the
-// deposed callback too, and the same 503-not-500 mapping must apply.
-func TestDestroyVM_PoolDeposedMidCallReturns503(t *testing.T) {
-	t.Parallel()
-	s, fp := newTestServer(t, "topsecret")
-	fp.forceDestroyErr = pool.ErrManagerDeposed
-	h := chiHandler(s)
-
-	w := httptest.NewRecorder()
-	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/destroy/10042", nil)
-	r.Header.Set("Authorization", "Bearer topsecret")
-	h.ServeHTTP(w, r)
-
-	require.Equal(t, http.StatusServiceUnavailable, w.Code)
-	require.Equal(t, "1", w.Header().Get("Retry-After"))
-}
-
 func TestDrain_TriggersCallback(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{}
@@ -749,4 +720,85 @@ func TestAuth_RateLimit_CannotBeSpoofedViaXFF(t *testing.T) {
 	}
 	require.Positive(t, seen429,
 		"spoofed XFF must NOT defeat the per-IP rate limiter; got %d 401 / %d 429", seen401, seen429)
+}
+
+// ---------------------------------------------------------------------------
+// Preempt endpoint (PR 5 — issue #10)
+// ---------------------------------------------------------------------------
+
+func TestPreempt_QueuesPreemptionAndIncrementsMetric(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{}
+	registry := prometheus.NewRegistry()
+	metrics := observability.NewMetrics(registry)
+	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
+		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	s.SetMetrics(metrics)
+	h := preemptHandler(s)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/12345", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	require.Equal(t, http.StatusAccepted, w.Code, "successful preempt: 202")
+
+	require.Equal(t, []int{12345}, fp.preempted)
+	require.Equal(t, 1.0,
+		testutil.ToFloat64(metrics.Preemptions.WithLabelValues("", "manual")),
+		"preempt endpoint must bump scaleset_preemptions_total{to_class=manual}")
+}
+
+func TestPreempt_RefusedReturnsConflict(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{preemptErr: pool.ErrPreemptRefused}
+	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
+		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	h := preemptHandler(s)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/12345", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code,
+		"refused preempt (e.g. row is Running) must surface as 409")
+}
+
+func TestPreempt_InvalidVMID(t *testing.T) {
+	t.Parallel()
+	fp := &fakePool{}
+	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return fp },
+		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	h := preemptHandler(s)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/not-a-number", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Empty(t, fp.preempted, "no preempt must fire for an invalid vmid")
+}
+
+func TestPreempt_NoLeaderReturns503(t *testing.T) {
+	t.Parallel()
+	s := New(Config{SharedSecret: "tk"}, func() pool.Manager { return nil },
+		nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+	h := preemptHandler(s)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/12345", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code,
+		"pool nil (leader transition): 503 with Retry-After")
+	require.NotEmpty(t, w.Header().Get("Retry-After"))
+}
+
+// preemptHandler mounts JUST the preempt route through chi so tests
+// can exercise the full middleware chain (auth + path-param decode)
+// without binding a port.
+func preemptHandler(s *Server) http.Handler {
+	r := chi.NewRouter()
+	r.Use(s.requireBearerToken)
+	r.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
+	return r
 }

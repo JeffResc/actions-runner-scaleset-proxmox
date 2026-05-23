@@ -952,6 +952,147 @@ func TestProfiles_BootMaxAttemptsZeroRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "must be >= 1")
 }
 
+// ---------------------------------------------------------------------------
+// Quotas + Priority parsing/validation tests (PR 5 — issues #4 + #10)
+// ---------------------------------------------------------------------------
+
+func TestQuotas_ParsedFromYAML(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	withQuotas := validPATYAML + `
+quotas:
+  default_per_repo: 5
+  default_per_org: 20
+  overrides:
+    - match: { repo: "acme/heavy-ci" }
+      max_concurrent: 15
+    - match: { org: "acme-platform" }
+      max_concurrent: 30
+`
+	cfg, err := config.Parse([]byte(withQuotas))
+	require.NoError(t, err)
+	require.Equal(t, 5, cfg.Quotas.DefaultPerRepo)
+	require.Equal(t, 20, cfg.Quotas.DefaultPerOrg)
+	require.Len(t, cfg.Quotas.Overrides, 2)
+	require.Equal(t, "acme/heavy-ci", cfg.Quotas.Overrides[0].Match.Repo)
+	require.Equal(t, 15, cfg.Quotas.Overrides[0].MaxConcurrent)
+	require.Equal(t, "acme-platform", cfg.Quotas.Overrides[1].Match.Org)
+	require.Equal(t, 30, cfg.Quotas.Overrides[1].MaxConcurrent)
+}
+
+func TestQuotas_RejectsAmbiguousOverride(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := validPATYAML + `
+quotas:
+  overrides:
+    - match: { org: "acme", repo: "acme/platform" }
+      max_concurrent: 5
+`
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exactly one of org or repo")
+}
+
+func TestQuotas_RejectsBothEmptyOverride(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := validPATYAML + `
+quotas:
+  overrides:
+    - match: {}
+      max_concurrent: 5
+`
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exactly one of org or repo")
+}
+
+func TestQuotas_RejectsNegativeDefaults(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := validPATYAML + `
+quotas:
+  default_per_repo: -1
+`
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+}
+
+func TestPriority_ParsedFromYAML(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	withPriority := validPATYAML + `
+priority:
+  classes:
+    - name: critical
+      match: { workflow_label: "priority:critical" }
+      weight: 100
+      preempt: true
+    - name: standard
+      weight: 10
+    - name: best_effort
+      match: { repo: "acme/research" }
+      weight: 1
+`
+	cfg, err := config.Parse([]byte(withPriority))
+	require.NoError(t, err)
+	require.Len(t, cfg.Priority.Classes, 3)
+
+	critical := cfg.Priority.Classes[0]
+	require.Equal(t, "critical", critical.Name)
+	require.Equal(t, "priority:critical", critical.Match.WorkflowLabel)
+	require.Equal(t, 100, critical.Weight)
+	require.True(t, critical.Preempt)
+
+	require.Equal(t, "standard", cfg.Priority.Classes[1].Name)
+	require.False(t, cfg.Priority.Classes[1].Preempt, "preempt defaults to false")
+
+	require.Equal(t, "acme/research", cfg.Priority.Classes[2].Match.Repo)
+}
+
+func TestPriority_RejectsEmptyName(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := validPATYAML + `
+priority:
+  classes:
+    - weight: 100
+`
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+}
+
+func TestPriority_RejectsDuplicateName(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := validPATYAML + `
+priority:
+  classes:
+    - name: critical
+      weight: 100
+    - name: critical
+      weight: 50
+`
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate")
+}
+
 // writeSelfSignedKeypair generates a fresh self-signed cert + key on
 // disk and returns their paths. The cert is valid for "localhost" only
 // — enough for our admin-API tests, which dial loopback.

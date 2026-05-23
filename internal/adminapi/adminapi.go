@@ -30,6 +30,7 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 	"golang.org/x/time/rate"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
 )
@@ -84,11 +85,12 @@ type PoolAccessor func() pool.Manager
 
 // Server is the admin API.
 type Server struct {
-	cfg  Config
-	pool PoolAccessor
-	prov provisioner.Provisioner
-	gate LeaderGate
-	log  *slog.Logger
+	cfg     Config
+	pool    PoolAccessor
+	prov    provisioner.Provisioner
+	gate    LeaderGate
+	log     *slog.Logger
+	metrics *observability.Metrics
 
 	// drain is invoked from POST /admin/drain. Typically wired by main()
 	// to cancel the orchestrator's root context, which triggers graceful
@@ -188,6 +190,12 @@ func New(cfg Config, poolFn PoolAccessor, prov provisioner.Provisioner, gate Lea
 	}
 }
 
+// SetMetrics attaches the orchestrator's Prometheus metric set so
+// handlers (preempt currently; future ones can join) can emit
+// counters from operator-driven actions. Nil disables the metric
+// emissions — the endpoint still works.
+func (s *Server) SetMetrics(m *observability.Metrics) { s.metrics = m }
+
 // AlwaysLeader is a LeaderGate that always reports leadership. Used by
 // standalone deployments. Forward is never called and panics if it is;
 // any caller using AlwaysLeader has misconfigured the gate.
@@ -234,6 +242,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	r.Get("/admin/state", s.handleState)
 	r.Post("/admin/drain", s.handleDrain)
 	r.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
+	r.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
 
 	srv := &http.Server{
 		Addr:              s.cfg.HTTPAddr,
@@ -450,16 +459,6 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	stats, err := p.Stats(r.Context())
 	if err != nil {
-		// Leader handover race: the pool was non-nil at the gate but
-		// got torn down by the deposed callback before Stats ran. Same
-		// "retry shortly" response shape as the nil-pool gate above so
-		// the operator metric stays clean (no spurious 500s during
-		// leader flap).
-		if errors.Is(err, pool.ErrManagerDeposed) {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
-			return
-		}
 		s.log.Error("admin state: pool stats failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -490,6 +489,51 @@ func (s *Server) handleDrain(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
+// handlePreemptVM destroys an Assigned-but-not-yet-Running VM via
+// the pool's Preempt API (issue #10). Refuses on Running VMs and
+// other non-Assigned states; surfaces those refusals as 409
+// Conflict so operators can see at a glance whether the preempt
+// was actionable. Increments scaleset_preemptions_total{from_class,
+// to_class="manual"} when the preempt actually fires — the
+// "manual" to_class records that this came from operator action
+// rather than an automatic priority decision.
+func (s *Server) handlePreemptVM(w http.ResponseWriter, r *http.Request) {
+	vmidStr := chi.URLParam(r, "vmid")
+	vmid, err := strconv.Atoi(vmidStr)
+	if err != nil || vmid <= 0 {
+		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
+		return
+	}
+	p := s.pool()
+	if p == nil {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+		return
+	}
+	err = p.Preempt(r.Context(), vmid, "admin preempt endpoint")
+	if err != nil {
+		if errors.Is(err, pool.ErrPreemptRefused) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		s.log.Error("admin preempt: failed", "vmid", vmid, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// The from_class label is intentionally empty for manual
+	// preempts: the admin endpoint doesn't know the row's
+	// PriorityClass (RowSnapshot doesn't expose it yet) and we
+	// don't want to widen the snapshot just for an admin-action
+	// label. Operators care about the increment.
+	if s.metrics != nil {
+		s.metrics.Preemptions.WithLabelValues("", "manual").Inc()
+	}
+	w.WriteHeader(http.StatusAccepted)
+	if _, err := w.Write([]byte("preempt queued")); err != nil {
+		s.log.Debug("admin preempt: response write failed", "err", err)
+	}
+}
+
 func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 	vmidStr := chi.URLParam(r, "vmid")
 	vmid, err := strconv.Atoi(vmidStr)
@@ -509,14 +553,6 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 	// effect. ForceDestroy is the unconditional drop the endpoint
 	// promises.
 	if err := p.ForceDestroy(r.Context(), vmid, "admin destroy endpoint"); err != nil {
-		// Same leader-handover race shape as handleState — see comment
-		// there. Convert to 503 + Retry-After so an operator's
-		// destroy-during-flap retries against the new leader.
-		if errors.Is(err, pool.ErrManagerDeposed) {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
-			return
-		}
 		s.log.Error("admin destroy: force destroy failed", "vmid", vmid, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

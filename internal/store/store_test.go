@@ -857,3 +857,114 @@ func TestAcquireHotInProfile_PerProfileMaxBusyClamps(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrAtCapacity,
 		"per-profile maxBusy must reject second gpu acquire even though x64 sibling has its own busy VM")
 }
+
+// ---------------------------------------------------------------------------
+// Org / Repo / PriorityClass indexes (PR 5)
+// ---------------------------------------------------------------------------
+
+func TestCountByOrg_ScopesByExactOrg(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 1, Node: "pve1", Name: "a",
+		Org: "acme", Repo: "acme/platform",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 2, Node: "pve1", Name: "b",
+		Org: "acme", Repo: "acme/heavy",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 3, Node: "pve1", Name: "c",
+		Org: "other", Repo: "other/x",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	// Hot/pre-job-pairing row with no metadata — must NOT appear
+	// under any org/repo bucket.
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 4, Node: "pve1", Name: "d",
+		PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+
+	n, err := s.CountByOrg("acme")
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	n, err = s.CountByOrg("other")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	// Empty arg is treated as "skip" (not a bucket).
+	n, err = s.CountByOrg("")
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+}
+
+func TestCountByRepo_ScopesByExactRepo(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 1, Node: "pve1", Name: "a",
+		Org: "acme", Repo: "acme/platform",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 2, Node: "pve1", Name: "b",
+		Org: "acme", Repo: "acme/platform",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 3, Node: "pve1", Name: "c",
+		Org: "acme", Repo: "acme/heavy",
+		PoolKind: store.PoolKindHot, State: store.StateRunning,
+	}))
+
+	n, err := s.CountByRepo("acme/platform")
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	n, err = s.CountByRepo("acme/heavy")
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	n, err = s.CountByRepo("acme/missing")
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+}
+
+func TestListByPriorityClass(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 1, Node: "pve1", Name: "a",
+		PriorityClass: "critical",
+		PoolKind:      store.PoolKindHot, State: store.StateRunning,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 2, Node: "pve1", Name: "b",
+		PriorityClass: "standard",
+		PoolKind:      store.PoolKindHot, State: store.StateAssigned,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 3, Node: "pve1", Name: "c",
+		PriorityClass: "critical",
+		PoolKind:      store.PoolKindHot, State: store.StateAssigned,
+	}))
+
+	crit, err := s.ListByPriorityClass("critical")
+	require.NoError(t, err)
+	require.Len(t, crit, 2)
+
+	std, err := s.ListByPriorityClass("standard")
+	require.NoError(t, err)
+	require.Len(t, std, 1)
+	require.Equal(t, 2, std[0].VMID)
+
+	missing, err := s.ListByPriorityClass("nonexistent")
+	require.NoError(t, err)
+	require.Empty(t, missing)
+}

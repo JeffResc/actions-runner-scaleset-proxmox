@@ -32,6 +32,11 @@ import (
 // "default" profile from the global Pool + Proxmox blocks so the
 // orchestrator's profile-aware internals don't have to special-case the
 // single-profile config shape.
+//
+// Quotas and Priority are optional multi-tenancy controls. Both
+// default to "disabled" — the orchestrator records per-job
+// metadata but does not throttle or re-order based on it. See the
+// quotas / priority subpackages for the routing semantics.
 type Config struct {
 	GitHub        GitHubConfig        `yaml:"github" validate:"required"`
 	ScaleSet      ScaleSetConfig      `yaml:"scaleset" validate:"required"`
@@ -39,9 +44,72 @@ type Config struct {
 	Nodes         NodesConfig         `yaml:"nodes" validate:"required"`
 	Pool          PoolConfig          `yaml:"pool" validate:"required"`
 	Profiles      []ProfileConfig     `yaml:"profiles"`
+	Quotas        QuotasConfig        `yaml:"quotas"`
+	Priority      PriorityConfig      `yaml:"priority"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	AdminAPI      AdminAPIConfig      `yaml:"admin_api"`
 	Cluster       ClusterConfig       `yaml:"cluster"`
+}
+
+// QuotasConfig caps per-org / per-repo concurrent VMs. The actual
+// resolution lives in internal/quotas; this block is just the YAML
+// surface.
+type QuotasConfig struct {
+	// DefaultPerRepo applies to jobs whose repo has no override.
+	// 0 disables the default. The cap is per-repo: a fleet with
+	// four busy repos can have 4 × DefaultPerRepo VMs in flight
+	// (still capped by the global MaxConcurrentRunners).
+	DefaultPerRepo int `yaml:"default_per_repo" validate:"gte=0"`
+
+	// DefaultPerOrg is the same idea, applied when the job has
+	// only an org (the listener payload carries both for repo-
+	// scoped jobs).
+	DefaultPerOrg int `yaml:"default_per_org" validate:"gte=0"`
+
+	// Overrides are exact matches. Exactly one of Match.Org or
+	// Match.Repo must be set per entry; this is validated by
+	// internal/quotas at startup.
+	Overrides []QuotaOverride `yaml:"overrides"`
+}
+
+// QuotaOverride scopes a cap to one org or one owner/repo.
+type QuotaOverride struct {
+	Match         QuotaMatch `yaml:"match"`
+	MaxConcurrent int        `yaml:"max_concurrent" validate:"gte=0"`
+}
+
+// QuotaMatch is the override selector. Exactly one of Org or Repo
+// must be set.
+type QuotaMatch struct {
+	Org  string `yaml:"org,omitempty"`
+	Repo string `yaml:"repo,omitempty"`
+}
+
+// PriorityConfig declares the priority classes the scaler uses to
+// classify incoming jobs. See internal/priority for the matching
+// semantics. The block is optional — when absent every job falls
+// into the synthetic "default" class with weight 0 and
+// preempt=false.
+type PriorityConfig struct {
+	Classes []PriorityClassConfig `yaml:"classes"`
+}
+
+// PriorityClassConfig is one operator-declared class.
+type PriorityClassConfig struct {
+	Name    string              `yaml:"name" validate:"required"`
+	Match   PriorityMatchConfig `yaml:"match"`
+	Weight  int                 `yaml:"weight"`
+	Preempt bool                `yaml:"preempt"`
+}
+
+// PriorityMatchConfig is the class's selector. All non-empty
+// fields must equal their corresponding job field for the class
+// to match. An empty selector means "match everything" — useful
+// for declaring a default class.
+type PriorityMatchConfig struct {
+	WorkflowLabel string `yaml:"workflow_label,omitempty"`
+	Repo          string `yaml:"repo,omitempty"`
+	Org           string `yaml:"org,omitempty"`
 }
 
 // GitHubConfig configures GitHub authentication, scope, and the
@@ -874,6 +942,43 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateProfiles(); err != nil {
 		return err
+	}
+	if err := c.validateQuotas(); err != nil {
+		return err
+	}
+	if err := c.validatePriority(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateQuotas enforces the exactly-one-of-org-or-repo rule on
+// overrides. Detailed semantics live in internal/quotas; the check
+// is duplicated here so a malformed config fails at Load time with
+// a stable error message instead of later at app startup.
+func (c *Config) validateQuotas() error {
+	for i, o := range c.Quotas.Overrides {
+		hasOrg, hasRepo := o.Match.Org != "", o.Match.Repo != ""
+		if hasOrg == hasRepo {
+			return fmt.Errorf("quotas.overrides[%d].match: set exactly one of org or repo", i)
+		}
+	}
+	return nil
+}
+
+// validatePriority enforces non-empty, unique class names. The
+// upstream priority.Matcher enforces the same rules at New() time;
+// catching them here is operator-experience polish.
+func (c *Config) validatePriority() error {
+	seen := make(map[string]int, len(c.Priority.Classes))
+	for i, cl := range c.Priority.Classes {
+		if cl.Name == "" {
+			return fmt.Errorf("priority.classes[%d].name is required", i)
+		}
+		if prev, dup := seen[cl.Name]; dup {
+			return fmt.Errorf("priority.classes: duplicate class name %q at indexes %d and %d", cl.Name, prev, i)
+		}
+		seen[cl.Name] = i
 	}
 	return nil
 }

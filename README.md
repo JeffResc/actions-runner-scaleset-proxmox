@@ -24,6 +24,16 @@ A scale set can declare one or more **profiles** — named bundles of `{labels, 
 
 Job-to-profile routing is _best-match by labels_: a profile satisfies a job when its labels are a superset of the job's `RequestLabels`, and the profile with the smallest extra-label count wins (ties resolve by declaration order). When no profile satisfies a job, `scaleset_unrouted_jobs_total{labels="..."}` increments so operators can spot the coverage gap. Config validation rejects scale sets whose declared labels aren't collectively covered by some profile — that misconfiguration is caught at load time rather than per-job at runtime.
 
+## Multi-tenancy: quotas + priority
+
+Optional `quotas:` and `priority:` blocks cap concurrent VMs per org or per repo, and classify jobs into priority lanes for visibility. Both are **observational today** — the `actions/scaleset` listener interface surfaces per-job metadata (`OwnerName`, `RepositoryName`, `RequestLabels`, `JobWorkflowRef`) only AFTER GitHub has paired a job with a VM, so at-acquire-time admission control needs a deeper listener-integration extension (deferred to a future PR). What ships today:
+
+- **Stamping**: when `JobStarted` fires the scaler records the job's `Org`/`Repo`/`PriorityClass` on the VM row.
+- **Counters**: `scaleset_quota_throttled_total{scope, name}` fires when a stamped row pushes its (org or repo) bucket past the configured cap; `scaleset_priority_acquires_total{class}` partitions every JobStarted by its class.
+- **Manual preempt**: `POST /admin/preempt/{vmid}` destroys an Assigned-but-not-yet-Running VM via the pool's safety-gated `Preempt` API. Running VMs are refused (HTTP 409) — preempting an actively-executing job is the destructive behaviour the orchestrator explicitly promises never to do. `scaleset_preemptions_total{from_class, to_class}` records each successful preempt.
+
+See `quotas:` and `priority:` in [config.example.yaml](config.example.yaml) for the YAML surface.
+
 ## Components
 
 | Package | Purpose |
@@ -58,6 +68,7 @@ Optional escape-hatch HTTP API enabled by setting `admin_api.http_addr` and `adm
 | --- | --- | --- |
 | `GET` | `/admin/state` | Current pool stats (counts per lifecycle state) |
 | `POST` | `/admin/drain` | Trigger a graceful drain (bounded by `pool.drain_timeout`) |
+| `POST` | `/admin/preempt/{vmid}` | Preempt an Assigned VM (refuses Running; 409 when not preempt-eligible) |
 | `POST` | `/admin/destroy/{vmid}` | Force-destroy a specific VM regardless of its state |
 
 In Kubernetes multi-replica deployments the admin API is bound on every replica. Non-leader replicas reverse-proxy requests to the leader (whose endpoint is published in a Lease annotation), so callers don't need to know which pod holds the lease.

@@ -209,6 +209,62 @@ func (s *Store) StatsByProfile(profile string) (map[State]int, error) {
 	return out, nil
 }
 
+// CountByOrg returns the number of rows whose Org equals org. Empty
+// org always returns 0 — the org index uses AllowMissing so unset
+// rows aren't indexed under the empty key. Used by the quota
+// enforcement path.
+func (s *Store) CountByOrg(org string) (int, error) {
+	if org == "" {
+		return 0, nil
+	}
+	txn := s.db.Txn(false)
+	defer txn.Abort()
+	it, err := txn.Get(tableVM, "org", org)
+	if err != nil {
+		return 0, fmt.Errorf("store: count org %s: %w", org, err)
+	}
+	n := 0
+	for raw := it.Next(); raw != nil; raw = it.Next() {
+		n++
+	}
+	return n, nil
+}
+
+// CountByRepo returns the number of rows whose Repo equals repo
+// (expected in "owner/repo" form). Empty repo always returns 0.
+func (s *Store) CountByRepo(repo string) (int, error) {
+	if repo == "" {
+		return 0, nil
+	}
+	txn := s.db.Txn(false)
+	defer txn.Abort()
+	it, err := txn.Get(tableVM, "repo", repo)
+	if err != nil {
+		return 0, fmt.Errorf("store: count repo %s: %w", repo, err)
+	}
+	n := 0
+	for raw := it.Next(); raw != nil; raw = it.Next() {
+		n++
+	}
+	return n, nil
+}
+
+// ListByPriorityClass returns every row whose PriorityClass equals
+// class. Empty class returns nil — the index uses AllowMissing so
+// unset rows are excluded. Used by the preemption admin path.
+func (s *Store) ListByPriorityClass(class string) ([]*VM, error) {
+	if class == "" {
+		return nil, nil
+	}
+	txn := s.db.Txn(false)
+	defer txn.Abort()
+	it, err := txn.Get(tableVM, "priority_class", class)
+	if err != nil {
+		return nil, fmt.Errorf("store: list priority_class %s: %w", class, err)
+	}
+	return collect(it), nil
+}
+
 // ListByProfileAndStates returns every row in the given profile whose
 // state is one of `states`. Used by the per-profile reconciler's
 // shrink-to-floor and recycle paths.

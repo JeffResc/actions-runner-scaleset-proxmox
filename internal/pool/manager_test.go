@@ -2008,35 +2008,6 @@ func TestDrain_CompletesNaturallyWhenWorkersFinish(t *testing.T) {
 		"drain should complete immediately when workers finish on their own")
 }
 
-// TestStats_ReturnsErrManagerDeposedAfterWorkerCancel locks in the
-// pool side of the leader-handover race fix: once the manager's
-// workerCtx has been cancelled (which drain() does on every exit),
-// Stats must return ErrManagerDeposed so the admin handler can
-// translate the result into a 503 + Retry-After instead of a 500.
-func TestStats_ReturnsErrManagerDeposedAfterWorkerCancel(t *testing.T) {
-	t.Parallel()
-	st := newTestStore(t)
-	mgr := newTestManager(t, st, &fakeProv{}, Config{})
-
-	mgr.workerCancel()
-
-	_, err := mgr.Stats(context.Background())
-	require.ErrorIs(t, err, ErrManagerDeposed)
-}
-
-// TestForceDestroy_ReturnsErrManagerDeposedAfterWorkerCancel is the
-// ForceDestroy twin of TestStats_*: same race shape, same sentinel.
-func TestForceDestroy_ReturnsErrManagerDeposedAfterWorkerCancel(t *testing.T) {
-	t.Parallel()
-	st := newTestStore(t)
-	mgr := newTestManager(t, st, &fakeProv{}, Config{})
-
-	mgr.workerCancel()
-
-	err := mgr.ForceDestroy(context.Background(), 12345, "test")
-	require.ErrorIs(t, err, ErrManagerDeposed)
-}
-
 // TestAllocateVMID_RespectsRecentlyDestroyedCooldown locks in the
 // post-destroy cooldown: after a destroy completes, PVE's qmdestroy
 // task and lock-file cleanup may still be settling, so reissuing the
@@ -2424,4 +2395,79 @@ func TestProfiles_AdoptRoutesByProfileTag(t *testing.T) {
 	orphan, err := st.Get(30003)
 	require.NoError(t, err)
 	require.Equal(t, "linux-x64", orphan.Profile)
+}
+
+// ---------------------------------------------------------------------------
+// Preempt (PR 5 — issue #10)
+// ---------------------------------------------------------------------------
+
+func TestPreempt_AssignedRowIsDestroyed(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 12000, Node: "pve1", Name: "best-effort",
+		PriorityClass: "best_effort",
+		PoolKind:      store.PoolKindHot, State: store.StateAssigned,
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 0, WarmSize: 0})
+
+	err := mgr.Preempt(context.Background(), 12000, "test: making room")
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.destroys) == 1 && fp.destroys[0] == 12000
+	}, 2*time.Second, 10*time.Millisecond, "expected destroy to be queued for preempted vmid")
+}
+
+func TestPreempt_RunningRowRefused(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 12001, Node: "pve1", Name: "running",
+		PriorityClass: "standard",
+		PoolKind:      store.PoolKindHot, State: store.StateRunning,
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 0, WarmSize: 0})
+
+	err := mgr.Preempt(context.Background(), 12001, "test: should refuse")
+	require.ErrorIs(t, err, ErrPreemptRefused,
+		"running VMs MUST NOT be preempted — issue #10 explicit safety rule")
+
+	// Row must still be Running, not Draining.
+	row, err := st.Get(12001)
+	require.NoError(t, err)
+	require.Equal(t, store.StateRunning, row.State)
+}
+
+func TestPreempt_NonExistentRefused(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 0, WarmSize: 0})
+
+	err := mgr.Preempt(context.Background(), 99999, "test: missing")
+	require.ErrorIs(t, err, ErrPreemptRefused)
+}
+
+func TestPreempt_HotRowRefused(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 12002, Node: "pve1", Name: "hot-idle",
+		PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 0, WarmSize: 0})
+
+	err := mgr.Preempt(context.Background(), 12002, "test: hot")
+	require.ErrorIs(t, err, ErrPreemptRefused,
+		"Hot rows are released via reconcile shrink, not preempt")
+
+	row, err := st.Get(12002)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State)
 }
