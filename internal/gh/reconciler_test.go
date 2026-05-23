@@ -573,8 +573,9 @@ func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T
 // the full http.Client timeout (~60s), multiplied per orphan
 // candidate.
 func TestCleanupOrphanRunners_PerCallTimeout(t *testing.T) {
-	t.Parallel()
-
+	// Mutates the package-level cleanupTimeoutPerRunner, which other
+	// cleanupOrphanRunners tests read — keep this test serial so
+	// -race doesn't flag the unsynchronised var.
 	// Shrink the per-call cap so the test doesn't sit on the real 10s.
 	orig := cleanupTimeoutPerRunner
 	cleanupTimeoutPerRunner = 100 * time.Millisecond
