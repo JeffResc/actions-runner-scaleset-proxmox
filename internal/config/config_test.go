@@ -880,6 +880,41 @@ func TestProfiles_HotPlusWarmExceedsMaxRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "hot_size+warm_size")
 }
 
+func TestProfiles_VMMaxAgeZeroRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	// gpu profile sets vm_max_age: 6h; flip it to 0s.
+	bad := strings.Replace(validProfileYAML, "vm_max_age: 6h", `vm_max_age: "0s"`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "vm_max_age must be positive")
+	require.Contains(t, err.Error(), "gpu")
+}
+
+func TestProfiles_VMMaxAgeNegativeRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML, "vm_max_age: 6h", `vm_max_age: "-5m"`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "vm_max_age must be positive")
+}
+
+func TestProfiles_VMMaxAgePositiveAccepted(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	ok := strings.Replace(validProfileYAML, "vm_max_age: 6h", "vm_max_age: 30m", 1)
+	cfg, err := config.Parse([]byte(ok))
+	require.NoError(t, err)
+	require.Equal(t, 30*time.Minute, cfg.Profiles[1].VMMaxAgeD)
+}
+
 // writeSelfSignedKeypair generates a fresh self-signed cert + key on
 // disk and returns their paths. The cert is valid for "localhost" only
 // — enough for our admin-API tests, which dial loopback.
