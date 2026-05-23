@@ -173,6 +173,17 @@ func New(cfg Config, gh *github.Client, p pool.Manager, prov provisioner.Provisi
 // (before its DB row landed) gets a second tick to be matched.
 const orphanGrace = 30 * time.Second
 
+// cleanupTimeoutPerRunner caps an individual GitHub Actions
+// RemoveRunner call. A GitHub-side outage previously stalled the
+// reconcile tick for the full http.Client timeout (~60s) per orphan
+// candidate, multiplied across the orphan set. With a per-call
+// timeout the slow runner is logged + skipped and the tick keeps
+// moving — the next tick retries.
+//
+// var (not const) so the regression test can dial it down to a few
+// hundred milliseconds without holding CI hostage for 10 seconds.
+var cleanupTimeoutPerRunner = 10 * time.Second
+
 // Run drives ticks until ctx is cancelled. Returns ctx.Err() on shutdown.
 //
 // On consecutive tick failures the next-tick delay doubles up to
@@ -459,13 +470,15 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 		}
 		r.log.Info("reconcile: orphan github runner; removing",
 			"name", name, "runner_id", gr.ID, "orphan_age", now.Sub(firstSeen))
+		rmCtx, cancel := context.WithTimeout(ctx, cleanupTimeoutPerRunner)
 		var err error
 		if r.cfg.Scope.Org != "" {
-			_, err = r.gh.Actions.RemoveOrganizationRunner(ctx, r.cfg.Scope.Org, gr.ID)
+			_, err = r.gh.Actions.RemoveOrganizationRunner(rmCtx, r.cfg.Scope.Org, gr.ID)
 		} else {
 			owner, repo := splitRepo(r.cfg.Scope.Repo)
-			_, err = r.gh.Actions.RemoveRunner(ctx, owner, repo, gr.ID)
+			_, err = r.gh.Actions.RemoveRunner(rmCtx, owner, repo, gr.ID)
 		}
+		cancel()
 		if err != nil {
 			r.log.Warn("reconcile: orphan runner removal failed", "name", name, "err", err)
 			if r.metrics != nil {
