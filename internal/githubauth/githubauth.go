@@ -208,6 +208,12 @@ func NewApp(clientID string, installationID int64, privateKeyPEM []byte) (Auth, 
 // Refuses to read a key file with world- or group-readable permissions
 // (any bit in 0o077) — the operator's deployment is misconfigured if
 // a private key is accessible by other users on the box.
+//
+// Also refuses (on unix) when the PEM is owned by a UID other than the
+// process's effective UID. mode 0600 alone is insufficient when the
+// orchestrator runs as root (or with CAP_DAC_READ_SEARCH): a key
+// dropped in by another user with mode 0600 would otherwise be
+// silently trusted.
 func NewAppFromFile(clientID string, installationID int64, pemPath string) (Auth, error) {
 	if pemPath == "" {
 		return nil, errors.New("githubauth: pem path is required")
@@ -219,6 +225,9 @@ func NewAppFromFile(clientID string, installationID int64, pemPath string) (Auth
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return nil, fmt.Errorf("githubauth: private key %s has insecure mode %#o; expected 0600 (chmod 600 the file)",
 			pemPath, mode)
+	}
+	if err := checkPEMOwnership(info, pemPath); err != nil {
+		return nil, err
 	}
 	pem, err := os.ReadFile(pemPath) // #nosec G304 -- pemPath is operator-supplied and perm-checked above.
 	if err != nil {
