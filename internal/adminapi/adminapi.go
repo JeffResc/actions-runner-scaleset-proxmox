@@ -10,6 +10,7 @@
 package adminapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -483,11 +484,23 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	// Encode to a buffer FIRST so a serialisation failure surfaces as
+	// a clean 500 instead of a truncated 200 (issue #147 follow-up).
+	// Only set Content-Type + write headers once we know we have a
+	// complete payload to ship.
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(stateResponse{Pool: stats}); err != nil {
+		s.log.Error("admin state: response encode failed", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(stateResponse{Pool: stats}); err != nil {
-		// Headers already sent so we can't surface the error, but logging
-		// it helps forensics if an operator reports a truncated response.
-		s.log.Debug("admin state: response encode failed", "err", err)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		// Post-header write failure on a read-only endpoint — log at
+		// Info (still survives default log levels) so an operator can
+		// spot truncated responses on flaky links.
+		s.log.Info("admin state: response write failed",
+			"endpoint", "GET /admin/state", "remote_addr", r.RemoteAddr, "err", err)
 	}
 }
 
@@ -496,7 +509,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 // root errgroup context, which fires the pool's gracefulDrain path. The
 // response returns immediately (202) — the actual shutdown unwinds
 // asynchronously and is bounded by pool.drain_timeout.
-func (s *Server) handleDrain(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	if s.drain == nil {
 		http.Error(w, "drain endpoint not wired (send SIGTERM to the process instead)", http.StatusNotImplemented)
 		return
@@ -505,7 +518,14 @@ func (s *Server) handleDrain(w http.ResponseWriter, _ *http.Request) {
 	go s.drain()
 	w.WriteHeader(http.StatusAccepted)
 	if _, err := w.Write([]byte("draining")); err != nil {
-		s.log.Debug("admin drain: response write failed", "err", err)
+		// State-changing endpoint: the 202 body is the operator's
+		// only confirmation the request landed. A broken-pipe or
+		// write-timeout HERE is a real operational signal — the
+		// operator's tooling may show "no response" while a drain
+		// IS in flight. Warn so the line survives production log
+		// levels (issue #147).
+		s.log.Warn("admin drain: response write failed",
+			"endpoint", "POST /admin/drain", "remote_addr", r.RemoteAddr, "err", err)
 	}
 }
 
@@ -550,7 +570,10 @@ func (s *Server) handlePreemptVM(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusAccepted)
 	if _, err := w.Write([]byte("preempt queued")); err != nil {
-		s.log.Debug("admin preempt: response write failed", "err", err)
+		// State-changing endpoint: see comment in handleDrain.
+		s.log.Warn("admin preempt: response write failed",
+			"endpoint", "POST /admin/preempt/{vmid}", "vmid", vmid,
+			"remote_addr", r.RemoteAddr, "err", err)
 	}
 }
 
@@ -579,6 +602,9 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusAccepted)
 	if _, err := w.Write([]byte("queued for destruction")); err != nil {
-		s.log.Debug("admin destroy: response write failed", "err", err)
+		// State-changing endpoint: see comment in handleDrain.
+		s.log.Warn("admin destroy: response write failed",
+			"endpoint", "POST /admin/destroy/{vmid}", "vmid", vmid,
+			"remote_addr", r.RemoteAddr, "err", err)
 	}
 }
