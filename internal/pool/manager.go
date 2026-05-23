@@ -208,6 +208,17 @@ type manager struct {
 	// fleet-wide aggregate; per-profile demand split is owed by the
 	// caller (PR 2 / #7 — label routing).
 	desiredCount atomic.Int32
+
+	// powerPollErrLastLog tracks, per-VMID, when we last emitted a
+	// Debug line for a PowerState query failure. Used by powerPollOnce
+	// to throttle the per-VM error log to at most one line per VMID
+	// per powerPollErrLogInterval — without this, a flapping Proxmox
+	// endpoint produces one Debug line per VM per tick (for fleets
+	// where Booting/WaitingReady is a sizeable share of the population,
+	// that's thousands of identical lines per minute that drown out
+	// the real signal). Only the power-poll goroutine touches this
+	// map, so no synchronisation is needed.
+	powerPollErrLastLog map[int]time.Time
 }
 
 // normaliseProfiles returns the profile slice the manager will
@@ -310,21 +321,22 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 	// either observed clean completion or hit DrainTimeout.
 	wctx, wcancel := context.WithCancel(context.Background())
 	m := &manager{
-		cfg:          cfg,
-		store:        st,
-		prov:         prov,
-		sel:          sel,
-		log:          log,
-		metrics:      metrics,
-		refill:       make(chan struct{}, 1),
-		cloneSem:     semaphore.NewWeighted(maxConcurrentClones),
-		destroySem:   semaphore.NewWeighted(maxConcurrentDestroys),
-		bootSem:      semaphore.NewWeighted(maxConcurrentBoots),
-		workerCtx:    wctx,
-		workerCancel: wcancel,
-		destroyQueue: make(chan destroyRequest, destroyQueueCap),
-		profiles:     make(map[string]*profileState, len(cfg.Profiles)),
-		profileOrder: make([]string, 0, len(cfg.Profiles)),
+		cfg:                 cfg,
+		store:               st,
+		prov:                prov,
+		sel:                 sel,
+		log:                 log,
+		metrics:             metrics,
+		refill:              make(chan struct{}, 1),
+		cloneSem:            semaphore.NewWeighted(maxConcurrentClones),
+		destroySem:          semaphore.NewWeighted(maxConcurrentDestroys),
+		bootSem:             semaphore.NewWeighted(maxConcurrentBoots),
+		workerCtx:           wctx,
+		workerCancel:        wcancel,
+		destroyQueue:        make(chan destroyRequest, destroyQueueCap),
+		profiles:            make(map[string]*profileState, len(cfg.Profiles)),
+		profileOrder:        make([]string, 0, len(cfg.Profiles)),
+		powerPollErrLastLog: make(map[int]time.Time),
 	}
 	for _, p := range cfg.Profiles {
 		m.profiles[p.Name] = &profileState{
@@ -1066,6 +1078,16 @@ func (m *manager) runPowerPoll(ctx context.Context) {
 // Tests may override this.
 var powerPollTimeoutPerVM = 5 * time.Second
 
+// powerPollErrLogInterval is the minimum wall-clock gap between two
+// Debug log lines for the same VMID's PowerState query failure. A
+// flapping Proxmox endpoint would otherwise produce one line per VM
+// per tick — at HotSize=50 and PowerPollInterval=3s that's 1000
+// identical lines per minute. With a 30s gap the same flap surfaces
+// twice per minute per VM, which is enough to diagnose without
+// drowning the log stream. Variable so tests can compress the
+// interval.
+var powerPollErrLogInterval = 30 * time.Second
+
 // adoptPowerStateTimeoutPerVM caps how long Adopt's per-VM PowerState
 // query may block during leader-plane startup. A bit looser than
 // powerPollTimeoutPerVM since adopt is a one-off cost paid before the
@@ -1084,14 +1106,26 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 		m.log.Warn("power-poll: list rows failed", "err", err)
 		return
 	}
+	now := time.Now()
+	seen := make(map[int]struct{}, len(rows))
+	suppressed := 0
 	for _, row := range rows {
+		seen[row.VMID] = struct{}{}
 		vmCtx, cancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
 		state, err := m.prov.PowerState(vmCtx, &provisioner.VM{
 			VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile,
 		})
 		cancel()
 		if err != nil {
-			m.log.Debug("power-poll: query failed; will retry", "vmid", row.VMID, "err", err)
+			// Per-VMID rate-limited Debug. A flapping Proxmox endpoint
+			// would otherwise emit one line per VM per tick — see the
+			// powerPollErrLogInterval doc for the rationale.
+			if last, ok := m.powerPollErrLastLog[row.VMID]; !ok || now.Sub(last) >= powerPollErrLogInterval {
+				m.log.Debug("power-poll: query failed; will retry", "vmid", row.VMID, "err", err)
+				m.powerPollErrLastLog[row.VMID] = now
+			} else {
+				suppressed++
+			}
 			continue
 		}
 		// Empty string means "unknown" (VM not found). Skip — the
@@ -1107,6 +1141,20 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 			"vmid", row.VMID, "state", state, "db_state", row.State)
 		if err := m.MarkCompleted(ctx, row.VMID); err != nil {
 			m.log.Warn("power-poll: mark completed failed", "vmid", row.VMID, "err", err)
+		}
+	}
+	// One summary line per tick when the per-VMID throttle swallowed
+	// any errors. Keeps observability that a flap is in progress
+	// without the per-VM line storm.
+	if suppressed > 0 {
+		m.log.Debug("power-poll: suppressed repeated error logs", "count", suppressed)
+	}
+	// Prune entries whose VMID is no longer in the poll set so the
+	// map can't grow unboundedly as VMIDs are recycled. Touched only
+	// by this goroutine, so no synchronisation needed.
+	for vmid := range m.powerPollErrLastLog {
+		if _, ok := seen[vmid]; !ok {
+			delete(m.powerPollErrLastLog, vmid)
 		}
 	}
 }
