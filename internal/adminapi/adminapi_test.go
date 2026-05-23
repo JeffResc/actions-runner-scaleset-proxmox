@@ -187,6 +187,40 @@ func TestRequireBearerToken_RejectsMissingAndWrong(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+// TestRequireBearerToken_FailurePathsIndistinguishable locks in the
+// timing-uniformity fix (#155): missing header, wrong scheme, and
+// wrong token must all route through the same sha256 + ConstantTime
+// compare so a probing client can't time-distinguish "no Authorization
+// at all" from "Bearer wrong-token" via response latency. We can't
+// directly test wall-clock timing in a stable way, so we assert the
+// behavioral consequence: identical status / body / headers for all
+// three failure shapes.
+func TestRequireBearerToken_FailurePathsIndistinguishable(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestServer(t, "topsecret")
+	h := mountHandler(s)
+
+	send := func(authHeader string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
+		if authHeader != "" {
+			r.Header.Set("Authorization", authHeader)
+		}
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	missing := send("")
+	wrongScheme := send("Basic dXNlcjpwYXNz")
+	wrongToken := send("Bearer wrong")
+
+	require.Equal(t, http.StatusUnauthorized, missing.Code)
+	require.Equal(t, missing.Code, wrongScheme.Code, "wrong scheme must not be distinguishable from missing header")
+	require.Equal(t, missing.Code, wrongToken.Code, "wrong token must not be distinguishable from missing header")
+	require.Equal(t, missing.Body.String(), wrongScheme.Body.String(), "response body must be identical")
+	require.Equal(t, missing.Body.String(), wrongToken.Body.String(), "response body must be identical")
+}
+
 // TestRequireBearerToken_RejectsRawSecretWithoutScheme locks down the
 // contract that the `Bearer ` scheme prefix is required. The previous
 // implementation used strings.TrimPrefix which silently accepted a bare

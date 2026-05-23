@@ -442,12 +442,19 @@ func (s *Server) requireBearerToken(next http.Handler) http.Handler {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Compute gotHash on every request — including missing-header
+		// and wrong-scheme cases — so a probing client can't time-
+		// distinguish "no Authorization at all" from "Bearer wrong-
+		// token". When the scheme is absent we feed an empty token
+		// through sha256 so the work done is identical to the
+		// wrong-token path; the result still mismatches wantHash and
+		// the request lands in denyUnauthorized.
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, scheme) {
-			denyUnauthorized(w, r)
-			return
+		var token string
+		if strings.HasPrefix(auth, scheme) {
+			token = auth[len(scheme):]
 		}
-		gotHash := sha256.Sum256([]byte(auth[len(scheme):]))
+		gotHash := sha256.Sum256([]byte(token))
 		if subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) != 1 {
 			denyUnauthorized(w, r)
 			return
