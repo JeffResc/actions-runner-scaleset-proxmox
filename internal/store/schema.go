@@ -52,10 +52,16 @@ var AllStates = []State{
 // JobID and RunnerID are int64 with 0 meaning "unset" rather than *int64.
 // VMIDs and GitHub IDs are positive integers, so the sentinel is unambiguous
 // and the indexer doesn't have to deal with nilable pointers.
+//
+// Profile names the runner profile this VM belongs to. Empty / unset is
+// treated as the default profile by upstream code; the store does not
+// rewrite the value so it round-trips faithfully even when older rows
+// without a profile field are adopted.
 type VM struct {
 	VMID         int
 	Node         string
 	Name         string
+	Profile      string
 	PoolKind     PoolKind
 	State        State
 	JobID        int64
@@ -87,6 +93,10 @@ const tableVM = "vm"
 //   - "pool_kind_state" compound on (PoolKind, State) — drives the
 //     countByPoolKind helper the reconciler uses to compute hot/warm
 //     provisioning headroom.
+//   - "profile" on Profile — lets a profile-aware reconcile loop list
+//     just the rows belonging to its profile without a full scan.
+//   - "profile_state" compound on (Profile, State) — drives per-profile
+//     stats / count helpers the multi-profile reconciler depends on.
 //
 // Other fields (JobID, RunnerID, timestamps) aren't indexed — the table
 // is bounded by max_concurrent_runners (tens to low hundreds of rows) so
@@ -111,6 +121,19 @@ func schema() *memdb.DBSchema {
 						Indexer: &memdb.CompoundIndex{
 							Indexes: []memdb.Indexer{
 								&memdb.StringFieldIndex{Field: "PoolKind"},
+								&memdb.StringFieldIndex{Field: "State"},
+							},
+						},
+					},
+					"profile": {
+						Name:    "profile",
+						Indexer: &memdb.StringFieldIndex{Field: "Profile"},
+					},
+					"profile_state": {
+						Name: "profile_state",
+						Indexer: &memdb.CompoundIndex{
+							Indexes: []memdb.Indexer{
+								&memdb.StringFieldIndex{Field: "Profile"},
 								&memdb.StringFieldIndex{Field: "State"},
 							},
 						},

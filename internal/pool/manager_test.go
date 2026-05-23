@@ -269,6 +269,7 @@ func seedHot(t *testing.T, st *store.Store, count int) {
 			VMID:     20000 + i,
 			Node:     "pve1",
 			Name:     "seed-hot",
+			Profile:  defaultProfileName,
 			PoolKind: store.PoolKindHot,
 			State:    store.StateHot,
 		})
@@ -283,6 +284,7 @@ func seedWarm(t *testing.T, st *store.Store, count int) {
 			VMID:     30000 + i,
 			Node:     "pve1",
 			Name:     "seed-warm",
+			Profile:  defaultProfileName,
 			PoolKind: store.PoolKindWarm,
 			State:    store.StateWarm,
 		})
@@ -583,7 +585,7 @@ func TestPromoteN_SaturatedBootSemLeavesRowsWarm(t *testing.T) {
 		"test setup: must be able to drain the entire bootSem budget")
 	defer mgr.bootSem.Release(16)
 
-	mgr.promoteN(context.Background(), 3)
+	mgr.promoteN(context.Background(), "", 3)
 
 	// No goroutines were spawned, so nothing to wait for.
 	for vmid := 30000; vmid < 30003; vmid++ {
@@ -1562,7 +1564,7 @@ func TestRunClone_PanicReportsAllocatedVMID(t *testing.T) {
 	// Trigger a single clone goroutine. The panic happens inside Clone,
 	// which is called AFTER allocateVMID — so the log line should
 	// reference the allocated id, not 0.
-	mgr.kickClone(context.Background(), store.PoolKindHot, true)
+	mgr.kickClone(context.Background(), "", store.PoolKindHot, true)
 
 	require.Eventually(t, func() bool {
 		logMu.Lock()
@@ -1609,7 +1611,7 @@ func TestRunClone_DeletesOrphanWhenRowVanished(t *testing.T) {
 	require.NoError(t, err)
 	mgr := mi.(*manager)
 
-	mgr.kickClone(context.Background(), store.PoolKindHot, true)
+	mgr.kickClone(context.Background(), "", store.PoolKindHot, true)
 
 	require.Eventually(t, func() bool {
 		fp.mu.Lock()
@@ -2150,4 +2152,140 @@ func TestReconcileOnce_DoesNotOverProvisionWhenClonesInFlight(t *testing.T) {
 	defer fp.mu.Unlock()
 	require.Empty(t, fp.clones,
 		"reconcileOnce must NOT dispatch new clones when prov.InFlightCloneCount() == HotSize — that's the previous tick's work coming through; got %d", len(fp.clones))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-profile tests (PR 1 — issues #2 + #3)
+// ---------------------------------------------------------------------------
+
+func TestProfiles_PerProfileReconcileClonesOnlyToProfileTarget(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+
+	mgr := newTestManager(t, st, fp, Config{
+		MaxConcurrentRunners: 20,
+		Profiles: []ProfileSettings{
+			{Name: "linux-x64", HotSize: 3, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 3},
+			{Name: "gpu", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 2, BootMaxAttempts: 3, CPUCores: 8, MemoryMB: 32768, TemplateVMID: 9100},
+		},
+	})
+
+	// Each profile's reconcile should dispatch only the clones needed
+	// for its own hot target. linux-x64 wants 3 hot, gpu wants 1.
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.clones) == 4
+	}, 2*time.Second, 10*time.Millisecond, "expected 3 x64 + 1 gpu clone")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	byProfile := map[string]int{}
+	for _, c := range fp.clones {
+		byProfile[c.Profile]++
+		if c.Profile == "gpu" {
+			require.Equal(t, 8, c.CPUCores, "gpu profile must propagate cpu override")
+			require.Equal(t, 32768, c.MemoryMB)
+			require.Equal(t, 9100, c.TemplateVMID)
+		}
+	}
+	require.Equal(t, 3, byProfile["linux-x64"])
+	require.Equal(t, 1, byProfile["gpu"])
+}
+
+func TestProfiles_AcquireForProfileScopesByName(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	// Seed one Hot VM per profile so we can verify scoping.
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 20000, Node: "pve1", Name: "x64",
+		Profile: "linux-x64", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 20100, Node: "pve2", Name: "gpu",
+		Profile: "gpu", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		MaxConcurrentRunners: 20,
+		Profiles: []ProfileSettings{
+			{Name: "linux-x64", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 3},
+			{Name: "gpu", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 2, BootMaxAttempts: 3},
+		},
+	})
+
+	got, err := mgr.AcquireForProfile(context.Background(), 4242, "gpu", 0)
+	require.NoError(t, err)
+	require.Equal(t, 20100, got.VMID)
+	require.Equal(t, "gpu", got.Profile)
+
+	// linux-x64 row still Hot.
+	x64, err := st.Get(20000)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, x64.State)
+}
+
+func TestProfiles_AcquireForProfileRejectsUnknown(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		MaxConcurrentRunners: 20,
+		Profiles: []ProfileSettings{
+			{Name: "linux-x64", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 3},
+		},
+	})
+	_, err := mgr.AcquireForProfile(context.Background(), 4242, "no-such-profile", 0)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown profile")
+}
+
+func TestProfiles_AdoptRoutesByProfileTag(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	// Provisioner reports two VMs with explicit profile tags.
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 30001, Node: "pve1", Name: "gh-runner-x64-1", Profile: "linux-x64"},
+			{VMID: 30002, Node: "pve2", Name: "gh-runner-gpu-1", Profile: "gpu"},
+			// A third VM with an UNKNOWN profile — Adopt should route
+			// it to the default and log a warning, NOT drop it.
+			{VMID: 30003, Node: "pve1", Name: "gh-runner-orphan-1", Profile: "retired-profile"},
+		},
+		powerStateBy: map[int]string{
+			30001: "stopped", // → Warm
+			30002: "running", // → Hot
+			30003: "running", // → Hot
+		},
+	}
+
+	mgr := newTestManager(t, st, fp, Config{
+		MaxConcurrentRunners: 20,
+		Profiles: []ProfileSettings{
+			{Name: "linux-x64", HotSize: 0, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 3},
+			{Name: "gpu", HotSize: 0, WarmSize: 0, MaxConcurrentRunners: 2, BootMaxAttempts: 3},
+		},
+	})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	x64, err := st.Get(30001)
+	require.NoError(t, err)
+	require.Equal(t, "linux-x64", x64.Profile)
+	require.Equal(t, store.StateWarm, x64.State)
+
+	gpu, err := st.Get(30002)
+	require.NoError(t, err)
+	require.Equal(t, "gpu", gpu.Profile)
+	require.Equal(t, store.StateHot, gpu.State)
+
+	// Unknown profile falls back to the manager's default (first
+	// declared) profile — linux-x64 here.
+	orphan, err := st.Get(30003)
+	require.NoError(t, err)
+	require.Equal(t, "linux-x64", orphan.Profile)
 }

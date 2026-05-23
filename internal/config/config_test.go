@@ -719,6 +719,167 @@ func TestTLSConfig_BuildServerAndClient(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// Profile parsing / validation tests (PR 1 — issues #2 + #3)
+// ---------------------------------------------------------------------------
+
+const validProfileYAML = `
+github:
+  auth_mode: pat
+  pat:
+    token_env: TEST_GH_TOKEN
+  scope:
+    org: my-org
+
+scaleset:
+  name: proxmox-ubuntu-x64
+  labels: [self-hosted, linux, proxmox]
+  max_concurrent_runners: 30
+
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  auth:
+    token_id: scaleset@pve!automation
+    token_secret_env: TEST_PVE_TOKEN
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage:  { disk: local-lvm, snippets: local }
+  network:  { bridge: vmbr0 }
+  clone:    { linked: true }
+
+nodes:
+  strategy: single
+  single_node: pve1
+
+pool:
+  hot_size: 2
+  warm_size: 3
+  global_max: 30
+  reconcile_interval: 5s
+  vm_max_age: 12h
+  drain_timeout: 15m
+  boot_max_attempts: 3
+
+profiles:
+  - name: linux-x64
+    labels: [self-hosted, linux, x64]
+    template_vmid: 9001
+    cpu: 4
+    memory_mb: 8192
+    hot_size: 5
+    warm_size: 10
+    max_concurrent_runners: 20
+  - name: gpu
+    labels: [self-hosted, linux, gpu]
+    template_vmid: 9100
+    cpu: 8
+    memory_mb: 32768
+    hot_size: 0
+    warm_size: 1
+    max_concurrent_runners: 4
+    vm_max_age: 6h
+`
+
+func TestProfiles_NoBlockSynthesizesDefault(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+
+	// The single-profile back-compat path must materialise one profile
+	// inheriting the global pool/scaleset values.
+	require.Len(t, cfg.Profiles, 1)
+	p := cfg.Profiles[0]
+	require.Equal(t, "default", p.Name)
+	require.Equal(t, cfg.Pool.HotSize, p.HotSizeOrDefault(0))
+	require.Equal(t, cfg.Pool.WarmSize, p.WarmSizeOrDefault(0))
+	require.Equal(t, cfg.ScaleSet.MaxConcurrentRunners, p.MaxConcurrentRunnersOrDefault(0))
+	require.Equal(t, cfg.Pool.BootMaxAttempts, p.BootMaxAttemptsOrDefault(0))
+	require.Equal(t, cfg.ScaleSet.Labels, p.Labels)
+}
+
+func TestProfiles_ExplicitBlockParses(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	cfg, err := config.Parse([]byte(validProfileYAML))
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Profiles, 2)
+	x64 := cfg.Profiles[0]
+	require.Equal(t, "linux-x64", x64.Name)
+	require.Equal(t, []string{"self-hosted", "linux", "x64"}, x64.Labels)
+	require.Equal(t, 9001, x64.TemplateVMID)
+	require.Equal(t, 4, x64.CPUCores)
+	require.Equal(t, 8192, x64.MemoryMB)
+	require.Equal(t, 5, x64.HotSizeOrDefault(-1))
+	require.Equal(t, 10, x64.WarmSizeOrDefault(-1))
+	require.Equal(t, 20, x64.MaxConcurrentRunnersOrDefault(-1))
+	// Inherited from global pool (omitted on profile).
+	require.Equal(t, cfg.Pool.BootMaxAttempts, x64.BootMaxAttemptsOrDefault(0))
+	require.Equal(t, cfg.Pool.VMMaxAge, x64.VMMaxAge)
+
+	gpu := cfg.Profiles[1]
+	require.Equal(t, "gpu", gpu.Name)
+	// Explicit 0 stays 0 — not overwritten by the global default of 2.
+	require.Equal(t, 0, gpu.HotSizeOrDefault(99))
+	require.Equal(t, 1, gpu.WarmSizeOrDefault(99))
+	// Per-profile override takes precedence over global pool.vm_max_age.
+	require.Equal(t, "6h", gpu.VMMaxAge)
+	require.Equal(t, 6*time.Hour, gpu.VMMaxAgeD)
+}
+
+func TestProfiles_GlobalMaxRejectsOversum(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	// linux-x64.max + gpu.max = 20 + 4 = 24; tightening global_max
+	// below that must fail at validation time.
+	oversum := strings.Replace(validProfileYAML, "global_max: 30", "global_max: 10", 1)
+	_, err := config.Parse([]byte(oversum))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "global_max")
+}
+
+func TestProfiles_DuplicateNameRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	dup := strings.Replace(validProfileYAML, "name: gpu", "name: linux-x64", 1)
+	_, err := config.Parse([]byte(dup))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate name")
+}
+
+func TestProfiles_InvalidNameRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML, "name: gpu", `name: "GPU 1"`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must match")
+}
+
+func TestProfiles_HotPlusWarmExceedsMaxRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	// linux-x64 hot=5 warm=10; lower its max to 12.
+	bad := strings.Replace(validProfileYAML,
+		"max_concurrent_runners: 20", "max_concurrent_runners: 12", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "hot_size+warm_size")
+}
+
 // writeSelfSignedKeypair generates a fresh self-signed cert + key on
 // disk and returns their paths. The cert is valid for "localhost" only
 // — enough for our admin-API tests, which dial loopback.

@@ -148,6 +148,79 @@ func (s *Store) CountByPoolKindState(kind PoolKind, state State) (int, error) {
 	return n, nil
 }
 
+// ListByProfile returns every row whose Profile matches the given name.
+// Used by the per-profile reconcile loop to scope its work without a
+// full scan. An empty profile string matches rows whose Profile is also
+// empty (typically pre-profiles rows during adoption).
+func (s *Store) ListByProfile(profile string) ([]*VM, error) {
+	txn := s.db.Txn(false)
+	defer txn.Abort()
+	it, err := txn.Get(tableVM, "profile", profile)
+	if err != nil {
+		return nil, fmt.Errorf("store: list profile %s: %w", profile, err)
+	}
+	return collect(it), nil
+}
+
+// CountByProfileState returns the number of rows in the given (profile,
+// state) tuple. Backed by the compound index. Used by the per-profile
+// reconciler to compute hot/warm/busy populations without scanning rows
+// from other profiles.
+func (s *Store) CountByProfileState(profile string, state State) (int, error) {
+	txn := s.db.Txn(false)
+	defer txn.Abort()
+	it, err := txn.Get(tableVM, "profile_state", profile, string(state))
+	if err != nil {
+		return 0, fmt.Errorf("store: count %s/%s: %w", profile, state, err)
+	}
+	n := 0
+	for raw := it.Next(); raw != nil; raw = it.Next() {
+		n++
+	}
+	return n, nil
+}
+
+// StatsByProfile returns one count per State for rows scoped to the
+// given profile, in a single read transaction so all values share a
+// consistent snapshot.
+func (s *Store) StatsByProfile(profile string) (map[State]int, error) {
+	txn := s.db.Txn(false)
+	defer txn.Abort()
+	out := make(map[State]int, len(AllStates))
+	for _, st := range AllStates {
+		it, err := txn.Get(tableVM, "profile_state", profile, string(st))
+		if err != nil {
+			return nil, fmt.Errorf("store: stats-by-profile %s/%s: %w", profile, st, err)
+		}
+		n := 0
+		for raw := it.Next(); raw != nil; raw = it.Next() {
+			n++
+		}
+		out[st] = n
+	}
+	return out, nil
+}
+
+// ListByProfileAndStates returns every row in the given profile whose
+// state is one of `states`. Used by the per-profile reconciler's
+// shrink-to-floor and recycle paths.
+func (s *Store) ListByProfileAndStates(profile string, states ...State) ([]*VM, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	txn := s.db.Txn(false)
+	defer txn.Abort()
+	var out []*VM
+	for _, st := range states {
+		it, err := txn.Get(tableVM, "profile_state", profile, string(st))
+		if err != nil {
+			return nil, fmt.Errorf("store: list profile-state %s/%s: %w", profile, st, err)
+		}
+		out = append(out, collect(it)...)
+	}
+	return out, nil
+}
+
 // Stats returns one count per State in a single read transaction so all
 // nine values share a consistent snapshot.
 func (s *Store) Stats() (map[State]int, error) {
@@ -188,8 +261,16 @@ func (s *Store) UsedVMIDs(minID, maxID int) (map[int]struct{}, error) {
 // Writes
 // ---------------------------------------------------------------------------
 
-// Insert creates a new row. Fails if the VMID is already present. Stamps
-// CreatedAt / UpdatedAt / StateSince to now() if unset.
+// DefaultProfileName is the synthetic profile name applied to rows
+// that don't carry an explicit Profile at insert time. Matches
+// tags.DefaultProfile; duplicated here so this package stays free of
+// the tags import.
+const DefaultProfileName = "default"
+
+// Insert creates a new row. Fails if the VMID is already present.
+// Stamps CreatedAt / UpdatedAt / StateSince to now() if unset, and
+// stamps Profile to DefaultProfileName if unset — the indexes refuse
+// empty strings, so every row must have a non-empty Profile.
 func (s *Store) Insert(v *VM) error {
 	if v.VMID <= 0 {
 		return fmt.Errorf("store: insert: vmid must be positive (got %d)", v.VMID)
@@ -213,6 +294,9 @@ func (s *Store) Insert(v *VM) error {
 	}
 	if row.StateSince.IsZero() {
 		row.StateSince = now
+	}
+	if row.Profile == "" {
+		row.Profile = DefaultProfileName
 	}
 	if err := txn.Insert(tableVM, row); err != nil {
 		return fmt.Errorf("store: insert %d: %w", v.VMID, err)
@@ -318,17 +402,24 @@ func (s *Store) UpdateState(vmid int, from, to State, mutate func(*VM)) (bool, e
 	return true, nil
 }
 
-// AcquireHot atomically claims the oldest Hot VM by transitioning it to
-// Assigned, but only if total busy (Assigned + Running) is strictly less
-// than maxConcurrent and (when maxBusy > 0) also strictly less than
-// maxBusy. Returns ErrAtCapacity if either cap would be exceeded or
-// ErrNoneAvailable if no Hot rows exist.
+// AcquireHot atomically claims the oldest Hot VM (across all profiles)
+// by transitioning it to Assigned. Equivalent to AcquireHotInProfile
+// with profile="" — the per-call clamp uses the orchestrator-wide busy
+// count. Kept for callers that don't care about profile scoping.
+func (s *Store) AcquireHot(jobID int64, maxConcurrent, maxBusy int) (*VM, error) {
+	return s.AcquireHotInProfile("", jobID, maxConcurrent, maxBusy)
+}
+
+// AcquireHotInProfile atomically claims the oldest Hot VM in the given
+// profile by transitioning it to Assigned, but only if the
+// orchestrator-wide busy count (Assigned + Running) is strictly less
+// than maxConcurrent and (when maxBusy > 0) the PER-PROFILE busy count
+// is strictly less than maxBusy.
 //
-// maxBusy is a per-call cap layered on top of the orchestrator-wide
-// maxConcurrent ceiling: callers that already know how many runners
-// they're prepared to satisfy in this burst pass it to clamp inside
-// the same transaction. Pass 0 (or any non-positive value) to disable
-// the per-call clamp.
+// Returns ErrAtCapacity if either cap would be exceeded or
+// ErrNoneAvailable if no Hot rows exist in the requested profile. An
+// empty profile string disables the profile filter (acquires from any
+// profile and uses the global busy count for maxBusy).
 //
 // The cap check and the CAS happen inside the same write transaction so
 // concurrent Acquire callers cannot all see "busy < cap" against the
@@ -337,32 +428,56 @@ func (s *Store) UpdateState(vmid int, from, to State, mutate func(*VM)) (bool, e
 //
 // Oldest-Hot-first selection is preserved (closest to vm_max_age recycle
 // goes first).
-func (s *Store) AcquireHot(jobID int64, maxConcurrent, maxBusy int) (*VM, error) {
+func (s *Store) AcquireHotInProfile(profile string, jobID int64, maxConcurrent, maxBusy int) (*VM, error) {
 	txn := s.db.Txn(true)
 	defer txn.Abort()
 
-	// Count busy inside the txn for snapshot consistency. We can't use
-	// the read-only Stats helper here — it opens its own transaction.
-	busy := 0
+	// Orchestrator-wide busy count — caps fleet-wide concurrent runners
+	// across every profile.
+	globalBusy := 0
 	for _, st := range []State{StateAssigned, StateRunning} {
 		it, err := txn.Get(tableVM, "state", string(st))
 		if err != nil {
 			return nil, fmt.Errorf("store: acquire: count %s: %w", st, err)
 		}
 		for raw := it.Next(); raw != nil; raw = it.Next() {
-			busy++
+			globalBusy++
 		}
 	}
-	if busy >= maxConcurrent {
+	if globalBusy >= maxConcurrent {
 		return nil, ErrAtCapacity
 	}
-	if maxBusy > 0 && busy >= maxBusy {
-		return nil, ErrAtCapacity
+	// Per-profile busy count — caps how many concurrent runners a
+	// single profile can hold. When profile is empty we re-use the
+	// global busy count.
+	if maxBusy > 0 {
+		busy := globalBusy
+		if profile != "" {
+			busy = 0
+			for _, st := range []State{StateAssigned, StateRunning} {
+				it, err := txn.Get(tableVM, "profile_state", profile, string(st))
+				if err != nil {
+					return nil, fmt.Errorf("store: acquire: count %s/%s: %w", profile, st, err)
+				}
+				for raw := it.Next(); raw != nil; raw = it.Next() {
+					busy++
+				}
+			}
+		}
+		if busy >= maxBusy {
+			return nil, ErrAtCapacity
+		}
 	}
 
 	// Pick the oldest Hot row by CreatedAt — same policy the manager
 	// applied previously, just inside the same txn now.
-	it, err := txn.Get(tableVM, "state", string(StateHot))
+	var it memdb.ResultIterator
+	var err error
+	if profile == "" {
+		it, err = txn.Get(tableVM, "state", string(StateHot))
+	} else {
+		it, err = txn.Get(tableVM, "profile_state", profile, string(StateHot))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store: acquire: list hot: %w", err)
 	}

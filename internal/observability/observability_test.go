@@ -64,11 +64,11 @@ func TestNewMetrics_RegistersAll(t *testing.T) {
 	require.NotNil(t, m)
 
 	// Touch each instrument so it shows up in /metrics output.
-	m.PoolSize.WithLabelValues("hot").Set(2)
-	m.VMsTotal.WithLabelValues("success").Inc()
-	m.CloneDuration.WithLabelValues("true", "pve1").Observe(1.5)
-	m.BootDuration.WithLabelValues("pve1").Observe(7.0)
-	m.AcquireDuration.WithLabelValues("hot").Observe(0.5)
+	m.PoolSize.WithLabelValues("default", "hot").Set(2)
+	m.VMsTotal.WithLabelValues("default", "success").Inc()
+	m.CloneDuration.WithLabelValues("default", "true", "pve1").Observe(1.5)
+	m.BootDuration.WithLabelValues("default", "pve1").Observe(7.0)
+	m.AcquireDuration.WithLabelValues("default", "hot").Observe(0.5)
 	m.ProxmoxErrors.WithLabelValues("clone", "pve1").Inc()
 	m.GitHubErrors.WithLabelValues("list-runners").Inc()
 	m.ListenerMessages.WithLabelValues("job_started").Inc()
@@ -122,8 +122,8 @@ func TestCloneBootBuckets_CoverSlowProxmox(t *testing.T) {
 	// Single observation past the old upper bucket but inside the new
 	// one. If the buckets are too tight this observation lands in +Inf;
 	// if they're wide enough, the largest non-Inf bucket includes it.
-	m.CloneDuration.WithLabelValues("true", "pve1").Observe(600)
-	m.BootDuration.WithLabelValues("pve1").Observe(600)
+	m.CloneDuration.WithLabelValues("default", "true", "pve1").Observe(600)
+	m.BootDuration.WithLabelValues("default", "pve1").Observe(600)
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -341,7 +341,7 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	m := observability.NewMetrics(reg)
 	// Labelled metrics don't appear in /metrics output until at least one
 	// label combination has been observed, so touch one explicitly.
-	m.PoolSize.WithLabelValues("hot").Set(0)
+	m.PoolSize.WithLabelValues("default", "hot").Set(0)
 	h := observability.NewHealth(time.Minute)
 
 	log, _ := observability.NewLoggerTo(io.Discard, "error", "text")

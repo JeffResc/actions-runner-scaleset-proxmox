@@ -61,20 +61,45 @@ var (
 
 // VM is the orchestrator's view of a Proxmox VM. It is intentionally tiny —
 // the persistent store (ent) carries the richer state.
+//
+// Profile is populated by ListOwnedVMs from the VM's profile tag (or
+// the empty string when no profile tag is present, which Adopt then
+// treats as the default profile). Other call sites that construct VM
+// without a profile context can leave it empty.
 type VM struct {
-	VMID int
-	Node string
-	Name string
+	VMID    int
+	Node    string
+	Name    string
+	Profile string
 }
 
 // CloneOptions are passed to [Provisioner.Clone]. NewVMID is allocated by
 // the caller (pool manager); Node is chosen by the NodeSelector.
+//
+// Profile names the runner profile this clone belongs to (see
+// internal/config.ProfileConfig). An empty Profile is treated as
+// tags.DefaultProfile so callers that pre-date the profiles abstraction
+// continue to work.
+//
+// TemplateVMID, CPUCores, MemoryMB, DiskGB, and Storage are optional
+// per-clone overrides. Zero / empty inherits from the global Proxmox
+// config (TemplateVMID) or from the template VM (CPU / memory / disk).
+// CPU and memory are applied post-clone via VirtualMachine.Config; disk
+// is resized via the resize endpoint when the requested size exceeds
+// the template's current disk.
 type CloneOptions struct {
 	NewVMID   int
 	Node      string
 	Name      string
 	Linked    bool
 	PoweredOn bool
+
+	Profile      string
+	TemplateVMID int
+	CPUCores     int
+	MemoryMB     int
+	DiskGB       int
+	Storage      string
 }
 
 // Provisioner is the contract the rest of the orchestrator uses to talk to
@@ -406,11 +431,29 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	p.inFlightClones.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
 	defer p.inFlightClones.Delete(opts.NewVMID)
 
-	templateNode, err := p.cli.Node(ctx, p.templateNode)
+	// Resolve the source template: per-clone override falls back to the
+	// orchestrator-global template. Linked clones MUST stay on the
+	// template's node, but a profile-specific template typically lives on
+	// the same node as the global one — we only re-discover when an
+	// override is set.
+	templateVMID := opts.TemplateVMID
+	if templateVMID <= 0 {
+		templateVMID = p.cfg.TemplateVMID
+	}
+	templateNodeName := p.templateNode
+	if opts.TemplateVMID > 0 && opts.TemplateVMID != p.cfg.TemplateVMID {
+		discovered, err := p.locateTemplate(ctx, opts.TemplateVMID)
+		if err != nil {
+			return nil, fmt.Errorf("locate profile template %d: %w", opts.TemplateVMID, err)
+		}
+		templateNodeName = discovered
+	}
+
+	templateNode, err := p.cli.Node(ctx, templateNodeName)
 	if err != nil {
 		return nil, fmt.Errorf("get template node: %w", err)
 	}
-	templateVM, err := templateNode.VirtualMachine(ctx, p.cfg.TemplateVMID)
+	templateVM, err := templateNode.VirtualMachine(ctx, templateVMID)
 	if err != nil {
 		return nil, fmt.Errorf("get template vm: %w", err)
 	}
@@ -424,8 +467,11 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	} else {
 		cloneOpts.Full = 1
 		// Target only takes effect for full clones.
-		if opts.Node != "" && opts.Node != p.templateNode {
+		if opts.Node != "" && opts.Node != templateNodeName {
 			cloneOpts.Target = opts.Node
+		}
+		if opts.Storage != "" {
+			cloneOpts.Storage = opts.Storage
 		}
 	}
 
@@ -440,10 +486,10 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	// Compute the resulting node; linked clones land on the template node.
 	resultNode := opts.Node
 	if opts.Linked {
-		resultNode = p.templateNode
+		resultNode = templateNodeName
 	}
 	if resultNode == "" {
-		resultNode = p.templateNode
+		resultNode = templateNodeName
 	}
 
 	newNode, err := p.cli.Node(ctx, resultNode)
@@ -455,12 +501,42 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		return nil, fmt.Errorf("fetch cloned vm: %w", err)
 	}
 
-	initial, err := tags.Initial(p.scaleSetName)
+	// Apply owner + profile tags AND any per-clone hardware overrides in
+	// the same Config call. Bundling cuts a round-trip and keeps the
+	// tag-apply atomic with the resource override — otherwise an
+	// orchestrator crash between the two leaves the VM with our owner
+	// tag but the template's default resources.
+	initial, err := tags.Initial(p.scaleSetName, opts.Profile)
 	if err != nil {
 		return nil, fmt.Errorf("compute initial tags: %w", err)
 	}
-	if _, err := newVM.Config(ctx, proxmox.VirtualMachineOption{Name: "tags", Value: tags.Encode(initial)}); err != nil {
-		return nil, fmt.Errorf("set owner tags: %w", err)
+	configOpts := []proxmox.VirtualMachineOption{
+		{Name: "tags", Value: tags.Encode(initial)},
+	}
+	if opts.CPUCores > 0 {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "cores", Value: opts.CPUCores})
+	}
+	if opts.MemoryMB > 0 {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "memory", Value: opts.MemoryMB})
+	}
+	if _, err := newVM.Config(ctx, configOpts...); err != nil {
+		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
+	}
+
+	// Disk resize is a distinct API endpoint (not Config). Apply after
+	// the Config call so the override is visible to the resize call.
+	// Proxmox treats an unprefixed value as absolute; a leading '+'
+	// would mean "grow by N". We pass absolute so the value lines up
+	// with the operator's stated profile.disk_gb regardless of the
+	// template's current disk size.
+	if opts.DiskGB > 0 {
+		task, err := newVM.ResizeDisk(ctx, "scsi0", fmt.Sprintf("%dG", opts.DiskGB))
+		if err != nil {
+			return nil, fmt.Errorf("resize disk: %w", err)
+		}
+		if err := task.WaitFor(ctx, 120); err != nil {
+			return nil, fmt.Errorf("await resize disk: %w", err)
+		}
 	}
 
 	if opts.PoweredOn {
@@ -470,6 +546,35 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	}
 
 	return &VM{VMID: newID, Node: resultNode, Name: opts.Name}, nil
+}
+
+// locateTemplate finds the node hosting an alternative template VMID
+// (e.g. a profile-specific template that differs from the orchestrator's
+// default). Uses the same per-node timeout strategy as
+// discoverTemplateNode so a hung node can't pin the clone.
+func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, error) {
+	statuses, err := p.cli.Nodes(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list nodes: %w", err)
+	}
+	for _, ns := range statuses {
+		nodeCtx, cancel := context.WithTimeout(ctx, templateDiscoveryTimeoutPerNode)
+		node, err := p.cli.Node(nodeCtx, ns.Node)
+		if err != nil {
+			cancel()
+			continue
+		}
+		vm, err := node.VirtualMachine(nodeCtx, templateVMID)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if !isTemplate(vm) {
+			continue
+		}
+		return ns.Node, nil
+	}
+	return "", fmt.Errorf("%w: vmid=%d", ErrTemplateNotFound, templateVMID)
 }
 
 // Start powers on an existing VM and waits up to 5 minutes for the task to
@@ -675,7 +780,15 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 						"vmid", vmid, "node", ns.Node, "name", v.Name)
 				}
 			}
-			out = append(out, &VM{VMID: vmid, Node: ns.Node, Name: v.Name})
+			// Decode the profile tag now so the adoption path can
+			// route the VM into the right per-profile pool without
+			// re-parsing the wire format. Empty string falls back to
+			// the default profile via tags.ProfileOf semantics.
+			profile := ""
+			if owned {
+				profile = tags.ProfileOf(v.Tags)
+			}
+			out = append(out, &VM{VMID: vmid, Node: ns.Node, Name: v.Name, Profile: profile})
 		}
 	}
 	return out, nil

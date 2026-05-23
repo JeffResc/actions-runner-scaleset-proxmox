@@ -18,6 +18,10 @@ State lives in-process in [hashicorp/go-memdb](https://github.com/hashicorp/go-m
 
 Proxmox node placement is pluggable via `nodes.strategy`: **`single`** (always the same node, for single-node PVE), **`round_robin`** (rotate through a configured member list), or **`least_loaded`** (periodically polls `/cluster/resources` and picks the node with the lowest weighted CPU + memory load).
 
+## Runner profiles
+
+A scale set can declare one or more **profiles** — named bundles of `{labels, template VMID, CPU / memory / disk shape, hot/warm/max sizing}`. Each profile gets its own reconcile loop and pool state; VMs are tagged with their profile name so crash recovery routes them back into the right pool on restart. Configs without a `profiles:` block keep working unchanged — the orchestrator synthesises a single `default` profile from the global `pool:` / `scaleset:` blocks. See `profiles:` in [config.example.yaml](config.example.yaml) for the full schema. Prometheus metrics are partitioned by `profile=` so dashboards can slice by hardware shape.
+
 ## Components
 
 | Package | Purpose |

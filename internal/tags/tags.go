@@ -22,6 +22,17 @@ const (
 
 	// ownerPrefix is followed by the (sanitized) scale set name.
 	ownerPrefix = "gh-scaleset-owner-"
+
+	// profilePrefix is followed by the (sanitized) runner-profile name.
+	// Operators can run multiple profiles (per-label hardware shapes)
+	// behind a single scale-set; the tag lets crash-recovery route each
+	// VM back to the right per-profile pool.
+	profilePrefix = "gh-scaleset-profile-"
+
+	// DefaultProfile is the synthetic profile name used when an operator
+	// has not declared an explicit `profiles:` block. Keeps the
+	// single-profile config shape working unchanged.
+	DefaultProfile = "default"
 )
 
 // scaleSetNameRE is what we accept for an unsanitized scale set name.
@@ -39,14 +50,43 @@ func OwnerTag(scaleSetName string) (string, error) {
 	return ownerPrefix + sanitize(scaleSetName), nil
 }
 
+// ProfileTag returns the profile tag for the given runner-profile name.
+// An empty name maps to DefaultProfile so callers don't have to special-case
+// the single-profile config shape.
+func ProfileTag(profileName string) string {
+	if profileName == "" {
+		profileName = DefaultProfile
+	}
+	return profilePrefix + sanitize(profileName)
+}
+
 // Initial returns the canonical initial tag set for a newly-created VM.
 // The slice is sorted so it produces a stable on-the-wire representation.
-func Initial(scaleSetName string) ([]string, error) {
+// profileName is the runner profile the VM was cloned for; an empty name
+// is treated as DefaultProfile.
+func Initial(scaleSetName, profileName string) ([]string, error) {
 	owner, err := OwnerTag(scaleSetName)
 	if err != nil {
 		return nil, err
 	}
-	return []string{Marker, owner}, nil
+	return []string{Marker, owner, ProfileTag(profileName)}, nil
+}
+
+// ProfileOf returns the profile name encoded in a VM's wire tag string,
+// or DefaultProfile when no profile tag is present (covers VMs cloned
+// before profile tagging was introduced).
+func ProfileOf(wireTags string) string {
+	for _, t := range Decode(wireTags) {
+		name, ok := strings.CutPrefix(t, profilePrefix)
+		if !ok {
+			continue
+		}
+		if name == "" {
+			return DefaultProfile
+		}
+		return name
+	}
+	return DefaultProfile
 }
 
 // Encode joins a slice of tags into the semicolon-separated wire format
