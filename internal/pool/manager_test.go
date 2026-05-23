@@ -766,12 +766,12 @@ func TestReconcile_PoisonAfterMaxBootAttempts(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 }
 
-// TestReconcile_PoisonHonoursPerProfileBootMaxAttempts asserts that a
+// TestReconcile_PoisonHonorsPerProfileBootMaxAttempts asserts that a
 // per-profile BootMaxAttempts override controls the poisoning threshold
 // for rows in that profile, independent of the fleet-wide value. A row
 // in profile "gpu" with its own threshold of 5 must NOT poison at 3
 // attempts even though the fleet-wide threshold is 2.
-func TestReconcile_PoisonHonoursPerProfileBootMaxAttempts(t *testing.T) {
+func TestReconcile_PoisonHonorsPerProfileBootMaxAttempts(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	require.NoError(t, st.Insert(&store.VM{

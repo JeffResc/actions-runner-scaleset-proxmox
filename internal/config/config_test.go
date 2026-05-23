@@ -937,7 +937,7 @@ func TestProfiles_VMMaxAgePositiveAccepted(t *testing.T) {
 // TestProfiles_BootMaxAttemptsZeroRejected pins the per-profile
 // boot_max_attempts >= 1 validator. Accepting 0 would silently poison
 // every VM in the affected profile on its first failed boot once the
-// poisoning decision honours the per-profile threshold.
+// poisoning decision honors the per-profile threshold.
 func TestProfiles_BootMaxAttemptsZeroRejected(t *testing.T) {
 	setEnv(t, map[string]string{
 		"TEST_GH_TOKEN":  "ghp_fake",
