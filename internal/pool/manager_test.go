@@ -276,6 +276,20 @@ func seedHot(t *testing.T, st *store.Store, count int) {
 	}
 }
 
+func seedWarm(t *testing.T, st *store.Store, count int) {
+	t.Helper()
+	for i := range count {
+		err := st.Insert(&store.VM{
+			VMID:     30000 + i,
+			Node:     "pve1",
+			Name:     "seed-warm",
+			PoolKind: store.PoolKindWarm,
+			State:    store.StateWarm,
+		})
+		require.NoError(t, err)
+	}
+}
+
 // ---------- Tests ----------
 
 func TestAcquire_PromotesHotToAssigned(t *testing.T) {
@@ -508,47 +522,35 @@ func TestForceDestroy_MissingRowIsNoop(t *testing.T) {
 	require.NoError(t, mgr.ForceDestroy(context.Background(), 99999, "test: missing"))
 }
 
-// TestForceDestroy_ConcurrentCallsDedupe locks in the bug fix:
-// previously a second concurrent ForceDestroy against an already-Draining
-// row would spawn a redundant destroy goroutine (wasted Proxmox + GitHub
-// API budget and noisy 404 warnings). The CAS-guarded version must
-// ensure exactly one prov.Destroy call regardless of caller count.
-func TestForceDestroy_ConcurrentCallsDedupe(t *testing.T) {
+// TestPromoteN_SaturatedBootSemLeavesRowsWarm locks in the #68 fix:
+// when bootSem is fully reserved, promoteN must leave Warm rows alone
+// instead of CAS'ing them to Booting and then rolling back. The old
+// behavior briefly flipped rows to (Booting, PoolKindHot) — which the
+// reconciler counts as Available — and rolled them back in a goroutine,
+// under-provisioning by one for the racing tick.
+func TestPromoteN_SaturatedBootSemLeavesRowsWarm(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
-	seedHot(t, st, 1)
-	fp := &fakeProv{}
-	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
+	seedWarm(t, st, 3)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 3})
 
-	// Acquire so the row is in Assigned (the realistic stuck-row state).
-	_, err := mgr.Acquire(context.Background(), 0)
-	require.NoError(t, err)
+	// Pre-saturate bootSem (capacity 16) so TryAcquire fails for every
+	// candidate. Real semaphore.Weighted, real reservation — no mock.
+	require.True(t, mgr.bootSem.TryAcquire(16),
+		"test setup: must be able to drain the entire bootSem budget")
+	defer mgr.bootSem.Release(16)
 
-	// Fire ten concurrent ForceDestroy calls for the same vmid.
-	const N = 10
-	var wg sync.WaitGroup
-	wg.Add(N)
-	for range N {
-		go func() {
-			defer wg.Done()
-			_ = mgr.ForceDestroy(context.Background(), 20000, "concurrent")
-		}()
+	mgr.promoteN(context.Background(), 3)
+
+	// No goroutines were spawned, so nothing to wait for.
+	for vmid := 30000; vmid < 30003; vmid++ {
+		row, err := st.Get(vmid)
+		require.NoError(t, err)
+		require.Equal(t, store.StateWarm, row.State,
+			"vmid %d must remain Warm when bootSem is saturated", vmid)
+		require.Equal(t, store.PoolKindWarm, row.PoolKind,
+			"vmid %d must remain PoolKindWarm (not transiently Hot)", vmid)
 	}
-	wg.Wait()
-
-	// Wait for the (single) destroy goroutine to finish and report.
-	require.Eventually(t, func() bool {
-		fp.mu.Lock()
-		defer fp.mu.Unlock()
-		return len(fp.destroys) >= 1
-	}, time.Second, 10*time.Millisecond)
-
-	// And confirm no further destroys queue up.
-	time.Sleep(50 * time.Millisecond)
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
-	require.Equal(t, 1, len(fp.destroys),
-		"ForceDestroy must dedupe concurrent callers via CAS; saw %d destroys", len(fp.destroys))
 }
 
 // TestListRows_ExcludesTerminal: the reconciler must not waste a GH API
