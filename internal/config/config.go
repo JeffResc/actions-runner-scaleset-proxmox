@@ -23,6 +23,8 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"gopkg.in/yaml.v3"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
 )
 
 // Config is the full orchestrator configuration parsed from YAML.
@@ -491,7 +493,23 @@ type ClusterRaftPeer struct {
 // file. The returned Config is ready to use by the rest of the
 // orchestrator; on error the partially-parsed Config is discarded.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path) // #nosec G304 -- path is the operator-supplied config file; we are the trust boundary.
+	// The config file holds the Proxmox API token, GitHub webhook
+	// secret, and admin bearer — the same class of credential the App
+	// PEM already protects. Refuse to read when the file is world- or
+	// group-readable (mode > 0o600) or owned by a UID other than the
+	// process's effective UID. Surfacing the misconfiguration at
+	// startup is better than after the secret has been exfiltrated.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: stat %s: %w", path, err)
+	}
+	if err := fileperm.CheckMode(info, path, 0o600); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if err := fileperm.CheckOwnership(info, path); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- path is the operator-supplied config file; perm- and owner-checked above.
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}

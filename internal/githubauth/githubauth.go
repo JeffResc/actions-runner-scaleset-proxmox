@@ -17,6 +17,8 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v88/github"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
 )
 
 // Scope identifies the GitHub registration target. Exactly one of Org or
@@ -230,12 +232,11 @@ func NewAppFromFile(clientID string, installationID int64, pemPath string) (Auth
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: stat private key %s: %w", pemPath, err)
 	}
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		return nil, fmt.Errorf("githubauth: private key %s has insecure mode %#o; expected 0600 (chmod 600 the file)",
-			pemPath, mode)
+	if err := fileperm.CheckMode(info, pemPath, 0o600); err != nil {
+		return nil, fmt.Errorf("githubauth: private key: %w", err)
 	}
-	if err := checkPEMOwnership(info, pemPath); err != nil {
-		return nil, err
+	if err := fileperm.CheckOwnership(info, pemPath); err != nil {
+		return nil, fmt.Errorf("githubauth: private key: %w", err)
 	}
 	pem, err := os.ReadFile(pemPath) // #nosec G304 -- pemPath is operator-supplied and perm-checked above.
 	if err != nil {

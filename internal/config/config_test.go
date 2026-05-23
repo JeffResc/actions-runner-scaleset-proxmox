@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -496,6 +497,34 @@ func TestLoad_ReadsFromDisk(t *testing.T) {
 	cfg, err := config.Load(path)
 	require.NoError(t, err)
 	require.Equal(t, "proxmox-ubuntu-x64", cfg.ScaleSet.Name)
+}
+
+// TestLoad_RejectsWorldReadablePerms pins the perm check Load applies to
+// the config file. The file holds Proxmox tokens, the webhook secret,
+// and the admin bearer — same class as the PEM file we already protect.
+// World/group-readable mode bits must refuse at startup, not log-and-go.
+func TestLoad_RejectsWorldReadablePerms(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows mode bits don't map onto POSIX r/w/x")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(validPATYAML), 0o600))
+	require.NoError(t, os.Chmod(path, 0o644))
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	_, err := config.Load(path)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "insecure mode")
+	require.Contains(t, err.Error(), "0644")
+}
+
+// TestLoad_AcceptsTight pins the happy-path: mode 0600 owned by us
+// passes both checks.
+func TestLoad_AcceptsTight(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(validPATYAML), 0o600))
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	_, err := config.Load(path)
+	require.NoError(t, err)
 }
 
 // Cluster defaults: omitted cluster block falls back to standalone with
