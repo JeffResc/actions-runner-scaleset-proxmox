@@ -42,6 +42,9 @@ type fakePool struct {
 func (f *fakePool) Acquire(_ context.Context, _ int64, _ int) (*pool.VM, error) {
 	return nil, pool.ErrNoneAvailable
 }
+func (f *fakePool) AcquireForProfile(_ context.Context, _ int64, _ string, _ int) (*pool.VM, error) {
+	return nil, pool.ErrNoneAvailable
+}
 func (f *fakePool) MarkRunning(_ context.Context, _ int, _ int64) error { return nil }
 func (f *fakePool) SetRunnerID(_ context.Context, _ int, _ int64) error { return nil }
 func (f *fakePool) MarkCompleted(_ context.Context, vmid int) error {

@@ -74,6 +74,10 @@ type fakePool struct {
 	desiredHistory []int
 }
 
+func (f *fakePool) AcquireForProfile(ctx context.Context, jobID int64, _ string, maxBusy int) (*pool.VM, error) {
+	return f.Acquire(ctx, jobID, maxBusy)
+}
+
 func (f *fakePool) Acquire(_ context.Context, _ int64, maxBusy int) (*pool.VM, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -62,7 +62,57 @@ func TestIsOwnedBy(t *testing.T) {
 
 func TestInitial(t *testing.T) {
 	t.Parallel()
-	got, err := tags.Initial("proxmox-ubuntu")
+
+	t.Run("empty profile maps to default", func(t *testing.T) {
+		t.Parallel()
+		got, err := tags.Initial("proxmox-ubuntu", "")
+		require.NoError(t, err)
+		require.Equal(t, []string{
+			tags.Marker,
+			"gh-scaleset-owner-proxmox-ubuntu",
+			"gh-scaleset-profile-default",
+		}, got)
+	})
+
+	t.Run("named profile is sanitized", func(t *testing.T) {
+		t.Parallel()
+		got, err := tags.Initial("proxmox-ubuntu", "Linux.GPU")
+		require.NoError(t, err)
+		require.Equal(t, []string{
+			tags.Marker,
+			"gh-scaleset-owner-proxmox-ubuntu",
+			"gh-scaleset-profile-linux-gpu",
+		}, got)
+	})
+}
+
+func TestProfileTag(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "gh-scaleset-profile-default", tags.ProfileTag(""))
+	require.Equal(t, "gh-scaleset-profile-gpu", tags.ProfileTag("gpu"))
+	require.Equal(t, "gh-scaleset-profile-linux-x64", tags.ProfileTag("Linux.X64"))
+}
+
+func TestProfileOf(t *testing.T) {
+	t.Parallel()
+
+	owner, err := tags.OwnerTag("scaleset-1")
 	require.NoError(t, err)
-	require.Equal(t, []string{tags.Marker, "gh-scaleset-owner-proxmox-ubuntu"}, got)
+
+	t.Run("returns encoded profile", func(t *testing.T) {
+		t.Parallel()
+		wire := tags.Encode([]string{tags.Marker, owner, tags.ProfileTag("gpu")})
+		require.Equal(t, "gpu", tags.ProfileOf(wire))
+	})
+
+	t.Run("missing profile tag falls back to default", func(t *testing.T) {
+		t.Parallel()
+		wire := tags.Encode([]string{tags.Marker, owner})
+		require.Equal(t, tags.DefaultProfile, tags.ProfileOf(wire))
+	})
+
+	t.Run("empty wire string falls back to default", func(t *testing.T) {
+		t.Parallel()
+		require.Equal(t, tags.DefaultProfile, tags.ProfileOf(""))
+	})
 }

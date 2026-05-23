@@ -658,3 +658,118 @@ func TestAcquireHot_RaceRespectsCapacity(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, assigned, cap)
 }
+
+// ---------------------------------------------------------------------------
+// Per-profile helpers (PR 1)
+// ---------------------------------------------------------------------------
+
+func TestInsert_StampsDefaultProfileWhenEmpty(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 1, Node: "pve1", Name: "no-profile",
+		PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	got, err := s.Get(1)
+	require.NoError(t, err)
+	require.Equal(t, store.DefaultProfileName, got.Profile)
+}
+
+func TestListByProfile_ScopesByName(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 1, Node: "pve1", Name: "x64-a",
+		Profile: "linux-x64", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 2, Node: "pve1", Name: "x64-b",
+		Profile: "linux-x64", PoolKind: store.PoolKindWarm, State: store.StateWarm,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 3, Node: "pve2", Name: "gpu-a",
+		Profile: "gpu", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+
+	x64Rows, err := s.ListByProfile("linux-x64")
+	require.NoError(t, err)
+	require.Len(t, x64Rows, 2)
+	for _, r := range x64Rows {
+		require.Equal(t, "linux-x64", r.Profile)
+	}
+
+	gpuHot, err := s.ListByProfileAndStates("gpu", store.StateHot)
+	require.NoError(t, err)
+	require.Len(t, gpuHot, 1)
+	require.Equal(t, 3, gpuHot[0].VMID)
+
+	statsGPU, err := s.StatsByProfile("gpu")
+	require.NoError(t, err)
+	require.Equal(t, 1, statsGPU[store.StateHot])
+	require.Equal(t, 0, statsGPU[store.StateWarm])
+
+	statsX64, err := s.StatsByProfile("linux-x64")
+	require.NoError(t, err)
+	require.Equal(t, 1, statsX64[store.StateHot])
+	require.Equal(t, 1, statsX64[store.StateWarm])
+
+	cnt, err := s.CountByProfileState("gpu", store.StateHot)
+	require.NoError(t, err)
+	require.Equal(t, 1, cnt)
+}
+
+func TestAcquireHotInProfile_ScopesToNamedProfile(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	// Two profiles each with one Hot VM. Acquiring "gpu" must NOT
+	// promote the linux-x64 VM, even though it's also Hot.
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 1, Node: "pve1", Name: "x64",
+		Profile: "linux-x64", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 2, Node: "pve2", Name: "gpu",
+		Profile: "gpu", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+
+	got, err := s.AcquireHotInProfile("gpu", 4242, 10, 0)
+	require.NoError(t, err)
+	require.Equal(t, 2, got.VMID, "must acquire the gpu VM, not the x64 one")
+
+	// x64 row still Hot.
+	x64, err := s.Get(1)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, x64.State)
+}
+
+func TestAcquireHotInProfile_PerProfileMaxBusyClamps(t *testing.T) {
+	t.Parallel()
+	s, err := store.New()
+	require.NoError(t, err)
+	// Two Hot VMs in "gpu" profile. Per-call maxBusy=1 must reject
+	// the second acquire while the first is still Assigned.
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 1, Node: "pve1", Name: "gpu-a",
+		Profile: "gpu", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 2, Node: "pve1", Name: "gpu-b",
+		Profile: "gpu", PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	// Sibling profile with a busy VM — must NOT be counted toward
+	// "gpu"'s per-profile cap.
+	require.NoError(t, s.Insert(&store.VM{
+		VMID: 99, Node: "pve1", Name: "x64-busy",
+		Profile: "linux-x64", PoolKind: store.PoolKindHot, State: store.StateAssigned,
+	}))
+
+	_, err = s.AcquireHotInProfile("gpu", 1, 10, 1)
+	require.NoError(t, err)
+
+	_, err = s.AcquireHotInProfile("gpu", 2, 10, 1)
+	require.ErrorIs(t, err, store.ErrAtCapacity,
+		"per-profile maxBusy must reject second gpu acquire even though x64 sibling has its own busy VM")
+}

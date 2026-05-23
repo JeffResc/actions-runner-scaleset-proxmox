@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -25,12 +26,19 @@ import (
 )
 
 // Config is the full orchestrator configuration parsed from YAML.
+//
+// Profiles is an optional list of runner-profile overrides (per-label
+// hardware shapes). When empty, ApplyDefaults synthesises a single
+// "default" profile from the global Pool + Proxmox blocks so the
+// orchestrator's profile-aware internals don't have to special-case the
+// single-profile config shape.
 type Config struct {
 	GitHub        GitHubConfig        `yaml:"github" validate:"required"`
 	ScaleSet      ScaleSetConfig      `yaml:"scaleset" validate:"required"`
 	Proxmox       ProxmoxConfig       `yaml:"proxmox" validate:"required"`
 	Nodes         NodesConfig         `yaml:"nodes" validate:"required"`
 	Pool          PoolConfig          `yaml:"pool" validate:"required"`
+	Profiles      []ProfileConfig     `yaml:"profiles"`
 	Observability ObservabilityConfig `yaml:"observability"`
 	AdminAPI      AdminAPIConfig      `yaml:"admin_api"`
 	Cluster       ClusterConfig       `yaml:"cluster"`
@@ -181,9 +189,15 @@ type NodesConfig struct {
 }
 
 // PoolConfig configures pool sizes and timing.
+//
+// Pool-level HotSize / WarmSize / BootMaxAttempts / VMMaxAge are
+// fall-back defaults for profiles that omit those fields. GlobalMax,
+// when set, caps the sum of per-profile MaxConcurrentRunners so an
+// operator can put a fleet-wide ceiling above the per-profile arithmetic.
 type PoolConfig struct {
 	HotSize           int    `yaml:"hot_size" validate:"gte=0"`
 	WarmSize          int    `yaml:"warm_size" validate:"gte=0"`
+	GlobalMax         int    `yaml:"global_max" validate:"gte=0"`
 	ReconcileInterval string `yaml:"reconcile_interval"`
 	VMMaxAge          string `yaml:"vm_max_age"`
 	DrainTimeout      string `yaml:"drain_timeout"`
@@ -228,6 +242,84 @@ type PoolConfig struct {
 	OrphanGraceD        time.Duration `yaml:"-"`
 	CloneInflightGraceD time.Duration `yaml:"-"`
 }
+
+// ProfileConfig defines a runner profile — a named bundle of hardware
+// shape and per-pool sizing that the scaler routes labelled jobs to.
+//
+// Fields left at their zero value inherit from the global Pool /
+// Proxmox blocks at Resolve time, so the simplest single-profile config
+// only needs `name` + `labels`.
+type ProfileConfig struct {
+	// Name is the profile identifier used in metrics, tags, and the
+	// scaler's routing decisions. Must be unique across Profiles and
+	// match the sanitised-tag character set [a-z0-9-].
+	Name string `yaml:"name" validate:"required"`
+
+	// Labels are the GitHub Actions labels this profile satisfies.
+	// The router (issue #7) picks a profile whose Labels are a
+	// superset of the job's requested labels.
+	Labels []string `yaml:"labels"`
+
+	// TemplateVMID overrides the global proxmox.template_vmid for
+	// this profile. Zero inherits the global value.
+	TemplateVMID int `yaml:"template_vmid"`
+
+	// CPUCores / MemoryMB / DiskGB are per-clone hardware overrides
+	// applied after the clone returns. Zero leaves the template's
+	// default in place.
+	CPUCores int `yaml:"cpu"`
+	MemoryMB int `yaml:"memory_mb"`
+	DiskGB   int `yaml:"disk_gb"`
+
+	// Storage overrides the target storage pool for full clones.
+	// Empty inherits the global proxmox.storage.disk.
+	Storage string `yaml:"storage"`
+
+	// HotSize / WarmSize / MaxConcurrentRunners are per-profile pool
+	// sizes. *int so the unmarshaller can distinguish "field omitted"
+	// (nil — inherit from global pool / scaleset) from "explicit 0"
+	// (e.g. a gpu profile that wants no hot pool, only warm). The
+	// effective values are resolved into the matching *_effective
+	// helpers below at ApplyDefaults time.
+	HotSize              *int `yaml:"hot_size,omitempty" validate:"omitempty,gte=0"`
+	WarmSize             *int `yaml:"warm_size,omitempty" validate:"omitempty,gte=0"`
+	MaxConcurrentRunners *int `yaml:"max_concurrent_runners,omitempty" validate:"omitempty,gte=0"`
+
+	// BootMaxAttempts / VMMaxAge are per-profile recycle/poison knobs.
+	// Nil/empty inherits the global pool defaults.
+	BootMaxAttempts *int   `yaml:"boot_max_attempts,omitempty" validate:"omitempty,gte=0"`
+	VMMaxAge        string `yaml:"vm_max_age"`
+
+	// VMMaxAgeD is the resolved duration (populated by Resolve).
+	VMMaxAgeD time.Duration `yaml:"-"`
+}
+
+// HotSizeOrDefault returns the effective hot pool size for the
+// profile, dereferencing the *int and falling back to the supplied
+// default when nil.
+func (p ProfileConfig) HotSizeOrDefault(d int) int { return derefIntDefault(p.HotSize, d) }
+
+// WarmSizeOrDefault returns the effective warm pool size.
+func (p ProfileConfig) WarmSizeOrDefault(d int) int { return derefIntDefault(p.WarmSize, d) }
+
+// MaxConcurrentRunnersOrDefault returns the effective concurrency cap.
+func (p ProfileConfig) MaxConcurrentRunnersOrDefault(d int) int {
+	return derefIntDefault(p.MaxConcurrentRunners, d)
+}
+
+// BootMaxAttemptsOrDefault returns the effective boot-attempts ceiling.
+func (p ProfileConfig) BootMaxAttemptsOrDefault(d int) int {
+	return derefIntDefault(p.BootMaxAttempts, d)
+}
+
+func derefIntDefault(p *int, d int) int {
+	if p == nil {
+		return d
+	}
+	return *p
+}
+
+func intp(v int) *int { return &v }
 
 // ObservabilityConfig configures logging, metrics, and tracing endpoints.
 type ObservabilityConfig struct {
@@ -419,6 +511,11 @@ func Parse(data []byte) (*Config, error) {
 	return &cfg, nil
 }
 
+// defaultProfileName is the synthetic profile name used when no
+// `profiles:` block is declared. Kept aligned with tags.DefaultProfile;
+// this package does not import tags to avoid a circular reference.
+const defaultProfileName = "default"
+
 // ApplyDefaults fills in sane defaults for optional fields.
 func (c *Config) ApplyDefaults() {
 	// Pool
@@ -490,6 +587,47 @@ func (c *Config) ApplyDefaults() {
 	// covered by the default.
 	if c.AdminAPI.TrustedProxies == nil {
 		c.AdminAPI.TrustedProxies = []string{"127.0.0.0/8", "::1/128"}
+	}
+	// Profiles: synthesise a single default profile from the global
+	// pool / proxmox / scaleset fields when no profiles block is
+	// declared. The rest of the orchestrator then runs the profile
+	// path uniformly — old single-profile configs still work, but
+	// internally there is always at least one profile.
+	if len(c.Profiles) == 0 {
+		c.Profiles = []ProfileConfig{{
+			Name:                 defaultProfileName,
+			Labels:               append([]string(nil), c.ScaleSet.Labels...),
+			HotSize:              intp(c.Pool.HotSize),
+			WarmSize:             intp(c.Pool.WarmSize),
+			MaxConcurrentRunners: intp(c.ScaleSet.MaxConcurrentRunners),
+			BootMaxAttempts:      intp(c.Pool.BootMaxAttempts),
+			VMMaxAge:             c.Pool.VMMaxAge,
+		}}
+	} else {
+		// Each profile inherits unset sizing knobs from the global
+		// pool / scaleset blocks. We assign back into the slice
+		// element because range copies the value. Nil-vs-explicit-zero
+		// distinction matters here: a profile that explicitly sets
+		// hot_size: 0 keeps it; a profile that omits the field
+		// inherits the global default.
+		for i := range c.Profiles {
+			p := &c.Profiles[i]
+			if p.HotSize == nil {
+				p.HotSize = intp(c.Pool.HotSize)
+			}
+			if p.WarmSize == nil {
+				p.WarmSize = intp(c.Pool.WarmSize)
+			}
+			if p.MaxConcurrentRunners == nil {
+				p.MaxConcurrentRunners = intp(c.ScaleSet.MaxConcurrentRunners)
+			}
+			if p.BootMaxAttempts == nil {
+				p.BootMaxAttempts = intp(c.Pool.BootMaxAttempts)
+			}
+			if p.VMMaxAge == "" {
+				p.VMMaxAge = c.Pool.VMMaxAge
+			}
+		}
 	}
 }
 
@@ -607,6 +745,20 @@ func (c *Config) Resolve() error {
 	if err != nil {
 		return fmt.Errorf("github.assigned_offline_grace: %w", err)
 	}
+	// Profiles: parse per-profile vm_max_age now so callers don't have
+	// to re-parse on the hot path. Empty inherits from pool (already
+	// applied in ApplyDefaults, so this normally just round-trips).
+	for i := range c.Profiles {
+		p := &c.Profiles[i]
+		if p.VMMaxAge == "" {
+			continue
+		}
+		d, err := time.ParseDuration(p.VMMaxAge)
+		if err != nil {
+			return fmt.Errorf("profiles[%d].vm_max_age: %w", i, err)
+		}
+		p.VMMaxAgeD = d
+	}
 	// Cluster.
 	if err := c.resolveCluster(); err != nil {
 		return err
@@ -711,6 +863,52 @@ func (c *Config) Validate() error {
 		if err := c.Cluster.Raft.TLS.validate("cluster.raft.tls"); err != nil {
 			return err
 		}
+	}
+	if err := c.validateProfiles(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// profileNameRE constrains profile names to the same character set
+// Proxmox tags accept after sanitisation, so a name can round-trip
+// through tags.ProfileTag without surprises.
+var profileNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// validateProfiles enforces non-empty, unique, well-formed profile
+// names and the GlobalMax ceiling. Per-profile inheritance from global
+// pool fields already happened in ApplyDefaults.
+func (c *Config) validateProfiles() error {
+	if len(c.Profiles) == 0 {
+		// ApplyDefaults guarantees ≥ 1 profile; defending against a
+		// caller that bypassed it (e.g. constructing a Config in a
+		// test) keeps later code from segfaulting on an empty slice.
+		return errors.New("profiles: at least one profile is required (ApplyDefaults synthesises a default)")
+	}
+	seen := make(map[string]int, len(c.Profiles))
+	sumMax := 0
+	for i, p := range c.Profiles {
+		if !profileNameRE.MatchString(p.Name) {
+			return fmt.Errorf("profiles[%d].name %q must match %s", i, p.Name, profileNameRE.String())
+		}
+		if prev, dup := seen[p.Name]; dup {
+			return fmt.Errorf("profiles: duplicate name %q at indexes %d and %d", p.Name, prev, i)
+		}
+		seen[p.Name] = i
+		maxConc := p.MaxConcurrentRunnersOrDefault(c.ScaleSet.MaxConcurrentRunners)
+		if maxConc <= 0 {
+			return fmt.Errorf("profiles[%d] %q: max_concurrent_runners must be > 0 (inherited from scaleset when omitted)", i, p.Name)
+		}
+		hot := p.HotSizeOrDefault(c.Pool.HotSize)
+		warm := p.WarmSizeOrDefault(c.Pool.WarmSize)
+		if hot+warm > maxConc {
+			return fmt.Errorf("profiles[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
+				i, p.Name, hot+warm, maxConc)
+		}
+		sumMax += maxConc
+	}
+	if c.Pool.GlobalMax > 0 && sumMax > c.Pool.GlobalMax {
+		return fmt.Errorf("pool.global_max (%d) is below the sum of profile.max_concurrent_runners (%d)", c.Pool.GlobalMax, sumMax)
 	}
 	return nil
 }

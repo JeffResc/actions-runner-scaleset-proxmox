@@ -200,6 +200,7 @@ func Run(ctx context.Context, opts Options) error {
 			VMMaxAge:             cfg.Pool.VMMaxAgeD,
 			DrainTimeout:         cfg.Pool.DrainTimeoutD,
 			BootMaxAttempts:      cfg.Pool.BootMaxAttempts,
+			Profiles:             profileSettingsFromConfig(cfg),
 			ScaleSetName:         cfg.ScaleSet.Name,
 			VMNamePrefix:         prefix,
 			VMIDRange:            cfg.Proxmox.VMIDRange,
@@ -633,4 +634,32 @@ func ensureScaleSet(ctx context.Context, gh *scaleset.Client, cfg *config.Config
 		return nil, fmt.Errorf("create runner scale set: %w", err)
 	}
 	return created, nil
+}
+
+// profileSettingsFromConfig projects the YAML-level config.ProfileConfig
+// slice into the pool.ProfileSettings shape the manager consumes. The
+// per-profile resource fields (CPU, memory, etc.) are threaded through
+// CloneOptions; sizing fields drive the per-profile reconcile loop.
+//
+// ApplyDefaults has already synthesised the single default profile and
+// inherited unset fields from the global pool / scaleset blocks, so
+// this projection is a straight mapping.
+func profileSettingsFromConfig(cfg *config.Config) []pool.ProfileSettings {
+	out := make([]pool.ProfileSettings, 0, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		out = append(out, pool.ProfileSettings{
+			Name:                 p.Name,
+			HotSize:              p.HotSizeOrDefault(cfg.Pool.HotSize),
+			WarmSize:             p.WarmSizeOrDefault(cfg.Pool.WarmSize),
+			MaxConcurrentRunners: p.MaxConcurrentRunnersOrDefault(cfg.ScaleSet.MaxConcurrentRunners),
+			BootMaxAttempts:      p.BootMaxAttemptsOrDefault(cfg.Pool.BootMaxAttempts),
+			VMMaxAge:             p.VMMaxAgeD,
+			TemplateVMID:         p.TemplateVMID,
+			CPUCores:             p.CPUCores,
+			MemoryMB:             p.MemoryMB,
+			DiskGB:               p.DiskGB,
+			Storage:              p.Storage,
+		})
+	}
+	return out
 }

@@ -176,21 +176,26 @@ func (m *Metrics) RecordGHStateMismatch(dbState, ghState, action string) (string
 func NewMetrics(reg prometheus.Registerer) *Metrics {
 	const ns = "scaleset"
 	m := &Metrics{
+		// Profile-aware label set: every metric below now partitions
+		// by runner profile so operators with multiple profiles can
+		// slice dashboards by hardware shape (linux-x64 vs gpu vs
+		// big-mem etc.). Single-profile deployments emit profile=
+		// "default" so existing dashboards keep working — they just
+		// see one extra label.
 		PoolSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "pool_size",
-			Help: "Number of VMs in each lifecycle state.",
-		}, []string{"state"}),
+			Help: "Number of VMs in each lifecycle state, by profile.",
+		}, []string{"profile", "state"}),
 		VMsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "vms_total",
-			Help: "Cumulative count of VMs created, partitioned by outcome.",
-		}, []string{"outcome"}),
-		// CloneDuration label set is intentionally bounded by node count
-		// (a handful) × linked-bool (2). Do NOT add pool.kind or vm.id
-		// here — pool.kind only adds a fixed factor today but vm.id would
-		// produce one series per VM per scrape, blowing up Prometheus
-		// cardinality. If you need per-VM clone latency, emit a trace
-		// span (we already do — see provisioner.Clone) rather than a
-		// metric.
+			Help: "Cumulative count of VMs created, partitioned by profile and outcome.",
+		}, []string{"profile", "outcome"}),
+		// CloneDuration label set is intentionally bounded by
+		// profile count × node count × linked-bool. Do NOT add
+		// vm.id here — it would produce one series per VM per scrape,
+		// blowing up Prometheus cardinality. If you need per-VM
+		// clone latency, emit a trace span (we already do — see
+		// provisioner.Clone) rather than a metric.
 		CloneDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "clone_duration_seconds",
 			Help: "Time to clone a VM from template.",
@@ -199,19 +204,19 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			// out at ~128s, collapsing high-end percentiles into +Inf
 			// exactly when operators most needed to see the latency.
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 12),
-		}, []string{"linked", "node"}),
+		}, []string{"profile", "linked", "node"}),
 		BootDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "boot_duration_seconds",
 			Help: "Time from VM start to guest-agent ready.",
 			// 1s .. ~1024s — same widening as CloneDuration. Real VM
 			// boots can run several minutes when Proxmox is loaded.
 			Buckets: prometheus.ExponentialBuckets(1, 2, 11),
-		}, []string{"node"}),
+		}, []string{"profile", "node"}),
 		AcquireDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "acquire_duration_seconds",
-			Help:    "Time from Acquire call to a ready VM, by source tier.",
+			Help:    "Time from Acquire call to a ready VM, by profile and source tier.",
 			Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
-		}, []string{"tier"}),
+		}, []string{"profile", "tier"}),
 		ProxmoxErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "proxmox_api_errors_total",
 			Help: "Errors from Proxmox API calls, partitioned by operation.",

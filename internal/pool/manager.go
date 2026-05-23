@@ -43,6 +43,37 @@ func (m *manager) logRecoveredPanic(opName string, vmid int, r any) {
 		"op", opName, "vmid", vmid, "panic", fmt.Sprintf("%v", r))
 }
 
+// ProfileSettings is the per-profile sizing and clone-shape the
+// manager applies. Zero / empty fields fall back to the top-level
+// Config defaults (HotSize / WarmSize / MaxConcurrentRunners /
+// BootMaxAttempts / VMMaxAge) so existing single-profile callers
+// don't need to populate the slice.
+type ProfileSettings struct {
+	// Name is the profile identifier. Must be non-empty when
+	// Profiles is set; pool.NewManager synthesises a default
+	// "default" profile when the slice is empty.
+	Name string
+
+	// HotSize / WarmSize / MaxConcurrentRunners / BootMaxAttempts
+	// override the top-level Config fields when > 0.
+	HotSize              int
+	WarmSize             int
+	MaxConcurrentRunners int
+	BootMaxAttempts      int
+
+	// VMMaxAge overrides the top-level VMMaxAge when > 0. Zero
+	// inherits.
+	VMMaxAge time.Duration
+
+	// Per-clone hardware shape applied to provisioner.CloneOptions.
+	// Zero / empty inherits the template's default.
+	TemplateVMID int
+	CPUCores     int
+	MemoryMB     int
+	DiskGB       int
+	Storage      string
+}
+
 // Config bundles everything the manager needs at construction time.
 type Config struct {
 	HotSize              int
@@ -52,6 +83,12 @@ type Config struct {
 	VMMaxAge             time.Duration
 	DrainTimeout         time.Duration
 	BootMaxAttempts      int
+
+	// Profiles enables multi-profile operation. When empty, the
+	// manager synthesises a single "default" profile from the
+	// fields above so existing single-profile callers (and tests)
+	// continue to work unchanged.
+	Profiles []ProfileSettings
 
 	// PowerPollInterval is the cadence at which the manager polls
 	// Proxmox for the power state of Assigned/Running VMs. When a row's
@@ -92,6 +129,15 @@ type Config struct {
 	RunnerLister RunnerLister
 }
 
+// profileState is the per-profile runtime state.
+type profileState struct {
+	settings     ProfileSettings
+	desiredCount atomic.Int32
+	// refill is a per-profile signal channel so a profile's
+	// reconcile loop can be nudged without waking sibling loops.
+	refill chan struct{}
+}
+
 // manager is the in-process Manager implementation.
 type manager struct {
 	cfg     Config
@@ -100,6 +146,16 @@ type manager struct {
 	sel     nodeselector.Selector
 	log     *slog.Logger
 	metrics *observability.Metrics
+
+	// profiles is the per-profile state keyed by ProfileSettings.Name.
+	// At least one entry — NewManager synthesises a default profile
+	// when the operator didn't declare any.
+	profiles map[string]*profileState
+
+	// profileOrder preserves the declaration order from the config so
+	// callers that don't pass an explicit profile name (the
+	// backwards-compatible Acquire path) get deterministic selection.
+	profileOrder []string
 
 	refill chan struct{}
 
@@ -136,14 +192,69 @@ type manager struct {
 	// wasting work on Proxmox clone calls that would have to be undone.
 	allocMu sync.Mutex
 
-	// desiredCount is GitHub's most recent "total assigned jobs" signal.
-	// Read/written via atomic ops so the reconcile loop doesn't need to
-	// take a lock on every pass.
+	// desiredCount mirrors the per-profile desiredCount in the
+	// single-profile / "default" case so existing callers of
+	// SetDesiredCount (which is fleet-wide) still observe the
+	// classic semantics. With multiple profiles it represents the
+	// fleet-wide aggregate; per-profile demand split is owed by the
+	// caller (PR 2 / #7 — label routing).
 	desiredCount atomic.Int32
 }
 
+// normaliseProfiles returns the profile slice the manager will
+// operate on, synthesising a single default profile from the
+// top-level Config fields when none were declared. Per-profile
+// fields left at zero inherit the top-level value.
+func normaliseProfiles(cfg Config) []ProfileSettings {
+	if len(cfg.Profiles) == 0 {
+		return []ProfileSettings{{
+			Name:                 defaultProfileName,
+			HotSize:              cfg.HotSize,
+			WarmSize:             cfg.WarmSize,
+			MaxConcurrentRunners: cfg.MaxConcurrentRunners,
+			BootMaxAttempts:      cfg.BootMaxAttempts,
+			VMMaxAge:             cfg.VMMaxAge,
+		}}
+	}
+	out := make([]ProfileSettings, len(cfg.Profiles))
+	for i, p := range cfg.Profiles {
+		if p.HotSize == 0 {
+			p.HotSize = cfg.HotSize
+		}
+		if p.WarmSize == 0 {
+			p.WarmSize = cfg.WarmSize
+		}
+		if p.MaxConcurrentRunners == 0 {
+			p.MaxConcurrentRunners = cfg.MaxConcurrentRunners
+		}
+		if p.BootMaxAttempts == 0 {
+			p.BootMaxAttempts = cfg.BootMaxAttempts
+		}
+		if p.VMMaxAge == 0 {
+			p.VMMaxAge = cfg.VMMaxAge
+		}
+		out[i] = p
+	}
+	return out
+}
+
+// defaultProfileName must match tags.DefaultProfile. Duplicated here
+// (rather than imported) so the pool package keeps its short import
+// list and doesn't take a new dependency on tags solely for a string
+// literal.
+const defaultProfileName = "default"
+
 // NewManager constructs a Manager.
 func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel nodeselector.Selector, log *slog.Logger, metrics *observability.Metrics) (Manager, error) {
+	cfg.Profiles = normaliseProfiles(cfg)
+	for _, p := range cfg.Profiles {
+		if p.Name == "" {
+			return nil, fmt.Errorf("pool: profile name must be non-empty")
+		}
+		if err := validateConfig(p.HotSize, p.WarmSize, p.MaxConcurrentRunners); err != nil {
+			return nil, fmt.Errorf("pool: profile %q: %w", p.Name, err)
+		}
+	}
 	if err := validateConfig(cfg.HotSize, cfg.WarmSize, cfg.MaxConcurrentRunners); err != nil {
 		return nil, err
 	}
@@ -182,7 +293,7 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 	// Run's ctx briefly during drain. drain() cancels it once it has
 	// either observed clean completion or hit DrainTimeout.
 	wctx, wcancel := context.WithCancel(context.Background())
-	return &manager{
+	m := &manager{
 		cfg:          cfg,
 		store:        st,
 		prov:         prov,
@@ -195,37 +306,128 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 		bootSem:      semaphore.NewWeighted(maxConcurrentBoots),
 		workerCtx:    wctx,
 		workerCancel: wcancel,
-	}, nil
+		profiles:     make(map[string]*profileState, len(cfg.Profiles)),
+		profileOrder: make([]string, 0, len(cfg.Profiles)),
+	}
+	for _, p := range cfg.Profiles {
+		m.profiles[p.Name] = &profileState{
+			settings: p,
+			refill:   make(chan struct{}, 1),
+		}
+		m.profileOrder = append(m.profileOrder, p.Name)
+	}
+	return m, nil
 }
 
-// SignalRefill nudges the reconcile loop without blocking.
+// defaultProfile returns the profile name to use when a caller doesn't
+// specify one — the first declared profile (which is the synthesised
+// "default" profile in single-profile configs).
+func (m *manager) defaultProfile() string {
+	return m.profileOrder[0]
+}
+
+// profileOf returns the profileState for the given name, falling back
+// to the default profile when name is empty. Returns nil for an
+// unknown explicit name so callers can surface a clear error.
+func (m *manager) profileOf(name string) *profileState {
+	if name == "" {
+		return m.profiles[m.defaultProfile()]
+	}
+	return m.profiles[name]
+}
+
+// signalProfileRefill nudges one profile's reconcile loop without
+// waking sibling loops.
+func (m *manager) signalProfileRefill(profile string) {
+	ps := m.profileOf(profile)
+	if ps == nil {
+		return
+	}
+	select {
+	case ps.refill <- struct{}{}:
+	default:
+	}
+}
+
+// SignalRefill nudges every per-profile reconcile loop. The
+// fleet-wide channel is also signalled so callers waiting on it
+// (legacy single-profile path) wake up.
 func (m *manager) SignalRefill() {
 	select {
 	case m.refill <- struct{}{}:
 	default:
 	}
+	for _, name := range m.profileOrder {
+		m.signalProfileRefill(name)
+	}
 }
 
 // SetDesiredCount records the listener-side "total assigned jobs" so
 // reconcile can scale up beyond HotSize when the burst calls for it.
+// Fleet-wide aggregate. In single-profile configs (the only
+// production shape today) the value flows through to the default
+// profile's desiredCount. With multi-profile configs the per-profile
+// split is the caller's responsibility (PR 2 / #7 — label routing);
+// until that lands, the value is also applied to the default profile.
 func (m *manager) SetDesiredCount(n int) {
 	if n < 0 {
 		n = 0
 	}
-	prev := m.desiredCount.Swap(int32(n))
+	prev := m.desiredCount.Swap(int32(n)) // #nosec G115 -- n is bounded by GitHub's signal; clamped above
 	if int(prev) != n {
 		m.log.Debug("desired count updated", "from", prev, "to", n)
+	}
+	if ps := m.profileOf(""); ps != nil {
+		ps.desiredCount.Store(int32(n)) // #nosec G115 -- see above
 	}
 	m.SignalRefill()
 }
 
-// Stats returns a pool-population snapshot.
+// Stats returns the orchestrator-wide pool-population snapshot.
+// PoolSize gauge is emitted PER PROFILE rather than fleet-wide so
+// dashboards can slice by hardware shape; the returned aggregate
+// Stats keeps the previous shape for backwards-compatible callers
+// (admin API, tests).
 func (m *manager) Stats(_ context.Context) (Stats, error) {
 	raw, err := m.store.Stats()
 	if err != nil {
 		return Stats{}, fmt.Errorf("stats: %w", err)
 	}
-	stats := Stats{
+	stats := statsFromRaw(raw)
+	if m.metrics != nil {
+		for _, name := range m.profileOrder {
+			perProfile, perr := m.store.StatsByProfile(name)
+			if perr != nil {
+				continue
+			}
+			for st, n := range perProfile {
+				m.metrics.PoolSize.WithLabelValues(name, string(st)).Set(float64(n))
+			}
+		}
+	}
+	return stats, nil
+}
+
+// statsForProfile returns the population snapshot scoped to a single
+// profile. Used by the per-profile reconcile loop. store.Insert
+// stamps every row with a non-empty Profile (default-profile name
+// when unset), so this is a single profile-scoped query.
+func (m *manager) statsForProfile(profile string) (Stats, error) {
+	raw, err := m.store.StatsByProfile(profile)
+	if err != nil {
+		return Stats{}, fmt.Errorf("stats: %w", err)
+	}
+	if m.metrics != nil {
+		for st, n := range raw {
+			m.metrics.PoolSize.WithLabelValues(profile, string(st)).Set(float64(n))
+		}
+	}
+	return statsFromRaw(raw), nil
+}
+
+// statsFromRaw projects a store-state map into the Stats struct.
+func statsFromRaw(raw map[store.State]int) Stats {
+	return Stats{
 		Provisioning: raw[store.StateProvisioning],
 		Warm:         raw[store.StateWarm],
 		Booting:      raw[store.StateBooting],
@@ -236,22 +438,22 @@ func (m *manager) Stats(_ context.Context) (Stats, error) {
 		Destroying:   raw[store.StateDestroying],
 		Poison:       raw[store.StatePoison],
 	}
-	if m.metrics != nil {
-		for st, n := range raw {
-			m.metrics.PoolSize.WithLabelValues(string(st)).Set(float64(n))
-		}
-	}
-	return stats, nil
 }
 
-// Acquire atomically transitions one Hot VM to Assigned. Selection is by
-// oldest-Hot-first (preferring VMs near max-age recycle so we don't carry
-// stale VMs forever).
+// Acquire atomically transitions one Hot VM to Assigned. Selection
+// is by oldest-Hot-first (preferring VMs near max-age recycle so we
+// don't carry stale VMs forever).
 //
-// The cap check (busy < MaxConcurrentRunners; additionally busy < maxBusy
-// when maxBusy > 0) and the Hot→Assigned CAS happen inside the same store
-// write transaction, so concurrent Acquire callers cannot over-provision
-// past either ceiling.
+// Profile-agnostic: picks the oldest Hot VM across ALL profiles. The
+// per-call maxBusy clamp applies to the orchestrator-wide busy count.
+// This is the backwards-compatible single-profile entry point;
+// multi-profile callers that want per-profile scoping should use
+// AcquireForProfile.
+//
+// The cap check (busy < MaxConcurrentRunners; additionally busy <
+// maxBusy when maxBusy > 0) and the Hot→Assigned CAS happen inside
+// the same store write transaction, so concurrent Acquire callers
+// cannot over-provision past either ceiling.
 func (m *manager) Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, error) {
 	ctx, span := tracer.Start(ctx, "pool.Acquire",
 		trace.WithAttributes(attribute.Int64("job.id", jobID)))
@@ -279,7 +481,53 @@ func (m *manager) Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, e
 		attribute.String("vm.node", row.Node),
 	)
 	m.SignalRefill()
-	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name}, nil
+	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}, nil
+}
+
+// AcquireForProfile is the profile-aware variant of Acquire. An
+// explicit profile name scopes both the Hot-VM search and the
+// maxBusy clamp to that profile (so one profile can't starve
+// another). An empty profile name falls back to Acquire's
+// profile-agnostic behaviour for backwards compatibility. Unknown
+// explicit names return an error.
+func (m *manager) AcquireForProfile(ctx context.Context, jobID int64, profile string, maxBusy int) (*VM, error) {
+	if profile == "" {
+		return m.Acquire(ctx, jobID, maxBusy)
+	}
+	ps := m.profileOf(profile)
+	if ps == nil {
+		return nil, fmt.Errorf("acquire: unknown profile %q", profile)
+	}
+	resolved := ps.settings.Name
+	ctx, span := tracer.Start(ctx, "pool.Acquire", trace.WithAttributes(
+		attribute.Int64("job.id", jobID),
+		attribute.String("pool.profile", resolved),
+	))
+	defer span.End()
+	_ = ctx
+	row, err := m.store.AcquireHotInProfile(resolved, jobID, m.cfg.MaxConcurrentRunners, maxBusy)
+	switch {
+	case errors.Is(err, store.ErrAtCapacity):
+		span.SetStatus(codes.Ok, "at_capacity")
+		if m.metrics != nil {
+			m.metrics.AtCapacityTotal.Inc()
+		}
+		return nil, ErrAtCapacity
+	case errors.Is(err, store.ErrNoneAvailable):
+		span.SetStatus(codes.Ok, "none_available")
+		m.signalProfileRefill(resolved)
+		return nil, ErrNoneAvailable
+	case err != nil:
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, fmt.Errorf("acquire: %w", err)
+	}
+	span.SetAttributes(
+		attribute.Int("vm.id", row.VMID),
+		attribute.String("vm.node", row.Node),
+	)
+	m.signalProfileRefill(resolved)
+	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: resolved}, nil
 }
 
 // SetRunnerID stamps RunnerID on the row without changing state. Used by
@@ -395,6 +643,7 @@ func (m *manager) ListRows(_ context.Context) ([]RowSnapshot, error) {
 			VMID:       r.VMID,
 			Node:       r.Node,
 			Name:       r.Name,
+			Profile:    r.Profile,
 			State:      string(r.State),
 			JobID:      r.JobID,
 			RunnerID:   r.RunnerID,
@@ -520,10 +769,24 @@ func (m *manager) Adopt(ctx context.Context) error {
 // without leaking the loop control structure into the classification.
 func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) {
 	state, kind, runnerID := m.classifyAdoption(ctx, pv, runners)
+	// Route the adopted VM into a known profile. An unrecognised
+	// profile name (operator removed a profile config but VMs from
+	// it still exist on Proxmox) is force-routed to the default
+	// profile so the destroyer can still recycle the row instead of
+	// leaving it orphaned.
+	profile := pv.Profile
+	if profile == "" || m.profileOf(profile) == nil {
+		if profile != "" {
+			m.log.Warn("adopt: unknown profile on inherited vm; routing to default",
+				"vmid", pv.VMID, "profile", profile, "default", m.defaultProfile())
+		}
+		profile = m.defaultProfile()
+	}
 	row := &store.VM{
 		VMID:     pv.VMID,
 		Node:     pv.Node,
 		Name:     pv.Name,
+		Profile:  profile,
 		PoolKind: kind,
 		State:    state,
 		RunnerID: runnerID,
@@ -534,10 +797,10 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		return
 	}
 	m.log.Info("adopt: inherited vm",
-		"vmid", pv.VMID, "node", pv.Node, "name", pv.Name,
+		"vmid", pv.VMID, "node", pv.Node, "name", pv.Name, "profile", profile,
 		"state", state, "pool_kind", kind, "runner_id", runnerID)
 	if m.metrics != nil {
-		m.metrics.VMsTotal.WithLabelValues("adopted_" + string(state)).Inc()
+		m.metrics.VMsTotal.WithLabelValues(profile, "adopted_"+string(state)).Inc()
 	}
 }
 
@@ -592,14 +855,11 @@ func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runn
 // when the runner exits). The poller exits when ctx is cancelled; like
 // the reconcile loop it's bounded by the manager's lifetime.
 func (m *manager) Run(ctx context.Context) error {
-	tick := time.NewTicker(m.cfg.ReconcileInterval)
-	defer tick.Stop()
-
-	// Kick once on entry.
+	// Kick once on entry so every profile reconciles immediately.
 	m.SignalRefill()
 
-	// Power-state poller. Runs independently of the reconcile loop so
-	// a slow Proxmox reply doesn't delay reconcile and vice versa.
+	// Power-state poller. Runs independently of the reconcile loops
+	// so a slow Proxmox reply doesn't delay reconcile and vice versa.
 	pollerDone := make(chan struct{})
 	go func() {
 		defer close(pollerDone)
@@ -607,15 +867,52 @@ func (m *manager) Run(ctx context.Context) error {
 	}()
 	defer func() { <-pollerDone }()
 
+	// Per-profile reconcile loops. Each profile's reconcile is
+	// independent — one profile's saturated clone budget doesn't
+	// delay another's. Async workers still share workerCtx and the
+	// concurrency semaphores so total Proxmox parallelism is
+	// fleet-wide bounded.
+	loopsDone := make(chan struct{})
+	go func() {
+		defer close(loopsDone)
+		var wg sync.WaitGroup
+		for _, name := range m.profileOrder {
+			wg.Add(1)
+			go func(profile string) {
+				defer wg.Done()
+				m.runProfileLoop(ctx, profile)
+			}(name)
+		}
+		wg.Wait()
+	}()
+
+	<-ctx.Done()
+	m.drain()
+	<-loopsDone
+	return nil
+}
+
+// runProfileLoop is one profile's reconcile loop. Exits when ctx is
+// cancelled; drain is fleet-wide and handled by Run after loops
+// return.
+func (m *manager) runProfileLoop(ctx context.Context, profile string) {
+	ps := m.profileOf(profile)
+	if ps == nil {
+		return
+	}
+	tick := time.NewTicker(m.cfg.ReconcileInterval)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			m.drain()
-			return nil
+			return
 		case <-tick.C:
-			m.reconcileOnce(ctx)
+			m.reconcileProfileOnce(ctx, profile)
+		case <-ps.refill:
+			m.reconcileProfileOnce(ctx, profile)
 		case <-m.refill:
-			m.reconcileOnce(ctx)
+			// Fleet-wide refill — every profile loop wakes.
+			m.reconcileProfileOnce(ctx, profile)
 		}
 	}
 }
@@ -695,9 +992,27 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 	}
 }
 
-// reconcileOnce computes the desired pool population and dispatches the
-// async operations to reach it.
+// reconcileOnce is kept as a thin wrapper that delegates to the
+// default profile's reconcile. Retained so existing tests that drive
+// reconcile directly continue to work; new code should call
+// reconcileProfileOnce.
 func (m *manager) reconcileOnce(ctx context.Context) {
+	for _, name := range m.profileOrder {
+		m.reconcileProfileOnce(ctx, name)
+	}
+}
+
+// reconcileProfileOnce computes the desired pool population for a
+// single profile and dispatches the async operations to reach it.
+// Profile-scoped: per-profile hot/warm sizes, per-profile busy
+// counts, per-profile shrink/recycle. Shared resources (semaphores,
+// VMID allocator) remain fleet-wide so total Proxmox concurrency is
+// bounded.
+func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
+	ps := m.profileOf(profile)
+	if ps == nil {
+		return
+	}
 	start := time.Now()
 	defer func() {
 		if m.metrics != nil {
@@ -705,20 +1020,22 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 		}
 	}()
 
-	stats, err := m.Stats(ctx)
+	stats, err := m.statsForProfile(profile)
 	if err != nil {
-		m.log.Warn("reconcile: stats failed", "err", err)
+		m.log.Warn("reconcile: stats failed", "profile", profile, "err", err)
 		return
 	}
-
+	// Fleet-wide pool_kind/state counts are good enough for the
+	// in-flight-clone headroom check because the VMID allocator is
+	// fleet-wide and provisioner.InFlightCloneCount() is too.
 	hotProv, err := m.store.CountByPoolKindState(store.PoolKindHot, store.StateProvisioning)
 	if err != nil {
-		m.log.Warn("reconcile: count hot-provisioning failed", "err", err)
+		m.log.Warn("reconcile: count hot-provisioning failed", "profile", profile, "err", err)
 		return
 	}
 	warmProv, err := m.store.CountByPoolKindState(store.PoolKindWarm, store.StateProvisioning)
 	if err != nil {
-		m.log.Warn("reconcile: count warm-provisioning failed", "err", err)
+		m.log.Warn("reconcile: count warm-provisioning failed", "profile", profile, "err", err)
 		return
 	}
 	// Two reasons to clone a hot VM:
@@ -735,12 +1052,20 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 	// see an empty store and each spawn HotSize clones — producing
 	// the "current_hot=4 target=3" over-provision the production
 	// reproducer captured.
+	// Provisioner.InFlightCloneCount() is fleet-wide; using it for a
+	// single profile's headroom over-counts when other profiles are
+	// cloning concurrently, but only in the safe direction (we under-
+	// dispatch this profile's needed clones for one tick).
 	inflight := m.prov.InFlightCloneCount()
 	available := stats.Available() + hotProv + inflight
 	busy := stats.Busy()
-	desired := int(m.desiredCount.Load())
+	desired := int(ps.desiredCount.Load())
 
-	needIdle := m.cfg.HotSize - available
+	hotSize := ps.settings.HotSize
+	warmSize := ps.settings.WarmSize
+	profileMax := ps.settings.MaxConcurrentRunners
+
+	needIdle := hotSize - available
 	needBurst := desired - (available + busy)
 	needHot := needIdle
 	if needBurst > needHot {
@@ -749,8 +1074,8 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 	if needHot < 0 {
 		needHot = 0
 	}
-	// Cap by remaining room under MaxConcurrentRunners.
-	if room := m.cfg.MaxConcurrentRunners - (available + busy); room < needHot {
+	// Cap by remaining room under this profile's MaxConcurrentRunners.
+	if room := profileMax - (available + busy); room < needHot {
 		needHot = room
 	}
 	if needHot < 0 {
@@ -758,59 +1083,44 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 	}
 
 	warmInflight := stats.LiveWarm() + warmProv
-	needWarm := m.cfg.WarmSize - warmInflight
+	needWarm := warmSize - warmInflight
 	if needWarm < 0 {
 		needWarm = 0
 	}
 
 	// Promote warm -> hot first (cheap).
-	promoteN := needHot
-	if promoteN > stats.Warm {
-		promoteN = stats.Warm
+	promoteCount := needHot
+	if promoteCount > stats.Warm {
+		promoteCount = stats.Warm
 	}
-	if promoteN > 0 {
-		m.promoteN(ctx, promoteN)
-		needHot -= promoteN
+	if promoteCount > 0 {
+		m.promoteN(ctx, profile, promoteCount)
+		needHot -= promoteCount
 	}
 
 	// Clone whatever's left.
 	for range needHot {
-		m.kickClone(ctx, store.PoolKindHot, true)
+		m.kickClone(ctx, profile, store.PoolKindHot, true)
 	}
 	for range needWarm {
-		m.kickClone(ctx, store.PoolKindWarm, false)
+		m.kickClone(ctx, profile, store.PoolKindWarm, false)
 	}
 
-	// Shrink-to-floor: when the hot pool has grown beyond what we need
-	// (typically after a burst completes and demand collapses back to
-	// 0), destroy the excess. Target floor is max(HotSize, current
-	// burst demand) — never go below HotSize, and never below the
-	// shortfall the burst path is still trying to satisfy. Oldest hot
-	// VMs are destroyed first so younger ones get full vm_max_age.
-	//
-	// We use a CAS (Hot -> Draining) so an in-flight Acquire can't
-	// snipe a VM we just decided to destroy.
-	hotTarget := m.cfg.HotSize
+	// Shrink-to-floor: when the hot pool has grown beyond what we
+	// need (typically after a burst completes and demand collapses
+	// back to 0), destroy the excess. Per-profile scope so a quiet
+	// profile shrinks even while a busy sibling stays at cap.
+	hotTarget := hotSize
 	if burstTarget := desired - busy; burstTarget > hotTarget {
 		hotTarget = burstTarget
 	}
-	// Re-snapshot Stats before evaluating shrink. The original `stats`
-	// read at the top of reconcileOnce may be milliseconds-to-seconds
-	// stale: Booting rows can have promoted to Hot while we were
-	// dispatching clones. Using the stale count to decide whether to
-	// shrink can both miss legitimate shrinks AND fire spurious ones.
-	// A fresh read here costs one extra store transaction per tick and
-	// makes the shrink decision based on the current truth. On error
-	// we just skip the shrink path for this tick — the stuck-state
-	// sweep below is independent and still worth running.
-	freshStats, statsErr := m.Stats(ctx)
+	freshStats, statsErr := m.statsForProfile(profile)
 	if statsErr != nil {
-		m.log.Warn("reconcile: re-stats failed; skipping shrink this tick", "err", statsErr)
+		m.log.Warn("reconcile: re-stats failed; skipping shrink this tick", "profile", profile, "err", statsErr)
 	} else if freshStats.Hot > hotTarget {
 		excess := freshStats.Hot - hotTarget
-		hotRows, err := m.store.ListByState(store.StateHot)
+		hotRows, err := m.store.ListByProfileAndStates(profile, store.StateHot)
 		if err == nil {
-			// Oldest first.
 			sort.Slice(hotRows, func(i, j int) bool {
 				return hotRows[i].CreatedAt.Before(hotRows[j].CreatedAt)
 			})
@@ -826,58 +1136,35 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 					continue
 				}
 				m.log.Info("shrink: hot pool over target; destroying excess",
-					"vmid", row.VMID, "hot_size", m.cfg.HotSize, "target", hotTarget, "current_hot", freshStats.Hot)
+					"vmid", row.VMID, "profile", profile, "hot_size", hotSize, "target", hotTarget, "current_hot", freshStats.Hot)
 				m.destroyAsync(row.VMID, row.Node)
 				killed++
 			}
 		}
 	}
 
-	// Stuck-state sweep: rows that have been in a Proxmox-side
-	// transient state for too long (typically because Proxmox returned
-	// a transient error during clone/start/destroy) get re-queued.
-	// This keeps the orchestrator self-healing — a one-time API blip
-	// can't leave the pool in a permanently degraded state.
-	//
-	// Division of labor: this sweep ONLY covers the Proxmox-driven
-	// states (provisioning/booting/draining/destroying). The
-	// GitHub-driven states (assigned/running) are owned by the
-	// gh.Reconciler, which has the runner-side ground truth needed to
-	// distinguish "stuck" from "legitimately waiting on a long job".
-	const stuckGrace = 5 * time.Minute
-	stuckCutoff := time.Now().Add(-stuckGrace)
-	stuckCandidates, err := m.store.ListByState(
-		store.StateProvisioning, store.StateBooting,
-		store.StateDraining, store.StateDestroying,
-	)
-	if err == nil {
-		for _, s := range stuckCandidates {
-			if !s.UpdatedAt.Before(stuckCutoff) {
-				continue
-			}
-			m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy",
-				"vmid", s.VMID, "state", s.State, "age", time.Since(s.UpdatedAt))
-			// Force-transition to draining (idempotent) and kick destroy.
-			// The destroy path is idempotent on the Proxmox side too.
-			if _, err := m.store.Update(s.VMID, func(v *store.VM) {
-				v.State = store.StateDraining
-				v.StateSince = time.Now()
-			}); err == nil {
-				m.destroyAsync(s.VMID, s.Node)
-			}
-		}
+	// Stuck-state sweep is fleet-wide (transient-state issues aren't
+	// profile-specific). Only one profile's loop needs to run it
+	// each tick — pin it to the default profile to avoid N parallel
+	// sweeps doing the same work.
+	if profile == m.defaultProfile() {
+		m.sweepStuckRows()
 	}
 
-	// VM-max-age recycle: destroy idle Hot/Warm VMs older than the limit.
-	if m.cfg.VMMaxAge > 0 {
-		cutoff := time.Now().Add(-m.cfg.VMMaxAge)
-		olds, err := m.store.ListByState(store.StateHot, store.StateWarm)
+	// VM-max-age recycle: destroy idle Hot/Warm VMs in THIS profile
+	// older than the profile's max-age. Per-profile because the
+	// profile setting can override the global default.
+	maxAge := ps.settings.VMMaxAge
+	if maxAge > 0 {
+		cutoff := time.Now().Add(-maxAge)
+		olds, err := m.store.ListByProfileAndStates(profile, store.StateHot, store.StateWarm)
 		if err == nil {
 			for _, o := range olds {
 				if !o.CreatedAt.Before(cutoff) {
 					continue
 				}
-				m.log.Info("recycle: vm exceeded max age", "vmid", o.VMID, "age", time.Since(o.CreatedAt))
+				m.log.Info("recycle: vm exceeded max age",
+					"vmid", o.VMID, "profile", profile, "age", time.Since(o.CreatedAt))
 				if _, err := m.store.Update(o.VMID, func(v *store.VM) {
 					v.State = store.StateDraining
 					v.StateSince = time.Now()
@@ -889,13 +1176,49 @@ func (m *manager) reconcileOnce(ctx context.Context) {
 	}
 }
 
-// promoteN moves up to n Warm VMs to Booting and kicks Start+WaitReady in
-// the background for each. Oldest-Warm-first so warm VMs near max-age
-// recycle get used before the recycler reaps them.
-func (m *manager) promoteN(_ context.Context, n int) {
-	warms, err := m.store.ListByState(store.StateWarm)
+// sweepStuckRows is the fleet-wide transient-state sweep extracted
+// from the old reconcileOnce so a single profile's loop can run it
+// without forcing N concurrent sweeps in multi-profile configs.
+func (m *manager) sweepStuckRows() {
+	const stuckGrace = 5 * time.Minute
+	stuckCutoff := time.Now().Add(-stuckGrace)
+	stuckCandidates, err := m.store.ListByState(
+		store.StateProvisioning, store.StateBooting,
+		store.StateDraining, store.StateDestroying,
+	)
 	if err != nil {
-		m.log.Warn("promote: list warm failed", "err", err)
+		return
+	}
+	for _, s := range stuckCandidates {
+		if !s.UpdatedAt.Before(stuckCutoff) {
+			continue
+		}
+		m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy",
+			"vmid", s.VMID, "state", s.State, "age", time.Since(s.UpdatedAt))
+		if _, err := m.store.Update(s.VMID, func(v *store.VM) {
+			v.State = store.StateDraining
+			v.StateSince = time.Now()
+		}); err == nil {
+			m.destroyAsync(s.VMID, s.Node)
+		}
+	}
+}
+
+// promoteN moves up to n Warm VMs in the given profile to Booting
+// and kicks Start+WaitReady in the background for each. Oldest-Warm-
+// first so warm VMs near max-age recycle get used before the
+// recycler reaps them. An empty profile name selects warms across
+// every profile (used only by legacy code paths in tests).
+func (m *manager) promoteN(_ context.Context, profile string, n int) {
+	var warms []*store.VM
+	var err error
+	if profile == "" {
+		warms, err = m.store.ListByState(store.StateWarm)
+	} else {
+		warms, err = m.store.ListByProfileAndStates(profile, store.StateWarm)
+	}
+	if err != nil {
+		m.log.Warn("promote: list warm failed", "profile", profile, "err", err)
 		return
 	}
 	sort.Slice(warms, func(i, j int) bool { return warms[i].CreatedAt.Before(warms[j].CreatedAt) })
@@ -937,17 +1260,22 @@ func (m *manager) promoteN(_ context.Context, n int) {
 	}
 }
 
-// kickClone dispatches a single async clone operation, bounded by the
-// concurrency semaphore. If the semaphore can't be acquired (ctx done
-// during shutdown, or burst already saturated) the spawn is dropped —
-// the next reconcile pass will retry.
+// kickClone dispatches a single async clone operation, bounded by
+// the concurrency semaphore. If the semaphore can't be acquired (ctx
+// done during shutdown, or burst already saturated) the spawn is
+// dropped — the next reconcile pass will retry.
 //
 // The deferred panic-recover closure captures vmid by reference so a
 // panic that fires AFTER allocateVMID succeeded logs the real vmid,
 // not the goroutine-entry value of 0.
-func (m *manager) kickClone(ctx context.Context, kind store.PoolKind, poweredOn bool) {
+//
+// profile names the runner profile the clone is being made for; the
+// name is stamped on the store row and threaded into CloneOptions so
+// the provisioner can apply per-profile tags and hardware overrides.
+// An empty profile name selects the default profile.
+func (m *manager) kickClone(ctx context.Context, profile string, kind store.PoolKind, poweredOn bool) {
 	if err := m.cloneSem.Acquire(ctx, 1); err != nil {
-		m.log.Debug("clone: dropping spawn (semaphore unavailable)", "kind", kind, "err", err)
+		m.log.Debug("clone: dropping spawn (semaphore unavailable)", "profile", profile, "kind", kind, "err", err)
 		return
 	}
 	m.wg.Add(1)
@@ -958,15 +1286,26 @@ func (m *manager) kickClone(ctx context.Context, kind store.PoolKind, poweredOn 
 		defer m.wg.Done()
 		defer func() { m.logRecoveredPanic("clone", vmid, recover()) }()
 		defer m.cloneSem.Release(1)
-		m.runClone(kind, poweredOn, &vmid)
+		m.runClone(profile, kind, poweredOn, &vmid)
 	}()
 }
 
-// runClone is the body of an async clone goroutine. The caller passes
-// a *int that runClone writes the allocated vmid into as soon as
-// allocation succeeds — so the surrounding goroutine's panic-recover
-// closure can log the real vmid if a panic fires later in the body.
-func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
+// runClone is the body of an async clone goroutine. The caller
+// passes a *int that runClone writes the allocated vmid into as soon
+// as allocation succeeds — so the surrounding goroutine's panic-
+// recover closure can log the real vmid if a panic fires later in
+// the body.
+//
+// profile selects the per-profile hardware shape and labels the
+// clone with the matching tag. An empty profile name maps to the
+// manager's default profile.
+func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int) {
+	ps := m.profileOf(profile)
+	if ps == nil {
+		m.log.Warn("clone: unknown profile; aborting", "profile", profile)
+		return
+	}
+	profileName := ps.settings.Name
 	// Derived from workerCtx so SIGTERM (and drain timeout) propagate
 	// into in-flight Proxmox calls. 15-minute deadline caps a single
 	// stuck call.
@@ -1007,6 +1346,7 @@ func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
 		VMID:     vmid,
 		Node:     node,
 		Name:     name,
+		Profile:  profileName,
 		PoolKind: kind,
 		State:    store.StateProvisioning,
 	}
@@ -1017,21 +1357,31 @@ func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
 	}
 	m.allocMu.Unlock()
 
-	span.SetAttributes(attribute.Int("vm.id", vmid), attribute.String("vm.node", node))
+	span.SetAttributes(
+		attribute.Int("vm.id", vmid),
+		attribute.String("vm.node", node),
+		attribute.String("pool.profile", profileName),
+	)
 	cloneStart := time.Now()
 	pv, err := m.prov.Clone(ctx, provisioner.CloneOptions{
-		NewVMID:   vmid,
-		Node:      node,
-		Name:      name,
-		Linked:    m.cfg.LinkedClones,
-		PoweredOn: poweredOn,
+		NewVMID:      vmid,
+		Node:         node,
+		Name:         name,
+		Linked:       m.cfg.LinkedClones,
+		PoweredOn:    poweredOn,
+		Profile:      profileName,
+		TemplateVMID: ps.settings.TemplateVMID,
+		CPUCores:     ps.settings.CPUCores,
+		MemoryMB:     ps.settings.MemoryMB,
+		DiskGB:       ps.settings.DiskGB,
+		Storage:      ps.settings.Storage,
 	})
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "clone failed")
 		m.log.Warn("clone: provisioner failed", "vmid", vmid, "err", err)
 		if m.metrics != nil {
-			m.metrics.VMsTotal.WithLabelValues("clone-failed").Inc()
+			m.metrics.VMsTotal.WithLabelValues(profileName, "clone-failed").Inc()
 		}
 		// Mark the row destroying and let the destroy path clean up.
 		if _, updErr := m.store.Update(vmid, func(v *store.VM) {
@@ -1044,8 +1394,8 @@ func (m *manager) runClone(kind store.PoolKind, poweredOn bool, vmidRef *int) {
 		return
 	}
 	if m.metrics != nil {
-		m.metrics.CloneDuration.WithLabelValues(fmt.Sprintf("%t", m.cfg.LinkedClones), node).Observe(time.Since(cloneStart).Seconds())
-		m.metrics.VMsTotal.WithLabelValues("clone-success").Inc()
+		m.metrics.CloneDuration.WithLabelValues(profileName, fmt.Sprintf("%t", m.cfg.LinkedClones), node).Observe(time.Since(cloneStart).Seconds())
+		m.metrics.VMsTotal.WithLabelValues(profileName, "clone-success").Inc()
 	}
 
 	// Transition row to warm (if not powered on) or booting (if powered on).
@@ -1109,7 +1459,7 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 		return
 	}
 	if m.metrics != nil {
-		m.metrics.BootDuration.WithLabelValues(row.Node).Observe(time.Since(bootStart).Seconds())
+		m.metrics.BootDuration.WithLabelValues(row.Profile, row.Node).Observe(time.Since(bootStart).Seconds())
 	}
 	if _, err := m.store.Update(row.VMID, func(v *store.VM) {
 		v.State = store.StateHot
@@ -1238,11 +1588,15 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 		m.log.Warn("destroy: delete row failed", "vmid", vmid, "err", err)
 	}
 	var runnerID int64
+	destroyedProfile := defaultProfileName
 	if deleted != nil {
 		runnerID = deleted.RunnerID
+		if deleted.Profile != "" {
+			destroyedProfile = deleted.Profile
+		}
 	}
 	if m.metrics != nil {
-		m.metrics.VMsTotal.WithLabelValues("destroyed").Inc()
+		m.metrics.VMsTotal.WithLabelValues(destroyedProfile, "destroyed").Inc()
 	}
 
 	if runnerID != 0 && m.cfg.OnRunnerOrphaned != nil {

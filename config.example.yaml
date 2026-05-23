@@ -67,8 +67,12 @@ nodes:
   single_node: pve1               # only used when strategy = single
 
 pool:
-  hot_size: 2                     # always-booted idle runners
-  warm_size: 3                    # pre-cloned, powered-off runners
+  hot_size: 2                     # always-booted idle runners (default; profiles can override)
+  warm_size: 3                    # pre-cloned, powered-off runners (default; profiles can override)
+  # Optional fleet-wide ceiling on the sum of per-profile
+  # max_concurrent_runners. Validation rejects the config when the
+  # arithmetic exceeds this. Leave at 0 (default) for no cap.
+  # global_max: 50
   reconcile_interval: 10s
   vm_max_age: 24h                 # idle Hot/Warm VMs older than this are recycled
   drain_timeout: 30m              # max wait for running jobs on SIGTERM
@@ -97,6 +101,43 @@ pool:
   # Entries older than this are pruned by a background sweep in case
   # Clone hangs and never returns to clear them.
   clone_inflight_grace: 5m
+
+# Optional runner profiles — a named bundle of {labels, template,
+# hardware shape, per-profile pool sizing}. Each profile gets its
+# own reconcile loop and pool state; VMs are tagged with their
+# profile name so crash recovery routes them back into the right
+# pool.
+#
+# Omit the whole block and the orchestrator synthesises a single
+# "default" profile from the global pool / scaleset values above —
+# pre-profile configs keep working unchanged.
+#
+# Per-profile sizing knobs (hot_size, warm_size,
+# max_concurrent_runners, boot_max_attempts) accept an explicit 0;
+# leave them off entirely to inherit the global pool / scaleset
+# default.
+#
+# profiles:
+#   - name: linux-x64
+#     labels: [self-hosted, linux, x64]
+#     template_vmid: 9000           # optional override of the global proxmox.template_vmid
+#     cpu: 4                        # cores; 0 inherits the template default
+#     memory_mb: 8192               # 0 inherits the template default
+#     disk_gb: 0                    # 0 inherits the template default (resize is absolute)
+#     storage: ""                   # override of proxmox.storage.disk for full clones; "" inherits
+#     hot_size: 5
+#     warm_size: 10
+#     max_concurrent_runners: 20
+#     boot_max_attempts: 3
+#     vm_max_age: 12h               # per-profile recycle window
+#   - name: gpu
+#     labels: [self-hosted, linux, gpu]
+#     template_vmid: 9100
+#     cpu: 8
+#     memory_mb: 32768
+#     hot_size: 0                   # explicit 0 — no idle pool, clone on demand
+#     warm_size: 1
+#     max_concurrent_runners: 4
 
 observability:
   http_addr: ":9100"              # exposes /metrics /healthz /readyz

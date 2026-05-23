@@ -80,9 +80,10 @@ func (s Stats) LiveWarm() int { return s.Warm }
 // VM is the pool's external view of a managed VM. It is intentionally
 // thin; the full state row lives in the ent store.
 type VM struct {
-	VMID int
-	Node string
-	Name string
+	VMID    int
+	Node    string
+	Name    string
+	Profile string
 }
 
 // RowSnapshot is the reconciler's view of a single VM row. It excludes
@@ -93,6 +94,7 @@ type RowSnapshot struct {
 	VMID       int
 	Node       string
 	Name       string
+	Profile    string
 	State      string
 	JobID      int64
 	RunnerID   int64
@@ -136,6 +138,12 @@ type Manager interface {
 	// per-call clamp (only the orchestrator-wide
 	// MaxConcurrentRunners cap applies).
 	Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, error)
+
+	// AcquireForProfile is the profile-aware variant of Acquire. An
+	// empty profile name picks the default (first declared) profile.
+	// Returns an error for unknown explicit profile names. maxBusy
+	// is enforced per-profile when profile is non-empty.
+	AcquireForProfile(ctx context.Context, jobID int64, profile string, maxBusy int) (*VM, error)
 
 	// MarkRunning transitions a VM from Assigned to Running. Called from
 	// the scaleset listener's HandleJobStarted callback.
