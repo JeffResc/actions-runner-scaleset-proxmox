@@ -158,6 +158,19 @@ pool:
 #     max_concurrent_runners: 20
 #     boot_max_attempts: 3
 #     vm_max_age: 12h               # per-profile recycle window
+#     # Optional per-profile network. Each field is optional;
+#     # omitted ones inherit proxmox.network.*. ipam.backend
+#     # is "noop" (default; DHCP via cloud-init) or "static"
+#     # (in-memory pool fed by ipam.pool). External IPAM
+#     # backends (NetBox / Infoblox / phpIPAM) plug in behind
+#     # the same ipam.Allocator interface; none ship in-tree
+#     # yet because they need a live IPAM to verify.
+#     # network:
+#     #   bridge: vmbr0
+#     #   vlan_tag: 0
+#     #   mtu: 1500
+#     #   ipam:
+#     #     backend: noop
 #   - name: gpu
 #     labels: [self-hosted, linux, proxmox, gpu]
 #     template_vmid: 9100
@@ -166,6 +179,21 @@ pool:
 #     hot_size: 0                   # explicit 0 — no idle pool, clone on demand
 #     warm_size: 1
 #     max_concurrent_runners: 4
+#     network:
+#       bridge: vmbr1               # GPU VLAN
+#       vlan_tag: 30
+#       mtu: 9000                   # jumbo frames for the storage path
+#       extra_nics:
+#         - bridge: vmbr-storage    # second NIC for shared storage
+#           vlan_tag: 100
+#           mtu: 9000
+#       ipam:
+#         backend: static
+#         pool:
+#           - 10.0.30.10/24
+#           - 10.0.30.11/24
+#           - 10.0.30.12/24
+#           - 10.0.30.13/24
 
 # Optional per-org / per-repo concurrency caps. Both blocks are
 # OBSERVATIONAL today: the actions/scaleset listener surfaces

@@ -29,6 +29,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/gh"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/ipam"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
@@ -794,7 +795,73 @@ func profileSettingsFromConfig(cfg *config.Config) []pool.ProfileSettings {
 			MemoryMB:             p.MemoryMB,
 			DiskGB:               p.DiskGB,
 			Storage:              p.Storage,
+			NICs:                 nicsFromProfileNetwork(cfg, p),
+			IPAM:                 ipamFromProfileNetwork(p, slog.Default()),
 		})
 	}
 	return out
+}
+
+// nicsFromProfileNetwork builds the CloneNIC slice for one
+// profile, layering the optional per-profile network block over
+// the global proxmox.network defaults. Empty network = no NIC
+// override (the template's interfaces stay).
+func nicsFromProfileNetwork(cfg *config.Config, p config.ProfileConfig) []provisioner.CloneNIC {
+	if p.Network == nil {
+		return nil
+	}
+	primary := provisioner.CloneNIC{
+		Bridge:       firstNonEmpty(p.Network.Bridge, cfg.Proxmox.Network.Bridge),
+		VLANTag:      p.Network.VLANTag,
+		VLANUntagged: p.Network.VLANUntagged,
+		MTU:          p.Network.MTU,
+	}
+	// Fall back to the global VLAN tag when the profile didn't
+	// set its own (and isn't explicitly untagged).
+	if primary.VLANTag == 0 && !primary.VLANUntagged {
+		primary.VLANTag = cfg.Proxmox.Network.VLANTag
+	}
+	out := []provisioner.CloneNIC{primary}
+	for _, nic := range p.Network.ExtraNICs {
+		out = append(out, provisioner.CloneNIC{
+			Bridge:       nic.Bridge,
+			VLANTag:      nic.VLANTag,
+			VLANUntagged: nic.VLANUntagged,
+			MTU:          nic.MTU,
+		})
+	}
+	return out
+}
+
+// ipamFromProfileNetwork builds the per-profile IPAM allocator.
+// Returns ipam.Noop when no IPAM block is configured so the pool
+// manager can call Allocate/Release unconditionally.
+func ipamFromProfileNetwork(p config.ProfileConfig, log *slog.Logger) ipam.Allocator {
+	if p.Network == nil || p.Network.IPAM == nil {
+		return ipam.Noop{}
+	}
+	switch p.Network.IPAM.Backend {
+	case "static":
+		s, err := ipam.NewStatic(p.Network.IPAM.Pool)
+		if err != nil {
+			log.Warn("ipam: static allocator build failed; falling back to noop",
+				"profile", p.Name, "err", err)
+			return ipam.Noop{}
+		}
+		return s
+	case "noop", "":
+		return ipam.Noop{}
+	}
+	log.Warn("ipam: unknown backend; falling back to noop",
+		"profile", p.Name, "backend", p.Network.IPAM.Backend)
+	return ipam.Noop{}
+}
+
+// firstNonEmpty returns the first non-empty argument. Used to
+// layer a profile override over the global default.
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }

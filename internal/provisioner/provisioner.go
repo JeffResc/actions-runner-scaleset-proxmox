@@ -100,6 +100,42 @@ type CloneOptions struct {
 	MemoryMB     int
 	DiskGB       int
 	Storage      string
+
+	// NICs, when non-empty, sets the cloned VM's network
+	// interfaces post-clone (net0 is the first entry, net1 the
+	// second, ...). Nil leaves the template's NICs in place. The
+	// pool manager builds this from the profile's network config.
+	NICs []CloneNIC
+
+	// IPConfig, when non-empty, sets the Proxmox cloud-init
+	// ipconfig0 field (e.g. "ip=10.0.0.10/24,gw=10.0.0.1"). The
+	// VM boots with that address baked in by Proxmox's built-in
+	// cloud-init drive. Empty leaves ipconfig0 untouched (DHCP
+	// fallback or whatever the template configured).
+	IPConfig string
+}
+
+// CloneNIC describes one network interface attachment on a
+// cloned VM. Bridge is required; the rest are optional.
+type CloneNIC struct {
+	// Bridge is the Proxmox bridge name (e.g. "vmbr0"). Required.
+	Bridge string
+
+	// VLANTag tags the bridge; 0 = untagged (when VLANUntagged is
+	// false, 0 means "skip the tag= attribute entirely" so the
+	// bridge's VLAN-aware default applies).
+	VLANTag int
+
+	// VLANUntagged forces the NIC untagged even when VLANTag is
+	// 0 — disambiguates the zero-vs-omitted case.
+	VLANUntagged bool
+
+	// MTU sets the link MTU. 0 inherits the bridge default.
+	MTU int
+
+	// Model is the virtio model string; empty defaults to
+	// virtio (Proxmox's recommended high-performance driver).
+	Model string
 }
 
 // Provisioner is the contract the rest of the orchestrator uses to talk to
@@ -526,6 +562,20 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if opts.MemoryMB > 0 {
 		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "memory", Value: opts.MemoryMB})
 	}
+	// Network: stamp each NIC's net<idx> field. Proxmox's net%d
+	// syntax is "model=virtio,bridge=vmbr0,tag=42,mtu=9000" —
+	// build the string with the bits the operator opted into.
+	for i, nic := range opts.NICs {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{
+			Name:  fmt.Sprintf("net%d", i),
+			Value: encodeNIC(nic),
+		})
+	}
+	// Cloud-init IP: ipconfig0 maps to net0 by convention; that's
+	// the slot the orchestrator uses for the primary NIC.
+	if opts.IPConfig != "" {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "ipconfig0", Value: opts.IPConfig})
+	}
 	if _, err := newVM.Config(ctx, configOpts...); err != nil {
 		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
 	}
@@ -888,4 +938,27 @@ func isNotFound(err error) bool {
 // already-running VM" case.
 func isAlreadyRunning(err error) bool {
 	return errors.Is(classifyProxmoxError(err), ErrVMAlreadyRunning)
+}
+
+// encodeNIC renders a CloneNIC into Proxmox's net<idx> string
+// syntax (e.g. "virtio,bridge=vmbr0,tag=42,mtu=9000"). Empty
+// optional fields are omitted so Proxmox's defaults apply.
+//
+// Tag semantics:
+//   - VLANUntagged == true     → no tag= attribute (untagged)
+//   - VLANTag > 0              → tag=<N>
+//   - VLANTag == 0 && !Untagged → no tag= attribute (use bridge default)
+func encodeNIC(nic CloneNIC) string {
+	model := nic.Model
+	if model == "" {
+		model = "virtio"
+	}
+	parts := []string{model, "bridge=" + nic.Bridge}
+	if !nic.VLANUntagged && nic.VLANTag > 0 {
+		parts = append(parts, fmt.Sprintf("tag=%d", nic.VLANTag))
+	}
+	if nic.MTU > 0 {
+		parts = append(parts, fmt.Sprintf("mtu=%d", nic.MTU))
+	}
+	return strings.Join(parts, ",")
 }
