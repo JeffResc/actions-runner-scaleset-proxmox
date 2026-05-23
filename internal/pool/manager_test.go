@@ -649,6 +649,24 @@ func TestAllocateVMID_AvoidsCollisions(t *testing.T) {
 	require.Equal(t, 20001, id)
 }
 
+// TestAllocateVMID_HonorsCtxCancel locks in #154: a cancelled context
+// returns promptly from the alloc loop instead of being ignored. Uses
+// a wide range with no entries used and no cooldowns, so the only way
+// the function returns is via ctx (a successful allocation would
+// produce id=min on iteration 0).
+func TestAllocateVMID_HonorsCtxCancel(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		VMIDRange: config.VMIDRange{Min: 30000, Max: 30100},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before calling
+	_, err := mgr.allocateVMID(ctx)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestAllocateVMID_RangeExhausted(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
@@ -819,6 +837,46 @@ func TestReconcile_PoisonHonorsPerProfileBootMaxAttempts(t *testing.T) {
 // into the warm pool. Adopting (not destroying) is the load-bearing
 // invariant of the leader-takeover scenario: an in-progress job on a
 // warm slot must survive the handover.
+// TestAdoptionMatrix_AllCells pins the explicit state-matrix table —
+// the cells classifyAdoption looks up. Listing every (powerRunning,
+// runnerPresent, runnerBusy) triple here means a regression in the
+// table flips one assertion rather than slipping past the high-level
+// Adopt tests, which test a subset of the matrix.
+func TestAdoptionMatrix_AllCells(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		key        adoptionKey
+		wantState  store.State
+		wantKind   store.PoolKind
+		wantWithID bool
+	}{
+		// Powered off: every runner-snapshot combo collapses to Warm.
+		{adoptionKey{false, false, false}, store.StateWarm, store.PoolKindWarm, false},
+		{adoptionKey{false, false, true}, store.StateWarm, store.PoolKindWarm, false},
+		{adoptionKey{false, true, false}, store.StateWarm, store.PoolKindWarm, false},
+		{adoptionKey{false, true, true}, store.StateWarm, store.PoolKindWarm, false},
+		// Powered on, no runner: Hot.
+		{adoptionKey{true, false, false}, store.StateHot, store.PoolKindHot, false},
+		{adoptionKey{true, false, true}, store.StateHot, store.PoolKindHot, false},
+		// Powered on with a runner: Assigned (idle) / Running (busy).
+		{adoptionKey{true, true, false}, store.StateAssigned, store.PoolKindHot, true},
+		{adoptionKey{true, true, true}, store.StateRunning, store.PoolKindHot, true},
+	}
+	require.Len(t, adoptionMatrix, len(cases),
+		"adoptionMatrix must enumerate every (powerRunning, runnerPresent, runnerBusy) triple")
+	for _, c := range cases {
+		c := c
+		t.Run(fmt.Sprintf("pow=%t,present=%t,busy=%t", c.key.powerRunning, c.key.runnerPresent, c.key.runnerBusy), func(t *testing.T) {
+			t.Parallel()
+			class, ok := adoptionMatrix[c.key]
+			require.True(t, ok, "missing matrix entry for %#v", c.key)
+			require.Equal(t, c.wantState, class.state)
+			require.Equal(t, c.wantKind, class.kind)
+			require.Equal(t, c.wantWithID, class.withRunnerID)
+		})
+	}
+}
+
 func TestAdopt_PoweredOff_BecomesWarm(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
