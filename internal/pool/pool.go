@@ -37,6 +37,15 @@ var (
 	// runners; the GitHub side should queue jobs server-side until a
 	// running job completes.
 	ErrAtCapacity = errors.New("pool: at MaxConcurrentRunners")
+
+	// ErrManagerDeposed is returned by externally-callable Manager
+	// methods (Stats, ForceDestroy) when the manager's worker context
+	// has been cancelled — i.e. this replica has been deposed and the
+	// pool is mid-tear-down. Callers (typically the admin API) should
+	// translate this into a 503 + Retry-After rather than a generic
+	// 500: the request is recoverable by retrying against the new
+	// leader.
+	ErrManagerDeposed = errors.New("pool: manager deposed")
 )
 
 // Stats summarises the pool's current population.

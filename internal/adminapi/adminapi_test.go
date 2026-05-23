@@ -35,6 +35,7 @@ type fakePool struct {
 	mu              sync.Mutex
 	stats           pool.Stats
 	statsErr        error
+	forceDestroyErr error
 	markedCompleted []int
 	forceDestroyed  []int
 }
@@ -67,6 +68,9 @@ func (f *fakePool) PromoteToRunning(_ context.Context, _ int, _, _ int64) error 
 func (f *fakePool) ForceDestroy(_ context.Context, vmid int, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.forceDestroyErr != nil {
+		return f.forceDestroyErr
+	}
 	f.forceDestroyed = append(f.forceDestroyed, vmid)
 	return nil
 }
@@ -445,6 +449,45 @@ func TestDestroyVM_QueuesAndReturns202(t *testing.T) {
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
 	require.Contains(t, fp.forceDestroyed, 10042)
+}
+
+// TestState_PoolDeposedMidCallReturns503 covers the leader-handover
+// race: handleState passed the nil-pool gate but the manager was torn
+// down by the deposed callback before Stats ran. The pool surfaces
+// ErrManagerDeposed; the handler must convert that into a 503 +
+// Retry-After so the operator's metric doesn't see a spurious 500
+// every time leadership flaps.
+func TestState_PoolDeposedMidCallReturns503(t *testing.T) {
+	t.Parallel()
+	s, fp := newTestServer(t, "topsecret")
+	fp.statsErr = pool.ErrManagerDeposed
+	h := chiHandler(s)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	h.ServeHTTP(w, r)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Equal(t, "1", w.Header().Get("Retry-After"))
+}
+
+// TestDestroyVM_PoolDeposedMidCallReturns503 is the handleDestroyVM
+// twin of the handleState test above — ForceDestroy can race the
+// deposed callback too, and the same 503-not-500 mapping must apply.
+func TestDestroyVM_PoolDeposedMidCallReturns503(t *testing.T) {
+	t.Parallel()
+	s, fp := newTestServer(t, "topsecret")
+	fp.forceDestroyErr = pool.ErrManagerDeposed
+	h := chiHandler(s)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/destroy/10042", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	h.ServeHTTP(w, r)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Equal(t, "1", w.Header().Get("Retry-After"))
 }
 
 func TestDrain_TriggersCallback(t *testing.T) {
