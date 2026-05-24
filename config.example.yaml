@@ -37,6 +37,26 @@ github:
   # Used when auth_mode = pat. The token must be supplied via
   # SCALESET_GITHUB_PAT_TOKEN (not written into yaml).
   pat: {}
+  # GHES: point the orchestrator at your enterprise instance. The
+  # two override forms are mutually exclusive:
+  #
+  #   config_url      — full URL with the org/repo baked in. Use
+  #                     for single-scaleset GHES. Multi-scaleset
+  #                     deployments would force every scaleset to
+  #                     handshake against the same scope; the
+  #                     config validator rejects this combination.
+  #
+  #   config_base_url — scheme + host only. The orchestrator joins
+  #                     it with each scaleset's scope at runtime
+  #                     so per-scaleset clients hit the right
+  #                     /<org> path on the shared host. Required
+  #                     for multi-scaleset GHES (issue #214).
+  #
+  # Leave both empty when running against github.com — the default
+  # per-scope URL derivation already targets the right per-org
+  # endpoint.
+  #   config_url: https://ghes.example.com/my-org
+  #   config_base_url: https://ghes.example.com
 
   # Exactly one of org or repo.
   scope:

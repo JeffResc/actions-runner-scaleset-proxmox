@@ -771,7 +771,16 @@ func buildGitHubAuth(cfg *config.Config, override githubauth.Auth) (githubauth.A
 	}
 	switch cfg.GitHub.AuthMode {
 	case "pat":
-		return githubauth.NewPAT(cfg.GitHub.PAT.Token)
+		// Config-time validation guarantees ConfigURL and ConfigBaseURL
+		// aren't both set; pass them straight through to NewPATWithConfig
+		// which re-enforces the mutual-exclusion rule at the auth
+		// boundary (defence in depth — a future config refactor that
+		// forgets the validator still gets caught here).
+		return githubauth.NewPATWithConfig(githubauth.PATConfig{
+			Token:         cfg.GitHub.PAT.Token,
+			ConfigURL:     cfg.GitHub.PAT.ConfigURL,
+			ConfigBaseURL: cfg.GitHub.PAT.ConfigBaseURL,
+		})
 	case "app":
 		return githubauth.NewAppFromFile(
 			cfg.GitHub.App.Issuer(),
