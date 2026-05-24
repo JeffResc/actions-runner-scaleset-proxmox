@@ -414,3 +414,112 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	cancel()
 	wg.Wait()
 }
+
+// TestServe_ReadyzFlipsBackTo503OnDeposal pins the reverse
+// direction of TestServe_RespondsToProbes: once a leader is
+// deposed (MarkLeader(false) + ClearScalesetState) and Proxmox
+// staleness window elapses, /readyz must flip BACK to 503 so the
+// load balancer takes the standby out of rotation until it's
+// genuinely ready again. A regression that latches /readyz=200
+// after the first flip would leave a deposed/unreachable replica
+// silently serving traffic.
+func TestServe_ReadyzFlipsBackTo503OnDeposal(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := prometheus.NewRegistry()
+	observability.NewMetrics(reg)
+	// Short staleness window so the Proxmox-stale path below
+	// fires within the test's bounded runtime.
+	h := observability.NewHealth(50 * time.Millisecond)
+	log, _ := observability.NewLoggerTo(io.Discard, "error", "text")
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = observability.ServeOn(ctx, ln, reg, h, log)
+	}()
+
+	getReady := func() int {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/readyz", nil)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Bring everything up.
+	h.RegisterScaleset("a")
+	h.MarkLeader(true)
+	h.MarkScalesetListenerConnected("a")
+	h.MarkScalesetRecoveryDone("a")
+	h.MarkProxmoxOK()
+	require.Eventually(t, func() bool { return getReady() == http.StatusOK }, time.Second, 10*time.Millisecond,
+		"/readyz must flip to 200 once all gates are satisfied")
+
+	// Deposal: ClearScalesetState resets the leader-only gates.
+	// A leader-bound replica with cleared scaleset state is no
+	// longer ready, even though Proxmox is still fresh.
+	h.ClearScalesetState("a")
+	require.Eventually(t, func() bool { return getReady() == http.StatusServiceUnavailable }, time.Second, 10*time.Millisecond,
+		"/readyz must flip back to 503 after ClearScalesetState; latched 200 would silently keep a deposed replica in rotation")
+
+	cancel()
+	wg.Wait()
+}
+
+// TestServe_ReadyzFlipsBackTo503OnProxmoxStale covers the other
+// path back to 503: a previously-ready replica whose Proxmox
+// stops responding (no fresh MarkProxmoxOK within the staleness
+// window) must drop out of rotation. Without this assertion, a
+// regression that pinned the last-good timestamp could leave a
+// silently-broken standby answering 200 indefinitely.
+func TestServe_ReadyzFlipsBackTo503OnProxmoxStale(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reg := prometheus.NewRegistry()
+	observability.NewMetrics(reg)
+	// 30ms staleness window so the stale path fires quickly.
+	h := observability.NewHealth(30 * time.Millisecond)
+	log, _ := observability.NewLoggerTo(io.Discard, "error", "text")
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = observability.ServeOn(ctx, ln, reg, h, log)
+	}()
+	getReady := func() int {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/readyz", nil)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Standby (no leader gates required): Proxmox alone gates readiness.
+	h.MarkProxmoxOK()
+	require.Eventually(t, func() bool { return getReady() == http.StatusOK }, time.Second, 5*time.Millisecond)
+
+	// Stop touching Proxmox. After the staleness window
+	// elapses, /readyz must return 503 on the next probe.
+	require.Eventually(t, func() bool { return getReady() == http.StatusServiceUnavailable }, time.Second, 5*time.Millisecond,
+		"/readyz must surface stale-Proxmox as 503")
+
+	cancel()
+	wg.Wait()
+}
