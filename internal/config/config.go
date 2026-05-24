@@ -376,6 +376,23 @@ type ScaleSetEntry struct {
 	// MaxConcurrentRunners + the shared Pool defaults, matching
 	// the singular-form behaviour.
 	Profiles []ProfileConfig `yaml:"profiles,omitempty"`
+
+	// VMIDRange is the per-scaleset slice of the Proxmox VMID
+	// space this scaleset's pool.Manager allocates from. With
+	// multiple scalesets sharing one Proxmox endpoint, each
+	// pool.Manager runs its own allocator unaware of siblings
+	// — so a single shared cfg.Proxmox.VMIDRange would have
+	// every scaleset's allocator pick the same lowest-free ID
+	// and race on Proxmox clone (issue #222). Operators with
+	// N > 1 scalesets MUST declare a disjoint per-scaleset
+	// range; validation rejects overlap and rejects two
+	// scalesets sharing the fall-through global range.
+	//
+	// Nil (unset) inherits cfg.Proxmox.VMIDRange — the
+	// single-scaleset back-compat path. Pointer keeps the
+	// struct-tag validator from firing on its required
+	// Min/Max sub-fields for the inherit case.
+	VMIDRange *VMIDRange `yaml:"vmid_range,omitempty"`
 }
 
 // asScaleSetConfig returns the identity fields of e in the
@@ -1602,6 +1619,67 @@ func (c *Config) validateScalesets() error {
 		if c.Pool.HotSize+c.Pool.WarmSize > s.MaxConcurrentRunners {
 			return fmt.Errorf("scalesets[%d] %q: pool.hot_size+pool.warm_size (%d) must not exceed max_concurrent_runners (%d)",
 				i, s.Name, c.Pool.HotSize+c.Pool.WarmSize, s.MaxConcurrentRunners)
+		}
+	}
+	if err := c.validateScalesetVMIDRanges(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateScalesetVMIDRanges enforces the disjoint per-scaleset
+// VMID partitioning required by issue #222. Each scaleset's
+// pool.Manager runs its own allocator unaware of siblings, so
+// overlap means two managers will race to clone the same VMID
+// and one will lose to a Proxmox "already exists" error.
+//
+// Rules:
+//
+//   - With exactly one scaleset, inheriting cfg.Proxmox.VMIDRange
+//     is fine — there is no sibling to collide with.
+//   - With N > 1, every scaleset must declare its OWN vmid_range
+//     (inheriting the global would produce N copies of the same
+//     range). The error message points operators at the
+//     migration path.
+//   - Declared per-scaleset ranges must be in-bounds, well-
+//     formed (min > 0, max > min), and pairwise non-overlapping.
+//   - Declared ranges may overlap the global cfg.Proxmox.VMIDRange
+//     — operators sometimes use a wide global range and slice it
+//     into per-scaleset chunks.
+func (c *Config) validateScalesetVMIDRanges() error {
+	type bounded struct {
+		name     string
+		min, max int
+	}
+	declared := make([]bounded, 0, len(c.Scalesets))
+	for i, s := range c.Scalesets {
+		if s.VMIDRange == nil {
+			if len(c.Scalesets) > 1 {
+				return fmt.Errorf("scalesets[%d] %q: vmid_range is required with multi-scaleset (%d scalesets declared) — every scaleset's pool.Manager runs an independent VMID allocator, so inheriting one shared cfg.proxmox.vmid_range across all of them produces clone collisions on Proxmox (issue #222)",
+					i, s.Name, len(c.Scalesets))
+			}
+			continue
+		}
+		if s.VMIDRange.Min <= 0 {
+			return fmt.Errorf("scalesets[%d] %q.vmid_range: min must be > 0 (got %d)", i, s.Name, s.VMIDRange.Min)
+		}
+		if s.VMIDRange.Max <= s.VMIDRange.Min {
+			return fmt.Errorf("scalesets[%d] %q.vmid_range: max (%d) must be greater than min (%d)",
+				i, s.Name, s.VMIDRange.Max, s.VMIDRange.Min)
+		}
+		declared = append(declared, bounded{name: s.Name, min: s.VMIDRange.Min, max: s.VMIDRange.Max})
+	}
+	// Pairwise overlap detection on the declared ranges. n is at
+	// most the number of scalesets — small enough that O(n^2) is
+	// cheaper than sorting.
+	for i := 0; i < len(declared); i++ {
+		for j := i + 1; j < len(declared); j++ {
+			a, b := declared[i], declared[j]
+			if a.max < b.min || b.max < a.min {
+				continue // disjoint
+			}
+			return fmt.Errorf("scalesets: %q vmid_range [%d, %d] overlaps %q [%d, %d] — overlapping ranges race on Proxmox clone (issue #222); declare disjoint ranges",
+				a.name, a.min, a.max, b.name, b.min, b.max)
 		}
 	}
 	return nil
