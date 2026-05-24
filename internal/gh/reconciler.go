@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -291,7 +292,7 @@ func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 	out := make(map[string]pool.RunnerInfo)
 	opt := &github.ListRunnersOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	for page := 0; page < maxListPages; page++ {
-		runnersPage, resp, err := listRunnersPage(ctx, gh, scope, opt)
+		runnersPage, resp, err := listRunnersPageWithRetry(ctx, gh, scope, opt, log)
 		if err != nil {
 			return nil, err
 		}
@@ -329,6 +330,91 @@ func listRunnersPage(ctx context.Context, gh *github.Client, scope githubauth.Sc
 	}
 	owner, repo := splitRepo(scope.Repo)
 	return gh.Actions.ListRunners(ctx, owner, repo, opt)
+}
+
+// listPageRetryConfig sets a small per-page retry budget. With 50
+// max pages a tick can issue up to 50 calls; capping retries at 3
+// keeps the worst-case API budget bounded at 150 calls even if
+// every page transiently fails, which is well under GitHub's
+// per-installation rate limit.
+const (
+	listPageMaxTries        = 3
+	listPageInitialInterval = 200 * time.Millisecond
+	listPageMaxInterval     = 2 * time.Second
+)
+
+// listRunnersPageWithRetry wraps listRunnersPage with bounded
+// retry/backoff. GitHub's runner-list endpoint returns 502/503 and
+// network errors with non-trivial frequency under deploys + rate-
+// limit pressure; before this wrapper a single page transient
+// failed the whole pagination run, discarding partial progress and
+// re-issuing every prior page on the next tick. With 50 dependent
+// pages, the per-page transient compounds quickly.
+//
+// Retry policy: 3 attempts per page (so worst case 150 API calls
+// per tick rather than 50), 200ms initial backoff capped at 2s.
+// Treats 4xx-other-than-429 as Permanent so a missing scope /
+// revoked token fails fast — only 429, 5xx, and network errors are
+// retried. ctx cancellation propagates through to backoff.Retry.
+func listRunnersPageWithRetry(ctx context.Context, gh *github.Client, scope githubauth.Scope, opt *github.ListRunnersOptions, log *slog.Logger) (*github.Runners, *github.Response, error) {
+	eb := backoff.NewExponentialBackOff()
+	eb.InitialInterval = listPageInitialInterval
+	eb.MaxInterval = listPageMaxInterval
+	eb.Multiplier = 2.0
+	eb.RandomizationFactor = 0.1
+
+	type pageResult struct {
+		runners *github.Runners
+		resp    *github.Response
+	}
+	var attempts int
+	res, err := backoff.Retry(ctx, func() (pageResult, error) {
+		attempts++
+		runners, resp, err := listRunnersPage(ctx, gh, scope, opt)
+		if err == nil {
+			return pageResult{runners: runners, resp: resp}, nil
+		}
+		if !isTransientListError(err, resp) {
+			return pageResult{}, backoff.Permanent(err)
+		}
+		return pageResult{}, err
+	},
+		backoff.WithBackOff(eb),
+		backoff.WithMaxTries(listPageMaxTries),
+		backoff.WithNotify(func(err error, d time.Duration) {
+			if log != nil {
+				log.Warn("ListRunners page transient failure; retrying",
+					"attempt", attempts, "backoff", d, "err", err)
+			}
+		}),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return res.runners, res.resp, nil
+}
+
+// isTransientListError classifies a list-runners failure for the
+// retry wrapper. 429 (rate-limited), 5xx, and any error without an
+// HTTP response (network failure, ctx-deadline before the request)
+// are transient and worth retrying. Any other 4xx (401, 403, 404)
+// is permanent — retrying won't help and would burn budget.
+func isTransientListError(err error, resp *github.Response) bool {
+	if err == nil {
+		return false
+	}
+	// Network errors or other failures with no response — retry.
+	if resp == nil || resp.Response == nil {
+		return true
+	}
+	status := resp.StatusCode
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	if status >= 500 && status <= 599 {
+		return true
+	}
+	return false
 }
 
 // NewRunnerLister returns a pool.RunnerLister that pages the GitHub
