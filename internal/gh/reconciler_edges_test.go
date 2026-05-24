@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 )
 
@@ -213,4 +214,75 @@ func TestReconcile_FastOnlineBusyOfflineTransitions(t *testing.T) {
 		"running+offline destroys with no grace — fast offline transition must reach the destroy path on the next tick")
 	require.Equal(t, 2001, mgr.destroyCalls[0].VMID)
 	require.Contains(t, mgr.destroyCalls[0].Reason, "runner went offline")
+}
+
+// TestListRunnersByPrefix_RetriesTransient5xx pins #244: a single
+// 502/503 on a page must NOT fail the whole pagination run. The
+// wrapper retries up to 3 times per page, so a server that 503s
+// once then 200s must surface as a successful list (with the
+// runner from the 200 response).
+func TestListRunnersByPrefix_RetriesTransient5xx(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			// First call: transient 503.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"message":"upstream temporarily unavailable"}`))
+			return
+		}
+		// Subsequent calls: success with one matching runner.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":1,"name":"gh-runner-x","status":"online","busy":false}]}`))
+	}))
+	defer srv.Close()
+
+	cli := newTestClient(t, srv)
+	got, err := ListRunnersByPrefix(context.Background(), cli, githubauth.Scope{Repo: "octocat/test"}, "gh-runner-", nil)
+	require.NoError(t, err, "503 then 200 must succeed via per-page retry")
+	require.Len(t, got, 1)
+	require.GreaterOrEqual(t, calls.Load(), int64(2),
+		"the wrapper must have retried the failing page; got %d calls", calls.Load())
+}
+
+// TestListRunnersByPrefix_BoundsRetriesOnPersistent5xx: when the
+// upstream is permanently broken (every call 5xx), the wrapper
+// must give up after listPageMaxTries (3) attempts per page, not
+// retry forever. This keeps the per-tick API budget bounded even
+// during sustained GitHub outages.
+func TestListRunnersByPrefix_BoundsRetriesOnPersistent5xx(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	cli := newTestClient(t, srv)
+	_, err := ListRunnersByPrefix(context.Background(), cli, githubauth.Scope{Repo: "octocat/test"}, "gh-runner-", nil)
+	require.Error(t, err, "persistent 5xx must surface as an error after retries are exhausted")
+	require.Equal(t, int64(listPageMaxTries), calls.Load(),
+		"per-page retries must cap at listPageMaxTries=%d, got %d", listPageMaxTries, calls.Load())
+}
+
+// TestListRunnersByPrefix_NoRetryOnPermanent4xx: a 403 (e.g.
+// insufficient token scope) must fail fast — retrying won't help
+// and would burn API budget. Asserts exactly one call.
+func TestListRunnersByPrefix_NoRetryOnPermanent4xx(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"resource not accessible"}`))
+	}))
+	defer srv.Close()
+
+	cli := newTestClient(t, srv)
+	_, err := ListRunnersByPrefix(context.Background(), cli, githubauth.Scope{Repo: "octocat/test"}, "gh-runner-", nil)
+	require.Error(t, err, "4xx must surface immediately")
+	require.Equal(t, int64(1), calls.Load(),
+		"4xx (non-429) must NOT be retried; got %d calls", calls.Load())
 }
