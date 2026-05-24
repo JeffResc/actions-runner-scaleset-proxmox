@@ -66,12 +66,11 @@ scaleset:
 # runner_group, and per-scaleset `profiles:`. Mixing the two
 # forms is rejected at load.
 #
-# NOTE: the schema, metric labels, and admin API namespacing all
-# support multiple scale sets, but the leader-plane orchestration
-# currently runs exactly one scale set per process — configs with
-# more than one entry are rejected at startup. The runtime fan-out
-# lands in a follow-up PR; declaring `scalesets: [{...}]` (single
-# element) today round-trips cleanly through ApplyDefaults.
+# Each declared scale set runs under its own pool manager, scaler,
+# listener, REST reconciler, canary controller, schedule runner,
+# store, and provisioner. The workers are spawned under a single
+# supervisor: a panic or returned error in one scale set is
+# recovered and logged but does NOT poison its siblings.
 #
 # scalesets:
 #   - name: linux-x64

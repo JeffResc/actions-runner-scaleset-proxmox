@@ -218,13 +218,14 @@ func TestMetrics_RateLimitObserver(t *testing.T) {
 func TestHealth_LeaderTransitionsToReady(t *testing.T) {
 	t.Parallel()
 	h := observability.NewHealth(time.Minute)
+	h.RegisterScaleset("a")
 	h.MarkLeader(true)
 	require.False(t, h.Ready())
 
-	h.MarkListenerConnected()
+	h.MarkScalesetListenerConnected("a")
 	require.False(t, h.Ready())
 
-	h.MarkRecoveryDone()
+	h.MarkScalesetRecoveryDone("a")
 	require.False(t, h.Ready(), "still missing Proxmox liveness")
 
 	h.MarkProxmoxOK()
@@ -234,9 +235,10 @@ func TestHealth_LeaderTransitionsToReady(t *testing.T) {
 func TestHealth_StaleProxmox(t *testing.T) {
 	t.Parallel()
 	h := observability.NewHealth(10 * time.Millisecond)
+	h.RegisterScaleset("a")
 	h.MarkLeader(true)
-	h.MarkListenerConnected()
-	h.MarkRecoveryDone()
+	h.MarkScalesetListenerConnected("a")
+	h.MarkScalesetRecoveryDone("a")
 	h.MarkProxmoxOK()
 	require.True(t, h.Ready())
 
@@ -264,16 +266,16 @@ func TestHealth_StandbyReadyOnProxmoxAlone(t *testing.T) {
 func TestHealth_ClearGatesOnDeposal(t *testing.T) {
 	t.Parallel()
 	h := observability.NewHealth(time.Minute)
+	h.RegisterScaleset("a")
 	h.MarkLeader(true)
-	h.MarkListenerConnected()
-	h.MarkRecoveryDone()
+	h.MarkScalesetListenerConnected("a")
+	h.MarkScalesetRecoveryDone("a")
 	h.MarkProxmoxOK()
 	require.True(t, h.Ready())
 
 	// Simulate cluster.Coordinator's OnDeposed work.
 	h.MarkLeader(false)
-	h.ClearListenerConnected()
-	h.ClearRecoveryDone()
+	h.ClearScalesetState("a")
 	// Standby readiness only requires Proxmox, which is still fresh.
 	require.True(t, h.Ready())
 
@@ -391,9 +393,10 @@ func TestServe_RespondsToProbes(t *testing.T) {
 	_ = resp.Body.Close()
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 
+	h.RegisterScaleset("a")
 	h.MarkLeader(true)
-	h.MarkListenerConnected()
-	h.MarkRecoveryDone()
+	h.MarkScalesetListenerConnected("a")
+	h.MarkScalesetRecoveryDone("a")
 	h.MarkProxmoxOK()
 
 	resp, err = getURL("/readyz")

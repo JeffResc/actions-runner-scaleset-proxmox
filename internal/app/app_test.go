@@ -1,9 +1,16 @@
 package app
 
 import (
+	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 )
 
 func TestPortFromAddr(t *testing.T) {
@@ -104,4 +111,54 @@ func TestMergeLeaderPlaneErr(t *testing.T) {
 			t.Fatalf("unset pointer must yield nil, got %v", got)
 		}
 	})
+}
+
+// TestSuperviseScaleset_PanicIsolated locks in the multi-scaleset
+// supervisor's failure-isolation contract (issue #1): a panic in
+// one scaleset's worker MUST NOT propagate to its siblings via
+// the outer errgroup. The supervisor recovers, logs, and returns
+// nil so the errgroup keeps the other scalesets running.
+func TestSuperviseScaleset_PanicIsolated(t *testing.T) {
+	t.Parallel()
+	entry := config.ScaleSetEntry{Name: "panicky", Scope: config.GitHubScope{Org: "x"}}
+	state := &scalesetState{name: "panicky"}
+	got := superviseScaleset(t.Context(), entry, state, silentLogger(),
+		func(context.Context, config.ScaleSetEntry, *scalesetState) error {
+			panic("simulated worker panic")
+		})
+	require.NoError(t, got, "panicking worker must NOT propagate up; sibling scalesets keep running")
+}
+
+// TestSuperviseScaleset_ErrorIsolated covers the same isolation
+// contract for returned errors: a non-canceled error from one
+// worker is logged and swallowed so siblings continue.
+func TestSuperviseScaleset_ErrorIsolated(t *testing.T) {
+	t.Parallel()
+	entry := config.ScaleSetEntry{Name: "broken", Scope: config.GitHubScope{Org: "x"}}
+	state := &scalesetState{name: "broken"}
+	got := superviseScaleset(t.Context(), entry, state, silentLogger(),
+		func(context.Context, config.ScaleSetEntry, *scalesetState) error {
+			return errors.New("simulated worker error")
+		})
+	require.NoError(t, got)
+}
+
+// TestSuperviseScaleset_ContextCanceledQuiet matches the rest of
+// the orchestrator's convention: ctx.Canceled on a clean shutdown
+// is not an error worth logging at error severity (it's just
+// drain/SIGTERM). Returning nil is the same observable behaviour
+// as the other isolation paths, but no error log is emitted.
+func TestSuperviseScaleset_ContextCanceledQuiet(t *testing.T) {
+	t.Parallel()
+	entry := config.ScaleSetEntry{Name: "draining", Scope: config.GitHubScope{Org: "x"}}
+	state := &scalesetState{name: "draining"}
+	got := superviseScaleset(t.Context(), entry, state, silentLogger(),
+		func(context.Context, config.ScaleSetEntry, *scalesetState) error {
+			return context.Canceled
+		})
+	require.NoError(t, got)
+}
+
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
