@@ -284,14 +284,37 @@ func Start(t testing.TB, opts Options) *Harness {
 		AdminAddr:            adminAddr,
 	}
 	if multi {
+		// Auto-partition the shared global VMID range (10000-10999
+		// per the harness's proxmox.vmid_range below) into
+		// disjoint per-scaleset slices. The config validator
+		// (issue #222) requires non-overlapping ranges so the
+		// per-scaleset pool.Manager allocators don't race on the
+		// same lowest-free ID. e2e tests get this for free
+		// without having to specify ranges.
+		const (
+			rangeMin = 10000
+			rangeMax = 10999
+		)
+		span := (rangeMax - rangeMin + 1) / len(opts.Scalesets)
 		cv.Scalesets = make([]scalesetCfg, 0, len(opts.Scalesets))
-		for _, ss := range opts.Scalesets {
+		for i, ss := range opts.Scalesets {
+			min := rangeMin + i*span
+			max := min + span - 1
+			if i == len(opts.Scalesets)-1 {
+				// Sweep any rounding remainder into the last
+				// scaleset so the union is exactly the global
+				// range — keeps the assertion "VMID in [10000,
+				// 11000)" intact in the two-scaleset scenarios.
+				max = rangeMax
+			}
 			cv.Scalesets = append(cv.Scalesets, scalesetCfg{
 				Name:                 ss.Name,
 				Org:                  ss.Org,
 				HotSize:              ss.HotSize,
 				WarmSize:             ss.WarmSize,
 				MaxConcurrentRunners: ss.MaxConcurrentRunners,
+				VMIDMin:              min,
+				VMIDMax:              max,
 			})
 		}
 	}
@@ -514,6 +537,8 @@ type scalesetCfg struct {
 	HotSize              int
 	WarmSize             int
 	MaxConcurrentRunners int
+	VMIDMin              int
+	VMIDMax              int
 }
 
 const configTmpl = `
@@ -546,6 +571,7 @@ scalesets:
     max_concurrent_runners: {{.MaxConcurrentRunners}}
     scope:
       org: {{.Org}}
+    vmid_range: { min: {{.VMIDMin}}, max: {{.VMIDMax}} }
     profiles:
       - name: default
         labels: [self-hosted, linux, x64, e2e]

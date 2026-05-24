@@ -91,8 +91,8 @@ scaleset:
 # `github.scope` + top-level `profiles:` form above, declare a
 # `scalesets:` list with one entry per scale set. Each entry
 # carries its own scope (org/repo), labels, max_concurrent_runners,
-# runner_group, and per-scaleset `profiles:`. Mixing the two
-# forms is rejected at load.
+# runner_group, vmid_range, and per-scaleset `profiles:`. Mixing
+# the two forms is rejected at load.
 #
 # Each declared scale set runs under its own pool manager, scaler,
 # listener, REST reconciler, canary controller, schedule runner,
@@ -100,12 +100,20 @@ scaleset:
 # supervisor: a panic or returned error in one scale set is
 # recovered and logged but does NOT poison its siblings.
 #
+# With N > 1 scalesets, each entry MUST declare its own
+# `vmid_range` and the ranges must be pairwise disjoint. Each
+# scaleset's pool manager runs an independent VMID allocator,
+# so sharing one range would race on Proxmox clone (issue #222).
+# Partition the global proxmox.vmid_range into per-scaleset
+# slices that together cover it (or any disjoint subset).
+#
 # scalesets:
 #   - name: linux-x64
 #     labels: [self-hosted, linux, x64, proxmox]
 #     runner_group: default
 #     max_concurrent_runners: 50
 #     scope: { org: my-org }
+#     vmid_range: { min: 10000, max: 14999 }
 #     profiles:
 #       - name: linux-x64
 #         labels: [self-hosted, linux, x64, proxmox]
@@ -116,6 +124,7 @@ scaleset:
 #     labels: [self-hosted, linux, gpu]
 #     max_concurrent_runners: 4
 #     scope: { org: my-other-org }
+#     vmid_range: { min: 15000, max: 19999 }
 #     profiles:
 #       - name: gpu
 #         labels: [self-hosted, linux, gpu]

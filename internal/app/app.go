@@ -245,7 +245,7 @@ func Run(ctx context.Context, opts Options) error {
 			Canary:               canaryCtrl,
 			ScaleSetName:         entry.Name,
 			VMNamePrefix:         state.vmPrefix,
-			VMIDRange:            cfg.Proxmox.VMIDRange,
+			VMIDRange:            entryVMIDRange(entry, cfg.Proxmox.VMIDRange),
 			LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
 			TemplateNode:         state.prov.TemplateNode(),
 			VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
@@ -938,6 +938,20 @@ func scheduleRunnerForScaleset(ss config.ScaleSetEntry, poolDefaults config.Pool
 // Pick still has a registered profile to query (avoiding
 // ErrUnknownProfile in the hot path). Returns nil + the
 // underlying error from canary.New on validation failures.
+// entryVMIDRange returns the per-scaleset VMID range, falling
+// back to the shared cfg.Proxmox.VMIDRange when the entry
+// inherits (the single-scaleset back-compat path). With N > 1
+// scalesets the config validator (validateScalesetVMIDRanges)
+// requires every entry to declare its own range, so the
+// fall-through here is only reached for single-scaleset configs
+// and for tests that construct a Config in-process.
+func entryVMIDRange(entry config.ScaleSetEntry, fallback config.VMIDRange) config.VMIDRange {
+	if entry.VMIDRange != nil {
+		return *entry.VMIDRange
+	}
+	return fallback
+}
+
 func canaryControllerForScaleset(ss config.ScaleSetEntry, defaultTemplateVMID int) (*canary.Controller, error) {
 	cfgs := make([]canary.ProfileConfig, 0, len(ss.Profiles))
 	for _, p := range ss.Profiles {
