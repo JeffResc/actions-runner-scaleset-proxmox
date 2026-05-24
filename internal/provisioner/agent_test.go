@@ -63,7 +63,9 @@ func TestInjectJITConfig_TwoPhaseRenameSequence(t *testing.T) {
 	defer srv.Close()
 
 	p := newTestProvisioner(t, srv, "pve1")
-	require.NoError(t, p.InjectJITConfig(t.Context(), &VM{VMID: 7, Node: "pve1"}, "Zm9v"))
+	// base64-encoded {"runner_id":42}; matches the JSON-object shape
+	// validateDecodedJITConfig requires after the regex fast-path.
+	require.NoError(t, p.InjectJITConfig(t.Context(), &VM{VMID: 7, Node: "pve1"}, "eyJydW5uZXJfaWQiOjQyfQ=="))
 
 	// Expected sequence:
 	//   1. POST file-write (writes .tmp)

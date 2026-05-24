@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -31,6 +32,62 @@ import (
 // here because the injection concern is about quote / newline / shell
 // metacharacters, none of which appear in either.
 var jitConfigPattern = regexp.MustCompile(`^[A-Za-z0-9+/=_-]+$`)
+
+// validateDecodedJITConfig is the defense-in-depth step that runs
+// after jitConfigPattern: base64-decode the payload (accepting both
+// standard and URL-safe alphabets, with or without padding) and
+// confirm the result is a non-empty JSON object. We don't pin a
+// schema because the runner inside the VM is the consumer — but a
+// successful JSON parse rules out two upstream-contract-break shapes
+// the regex alone can't catch:
+//
+//  1. A base64-shaped string that isn't actually base64 (unlikely
+//     today but cheap to defend against).
+//  2. A base64-but-not-JSON blob (e.g. an error message that was
+//     base64-encoded somewhere upstream and routed into the JIT-config
+//     field by a future code path that loses GitHub-API context).
+//
+// Today the only producer is the GitHub API authenticated via the
+// orchestrator's own credentials, so this is hardening — not closing
+// a known live attack. The cost is one decode + one Unmarshal per
+// inject, which is dominated by the qemu-guest-agent round-trip.
+func validateDecodedJITConfig(jitConfig string) error {
+	// Try standard first, then URL-safe — both are accepted by
+	// jitConfigPattern, so we don't know which alphabet upstream
+	// used. RawStd / RawURL also handle the unpadded variants the
+	// regex accepts (e.g. "ZWFzeQ").
+	decoders := []*base64.Encoding{
+		base64.StdEncoding, base64.URLEncoding,
+		base64.RawStdEncoding, base64.RawURLEncoding,
+	}
+	var (
+		decoded []byte
+		err     error
+	)
+	for _, dec := range decoders {
+		decoded, err = dec.DecodeString(jitConfig)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("base64 decode: %w", err)
+	}
+	if len(decoded) == 0 {
+		return fmt.Errorf("decoded payload is empty")
+	}
+	// The runner expects a JSON object — anything else is an upstream
+	// contract break. Unmarshal into a map (we don't enforce a schema)
+	// so any well-formed JSON object passes.
+	var obj map[string]any
+	if err := json.Unmarshal(decoded, &obj); err != nil {
+		return fmt.Errorf("decoded payload is not a JSON object: %w", err)
+	}
+	if len(obj) == 0 {
+		return fmt.Errorf("decoded JSON object has no fields")
+	}
+	return nil
+}
 
 var tracer = otel.Tracer(observability.TracerName)
 
@@ -64,6 +121,9 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) er
 	}
 	if !jitConfigPattern.MatchString(jitConfig) {
 		return fmt.Errorf("inject jit: config for vm %d does not match expected base64 form (chars outside [A-Za-z0-9+/=_-])", vm.VMID)
+	}
+	if err := validateDecodedJITConfig(jitConfig); err != nil {
+		return fmt.Errorf("inject jit: config for vm %d failed decoded validation: %w", vm.VMID, err)
 	}
 	ctx, span := tracer.Start(ctx, "provisioner.InjectJITConfig", trace.WithAttributes(
 		attribute.Int("vm.id", vm.VMID),
