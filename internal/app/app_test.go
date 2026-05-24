@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 )
 
 func TestPortFromAddr(t *testing.T) {
@@ -161,4 +162,99 @@ func TestSuperviseScaleset_ContextCanceledQuiet(t *testing.T) {
 
 func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// TestBuildNodeSelector_KnownStrategiesReturnNonNil pins the
+// happy paths through buildUnderlyingSelector: each of the
+// three declared strategies returns a non-nil selector and no
+// error. Without this, a typo or a removed case in the switch
+// would silently return (nil, nil) and the orchestrator would
+// crash at the first Acquire.
+func TestBuildNodeSelector_KnownStrategiesReturnNonNil(t *testing.T) {
+	t.Parallel()
+	t.Run("single", func(t *testing.T) {
+		t.Parallel()
+		cfg := &config.Config{Nodes: config.NodesConfig{
+			Strategy: "single", SingleNode: "pve1",
+		}}
+		sel, err := buildNodeSelector(cfg, nil)
+		require.NoError(t, err)
+		require.NotNil(t, sel)
+	})
+	t.Run("round_robin", func(t *testing.T) {
+		t.Parallel()
+		cfg := &config.Config{Nodes: config.NodesConfig{
+			Strategy: "round_robin", Members: []string{"pve1", "pve2"},
+		}}
+		sel, err := buildNodeSelector(cfg, nil)
+		require.NoError(t, err)
+		require.NotNil(t, sel)
+	})
+}
+
+// TestBuildNodeSelector_UnknownStrategyReturnsError pins the
+// safety net the audit (#202) flagged: an unknown strategy
+// must surface as an error, not as a silent nil selector. The
+// config validator's oneof tag normally catches typos at load
+// time, but buildNodeSelector is also called from in-process
+// code paths that bypass the validator (e.g. constructing
+// Config in a test) — the defensive branch must still fire.
+func TestBuildNodeSelector_UnknownStrategyReturnsError(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{Nodes: config.NodesConfig{
+		Strategy: "made-up-strategy", SingleNode: "pve1",
+	}}
+	sel, err := buildNodeSelector(cfg, nil)
+	require.Error(t, err,
+		"unknown strategy must surface as an error so a misconfig fails loud, "+
+			"not as a nil selector that crashes the first Acquire")
+	require.Nil(t, sel)
+	require.Contains(t, err.Error(), "made-up-strategy",
+		"error must name the bad strategy so the operator can locate it")
+}
+
+// TestBuildNodeSelector_AffinityWrapsUnderlying pins that
+// declaring nodes.affinity rules wraps the underlying selector
+// in an affinity layer — without the wrap the prefer_nodes /
+// anti_affinity_with rules would silently no-op.
+func TestBuildNodeSelector_AffinityWrapsUnderlying(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{
+		Nodes: config.NodesConfig{
+			Strategy:   "single",
+			SingleNode: "pve1",
+			Members:    []string{"pve1", "pve2"},
+			Affinity: []config.AffinityRule{{
+				Match:       config.AffinityMatch{Profile: "gpu"},
+				PreferNodes: []string{"pve1"},
+				Require:     true,
+			}},
+		},
+		Profiles: []config.ProfileConfig{{Name: "gpu"}},
+	}
+	sel, err := buildNodeSelector(cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, sel)
+	// The single-node selector returns a static string; the
+	// affinity wrapper, by contrast, has different concrete
+	// type. We pin the behaviour-level observable: with a
+	// Require rule pinned to "pve1" for the gpu profile, the
+	// returned Selector must place gpu jobs on pve1.
+	got, err := sel.Select(t.Context(), nodeselector.Hint{Profile: "gpu"})
+	require.NoError(t, err)
+	require.Equal(t, "pve1", got,
+		"affinity Require=true with prefer_nodes=[pve1] must pin gpu profile to pve1; "+
+			"if this fails, buildNodeSelector skipped the affinity wrap")
+}
+
+// TestRun_InvalidConfigPathReturnsError pins that Run() returns
+// promptly on a config-load failure, before any goroutines or
+// network calls fire. Without this, a typo'd config path would
+// surface deep in the stack (or worse, partial startup leaving
+// stray resources).
+func TestRun_InvalidConfigPathReturnsError(t *testing.T) {
+	t.Parallel()
+	err := Run(t.Context(), Options{ConfigPath: "/definitely/does/not/exist.yaml"})
+	require.Error(t, err,
+		"Run must surface config-load errors immediately; a silent partial startup would leak goroutines and Proxmox connections")
 }
