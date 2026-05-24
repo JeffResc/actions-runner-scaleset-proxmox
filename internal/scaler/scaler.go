@@ -16,6 +16,8 @@ package scaler
 import (
 	"context"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -281,19 +283,37 @@ func (s *Scaler) recordRouting(jobLabels []string) {
 	s.log.Debug("router: job routed", "profile", profile, "labels", jobLabels)
 }
 
+// unroutedLabelsBucketCount caps the cardinality of the
+// unrouted_jobs_total{labels} dimension. The label is hashed into
+// one of N buckets so a workflow author who embeds an ephemeral
+// string in `runs-on` (PR number, commit SHA, UUID, ...) cannot
+// blow up the metrics endpoint with an unbounded series count.
+// 64 keeps the bucket size noticeable enough to spot trends while
+// staying well below Prometheus's per-target series budget.
+const unroutedLabelsBucketCount = 64
+
 // joinLabelsForMetric renders a job's RequestLabels into a single
-// stable string suitable as a Prometheus label value. Sort + join so
-// the same logical label set always hashes to the same series — and
-// so the cardinality is bounded by distinct label sets, not by
-// arrival order.
+// stable, bounded-cardinality string suitable as a Prometheus label
+// value. Sort the input so the same logical label set always hashes
+// to the same bucket regardless of arrival order, then hash through
+// FNV-1a (stdlib, no new dep, well-distributed for small inputs)
+// and bucket into [0..unroutedLabelsBucketCount). Empty input maps
+// to "empty" so the no-labels case is distinguishable.
+//
+// The pre-bucket sort+join form is intentionally NOT exposed as the
+// metric value — it would let workflow-author-controlled strings
+// (e.g. a UUID inside a `runs-on` label) explode cardinality.
 func joinLabelsForMetric(labels []string) string {
 	if len(labels) == 0 {
-		return ""
+		return "empty"
 	}
 	cp := make([]string, len(labels))
 	copy(cp, labels)
 	sort.Strings(cp)
-	return strings.Join(cp, "|")
+	joined := strings.Join(cp, "|")
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(joined))
+	return fmt.Sprintf("bucket-%02d", h.Sum64()%unroutedLabelsBucketCount)
 }
 
 // HandleJobCompleted is called when a job finishes. We destroy the VM.
