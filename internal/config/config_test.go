@@ -1809,3 +1809,131 @@ func TestParse_MalformedDuration(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `"nope"`)
 }
+
+// TestParse_VMIDRangeEdgeCases pins the validator's behaviour at
+// VMIDRange boundaries. min == max is the "single-VM range" edge
+// (validate tag `gtfield=Min` rejects it — the orchestrator needs
+// at least one allocatable slot ABOVE Min for a fresh clone before
+// the destroyed VM's cooldown expires). zero and negative bounds
+// trip the `required,gt=0` chain.
+func TestParse_VMIDRangeEdgeCases(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		yamlEdit   string // replaces the `vmid_range: { min: 10000, max: 19999 }` line
+		wantErrSub string // empty = must succeed; non-empty = must error and contain this substring
+	}{
+		{
+			name:       "min equals max is rejected",
+			yamlEdit:   "vmid_range: { min: 10000, max: 10000 }",
+			wantErrSub: "Max",
+		},
+		{
+			name:       "min greater than max is rejected",
+			yamlEdit:   "vmid_range: { min: 20000, max: 10000 }",
+			wantErrSub: "Max",
+		},
+		{
+			name:       "min equals zero is rejected",
+			yamlEdit:   "vmid_range: { min: 0, max: 100 }",
+			wantErrSub: "Min",
+		},
+		{
+			name:       "negative min is rejected",
+			yamlEdit:   "vmid_range: { min: -1, max: 100 }",
+			wantErrSub: "Min",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			y := strings.Replace(validPATYAML,
+				"vmid_range: { min: 10000, max: 19999 }", c.yamlEdit, 1)
+			_, err := config.Parse([]byte(y))
+			require.Error(t, err, "VMID range %q must be rejected", c.yamlEdit)
+			require.Contains(t, err.Error(), c.wantErrSub,
+				"error must name the offending field so the operator can find it")
+		})
+	}
+}
+
+// TestTLS_InsecureSkipVerifyAndCAFileBothHonored pins the current
+// contract of [TLSConfig.BuildClientTLS]: when both
+// InsecureSkipVerify=true and a CAFile are set, BOTH are applied —
+// the CA pool is loaded into RootCAs AND Insecure is left true on
+// the resulting *tls.Config. The CA is therefore present but
+// unused (Insecure short-circuits verification).
+//
+// This is a foot-gun: an operator who set CAFile expecting Insecure
+// to be overridden gets neither pinning nor a config-load failure.
+// Pinning the behaviour means a future change has to make the
+// trade-off explicitly — either reject the combination at validate,
+// or have one take precedence. Without this test, a refactor could
+// silently flip the semantics.
+func TestTLS_InsecureSkipVerifyAndCAFileBothHonored(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	caFile := filepath.Join(dir, "ca.pem")
+	certFile := filepath.Join(dir, "cert.pem")
+	keyFile := filepath.Join(dir, "key.pem")
+
+	// Generate a self-signed cert/key pair to serve as the
+	// cert+key. tls.LoadX509KeyPair must accept them.
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:         true,
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(certFile,
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	keyBytes, err := x509.MarshalECPrivateKey(priv)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(keyFile,
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}), 0o600))
+	// Reuse the same cert as the CA bundle — the contract test
+	// just needs both files to load.
+	require.NoError(t, os.WriteFile(caFile,
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+
+	tcfg := &config.TLSConfig{
+		CertFile:           certFile,
+		KeyFile:            keyFile,
+		CAFile:             caFile,
+		InsecureSkipVerify: true,
+	}
+	built, err := tcfg.BuildClientTLS()
+	require.NoError(t, err)
+	require.True(t, built.InsecureSkipVerify,
+		"InsecureSkipVerify must reach the *tls.Config — the operator opted into it")
+	require.NotNil(t, built.RootCAs,
+		"CAFile must STILL be loaded into RootCAs even when Insecure is set; pinning the current behaviour catches a silent refactor")
+	require.NotNil(t, built.Certificates,
+		"keypair must be loaded regardless of Insecure")
+}
+
+// TestParse_EmptyTokenSecretEnvRejected pins the empty-env
+// fallback semantics: SCALESET_PROXMOX_AUTH_TOKEN_SECRET set to
+// an empty string must be rejected with the same error as the
+// fully-missing case. Without this, an operator who templated
+// an empty secret into their deployment manifest would silently
+// start the orchestrator with no Proxmox auth and only discover
+// the failure at the first PVE API call.
+//
+// No t.Parallel — setEnv uses t.Setenv which forbids parallel.
+func TestParse_EmptyTokenSecretEnvRejected(t *testing.T) {
+	noSecretYAML := strings.Replace(validPATYAML, "    token_secret: testsecret", "", 1)
+	setEnv(t, map[string]string{"SCALESET_PROXMOX_AUTH_TOKEN_SECRET": ""})
+	_, err := config.Parse([]byte(noSecretYAML))
+	require.Error(t, err, "empty env-var must be rejected — silent acceptance leads to auth failure deep in the call stack")
+	require.Contains(t, err.Error(), "proxmox.auth.token_secret",
+		"the error must name the missing field so the operator can find it")
+}
