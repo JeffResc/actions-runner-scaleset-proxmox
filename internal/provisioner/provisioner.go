@@ -482,22 +482,10 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	p.inFlightClones.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
 	defer p.inFlightClones.Delete(opts.NewVMID)
 
-	// Resolve the source template: per-clone override falls back to the
-	// orchestrator-global template. Linked clones MUST stay on the
-	// template's node, but a profile-specific template typically lives on
-	// the same node as the global one — we only re-discover when an
-	// override is set.
-	templateVMID := opts.TemplateVMID
-	if templateVMID <= 0 {
-		templateVMID = p.cfg.TemplateVMID
-	}
-	templateNodeName := p.templateNode
-	if opts.TemplateVMID > 0 && opts.TemplateVMID != p.cfg.TemplateVMID {
-		discovered, err := p.locateTemplate(ctx, opts.TemplateVMID)
-		if err != nil {
-			return nil, fmt.Errorf("locate profile template %d: %w", opts.TemplateVMID, err)
-		}
-		templateNodeName = discovered
+	templateVMID := resolveTemplateVMID(opts.TemplateVMID, p.cfg.TemplateVMID)
+	templateNodeName, err := p.resolveTemplateNode(ctx, opts)
+	if err != nil {
+		return nil, err
 	}
 
 	templateNode, err := p.cli.Node(ctx, templateNodeName)
@@ -509,24 +497,7 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		return nil, fmt.Errorf("get template vm: %w", err)
 	}
 
-	cloneOpts := &proxmox.VirtualMachineCloneOptions{
-		NewID: opts.NewVMID,
-		Name:  opts.Name,
-	}
-	if opts.Linked {
-		cloneOpts.Full = 0
-	} else {
-		cloneOpts.Full = 1
-		// Target only takes effect for full clones.
-		if opts.Node != "" && opts.Node != templateNodeName {
-			cloneOpts.Target = opts.Node
-		}
-		if opts.Storage != "" {
-			cloneOpts.Storage = opts.Storage
-		}
-	}
-
-	newID, task, err := templateVM.Clone(ctx, cloneOpts)
+	newID, task, err := templateVM.Clone(ctx, buildLibCloneOptions(opts, templateNodeName))
 	if err != nil {
 		return nil, fmt.Errorf("issue clone: %w", err)
 	}
@@ -552,37 +523,9 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		return nil, fmt.Errorf("fetch cloned vm: %w", err)
 	}
 
-	// Apply owner + profile tags AND any per-clone hardware overrides in
-	// the same Config call. Bundling cuts a round-trip and keeps the
-	// tag-apply atomic with the resource override — otherwise an
-	// orchestrator crash between the two leaves the VM with our owner
-	// tag but the template's default resources.
-	initial, err := tags.Initial(p.scaleSetName, opts.Profile, opts.TemplateClass)
+	configOpts, err := buildCloneConfig(p.scaleSetName, opts)
 	if err != nil {
-		return nil, fmt.Errorf("compute initial tags: %w", err)
-	}
-	configOpts := []proxmox.VirtualMachineOption{
-		{Name: "tags", Value: tags.Encode(initial)},
-	}
-	if opts.CPUCores > 0 {
-		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "cores", Value: opts.CPUCores})
-	}
-	if opts.MemoryMB > 0 {
-		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "memory", Value: opts.MemoryMB})
-	}
-	// Network: stamp each NIC's net<idx> field. Proxmox's net%d
-	// syntax is "model=virtio,bridge=vmbr0,tag=42,mtu=9000" —
-	// build the string with the bits the operator opted into.
-	for i, nic := range opts.NICs {
-		configOpts = append(configOpts, proxmox.VirtualMachineOption{
-			Name:  fmt.Sprintf("net%d", i),
-			Value: encodeNIC(nic),
-		})
-	}
-	// Cloud-init IP: ipconfig0 maps to net0 by convention; that's
-	// the slot the orchestrator uses for the primary NIC.
-	if opts.IPConfig != "" {
-		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "ipconfig0", Value: opts.IPConfig})
+		return nil, err
 	}
 	if _, err := newVM.Config(ctx, configOpts...); err != nil {
 		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
@@ -611,6 +554,94 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	}
 
 	return &VM{VMID: newID, Node: resultNode, Name: opts.Name}, nil
+}
+
+// resolveTemplateVMID picks the source template VMID for a clone:
+// the per-clone override (opts.TemplateVMID) wins when positive,
+// otherwise we fall back to the orchestrator-global template.
+// Pure function so the canary / profile-override decision is
+// straightforward to test in isolation.
+func resolveTemplateVMID(optOverride, defaultTemplateVMID int) int {
+	if optOverride > 0 {
+		return optOverride
+	}
+	return defaultTemplateVMID
+}
+
+// resolveTemplateNode picks the node where the source template
+// lives. Linked clones must stay on the orchestrator's template
+// node by construction; profile-override templates typically live
+// on the same node but we re-discover when the override is
+// explicitly set and differs from the global template, since the
+// operator may have placed it elsewhere.
+func (p *pmox) resolveTemplateNode(ctx context.Context, opts CloneOptions) (string, error) {
+	if opts.TemplateVMID > 0 && opts.TemplateVMID != p.cfg.TemplateVMID {
+		discovered, err := p.locateTemplate(ctx, opts.TemplateVMID)
+		if err != nil {
+			return "", fmt.Errorf("locate profile template %d: %w", opts.TemplateVMID, err)
+		}
+		return discovered, nil
+	}
+	return p.templateNode, nil
+}
+
+// buildLibCloneOptions translates our CloneOptions into the
+// go-proxmox library shape. Linked clones set Full=0 and leave
+// Target/Storage unset (the library mandates the new VM stays on
+// the template node). Full clones may optionally Target a different
+// node and Storage a different pool.
+func buildLibCloneOptions(opts CloneOptions, templateNodeName string) *proxmox.VirtualMachineCloneOptions {
+	cloneOpts := &proxmox.VirtualMachineCloneOptions{
+		NewID: opts.NewVMID,
+		Name:  opts.Name,
+	}
+	if opts.Linked {
+		cloneOpts.Full = 0
+		return cloneOpts
+	}
+	cloneOpts.Full = 1
+	if opts.Node != "" && opts.Node != templateNodeName {
+		cloneOpts.Target = opts.Node
+	}
+	if opts.Storage != "" {
+		cloneOpts.Storage = opts.Storage
+	}
+	return cloneOpts
+}
+
+// buildCloneConfig assembles the per-clone VirtualMachineOption
+// slice applied to the freshly-cloned VM. It bundles owner +
+// profile tags with hardware overrides (cpu/memory/NICs/ipconfig0)
+// so the orchestrator can apply everything in a single Config call
+// — keeping the tag-apply atomic with the resource override.
+//
+// Disk resize is intentionally out of scope: it goes through a
+// distinct Proxmox endpoint (ResizeDisk) and is applied separately
+// after the Config call lands.
+func buildCloneConfig(scaleSetName string, opts CloneOptions) ([]proxmox.VirtualMachineOption, error) {
+	initial, err := tags.Initial(scaleSetName, opts.Profile, opts.TemplateClass)
+	if err != nil {
+		return nil, fmt.Errorf("compute initial tags: %w", err)
+	}
+	configOpts := []proxmox.VirtualMachineOption{
+		{Name: "tags", Value: tags.Encode(initial)},
+	}
+	if opts.CPUCores > 0 {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "cores", Value: opts.CPUCores})
+	}
+	if opts.MemoryMB > 0 {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "memory", Value: opts.MemoryMB})
+	}
+	for i, nic := range opts.NICs {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{
+			Name:  fmt.Sprintf("net%d", i),
+			Value: encodeNIC(nic),
+		})
+	}
+	if opts.IPConfig != "" {
+		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "ipconfig0", Value: opts.IPConfig})
+	}
+	return configOpts, nil
 }
 
 // locateTemplate finds the node hosting an alternative template VMID

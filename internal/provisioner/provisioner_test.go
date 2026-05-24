@@ -1009,6 +1009,291 @@ func TestListOwnedVMs_StillWarnsOnRealUntaggedOrphan(t *testing.T) {
 // encodeNIC (PR 3 — issue #6)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// resolveTemplateVMID / buildLibCloneOptions / buildCloneConfig
+// (Clone-refactor helpers — issue #227)
+// ---------------------------------------------------------------------------
+
+// TestResolveTemplateVMID pins the per-clone override priority:
+// a positive override wins, otherwise the orchestrator-global
+// default is used. Zero / negative override = "no override".
+func TestResolveTemplateVMID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		override int
+		defTpl   int
+		want     int
+	}{
+		{"no override falls back to default", 0, 9000, 9000},
+		{"negative override falls back to default", -1, 9000, 9000},
+		{"explicit override wins", 9100, 9000, 9100},
+		{"override equals default", 9000, 9000, 9000},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, c.want, resolveTemplateVMID(c.override, c.defTpl))
+		})
+	}
+}
+
+// TestBuildLibCloneOptions_LinkedClone: linked clones use Full=0,
+// stay on the template node (no Target), and ignore Storage (the
+// lib mandates linked clones live with the template).
+func TestBuildLibCloneOptions_LinkedClone(t *testing.T) {
+	t.Parallel()
+	got := buildLibCloneOptions(CloneOptions{
+		NewVMID: 10042,
+		Name:    "gh-runner-10042",
+		Linked:  true,
+		Node:    "pve1",
+		Storage: "fast-storage",
+	}, "pve1")
+	require.Equal(t, 10042, got.NewID)
+	require.Equal(t, "gh-runner-10042", got.Name)
+	require.Equal(t, uint8(0), got.Full)
+	require.Empty(t, got.Target, "linked clones must not set Target")
+	require.Empty(t, got.Storage, "linked clones must not set Storage")
+}
+
+// TestBuildLibCloneOptions_FullCloneCrossNode: full clones with a
+// different target Node populate the Target field so the lib places
+// the clone there.
+func TestBuildLibCloneOptions_FullCloneCrossNode(t *testing.T) {
+	t.Parallel()
+	got := buildLibCloneOptions(CloneOptions{
+		NewVMID: 10042,
+		Name:    "gh-runner-10042",
+		Linked:  false,
+		Node:    "pve2",
+		Storage: "fast-storage",
+	}, "pve1")
+	require.Equal(t, uint8(1), got.Full)
+	require.Equal(t, "pve2", got.Target)
+	require.Equal(t, "fast-storage", got.Storage)
+}
+
+// TestBuildLibCloneOptions_FullCloneSameNodeOmitsTarget: when the
+// requested node equals the template node, Target is left empty so
+// the lib defaults to the template node (the right behavior).
+func TestBuildLibCloneOptions_FullCloneSameNodeOmitsTarget(t *testing.T) {
+	t.Parallel()
+	got := buildLibCloneOptions(CloneOptions{NewVMID: 1, Name: "x", Linked: false, Node: "pve1"}, "pve1")
+	require.Empty(t, got.Target, "same-node full clones must omit Target")
+}
+
+// TestBuildCloneConfig_TagsAlwaysPresent: every clone gets the
+// owner/profile/template tags in the Config call, regardless of
+// other overrides.
+func TestBuildCloneConfig_TagsAlwaysPresent(t *testing.T) {
+	t.Parallel()
+	got, err := buildCloneConfig("test-scaleset", CloneOptions{
+		NewVMID: 10042,
+		Profile: "default",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, got)
+	require.Equal(t, "tags", got[0].Name, "tags must be first so it always lands")
+	require.NotEmpty(t, got[0].Value)
+}
+
+// TestBuildCloneConfig_HardwareOverridesEmitted: cores/memory only
+// appear when > 0; the option list grows in a stable order so any
+// future structural change is easy to spot.
+func TestBuildCloneConfig_HardwareOverridesEmitted(t *testing.T) {
+	t.Parallel()
+	got, err := buildCloneConfig("test-scaleset", CloneOptions{
+		NewVMID:  10042,
+		Profile:  "default",
+		CPUCores: 4,
+		MemoryMB: 8192,
+	})
+	require.NoError(t, err)
+
+	names := make([]string, 0, len(got))
+	for _, o := range got {
+		names = append(names, o.Name)
+	}
+	require.Contains(t, names, "cores")
+	require.Contains(t, names, "memory")
+}
+
+// TestBuildCloneConfig_NICsAndIPConfigStamped: each NIC becomes a
+// net<idx> option in order; a non-empty IPConfig becomes
+// ipconfig0 (cloud-init's net0 binding).
+func TestBuildCloneConfig_NICsAndIPConfigStamped(t *testing.T) {
+	t.Parallel()
+	got, err := buildCloneConfig("test-scaleset", CloneOptions{
+		NewVMID: 10042,
+		Profile: "default",
+		NICs: []CloneNIC{
+			{Bridge: "vmbr0", VLANTag: 10},
+			{Bridge: "vmbr1", VLANUntagged: true},
+		},
+		IPConfig: "ip=10.0.0.5/24,gw=10.0.0.1",
+	})
+	require.NoError(t, err)
+
+	collected := make(map[string]any, len(got))
+	for _, o := range got {
+		collected[o.Name] = o.Value
+	}
+	require.Equal(t, "virtio,bridge=vmbr0,tag=10", collected["net0"])
+	require.Equal(t, "virtio,bridge=vmbr1", collected["net1"])
+	require.Equal(t, "ip=10.0.0.5/24,gw=10.0.0.1", collected["ipconfig0"])
+}
+
+// TestBuildCloneConfig_OmitsAbsentOverrides: a sparse CloneOptions
+// produces only the tags option. Prevents accidental emission of
+// zero-valued cores/memory (which Proxmox would reject or default).
+func TestBuildCloneConfig_OmitsAbsentOverrides(t *testing.T) {
+	t.Parallel()
+	got, err := buildCloneConfig("test-scaleset", CloneOptions{NewVMID: 1, Profile: "default"})
+	require.NoError(t, err)
+	require.Len(t, got, 1, "no overrides → only tags")
+	require.Equal(t, "tags", got[0].Name)
+}
+
+// ---------------------------------------------------------------------------
+// Start / Stop / Destroy direct unit tests (issue #235)
+// ---------------------------------------------------------------------------
+
+// TestStart_IdempotentOnAlreadyRunning: when Proxmox replies that
+// the VM is already running, Start treats it as success — the
+// desired post-condition is met.
+func TestStart_IdempotentOnAlreadyRunning(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/nodes/pve1/status":
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		case strings.HasSuffix(r.URL.Path, "/status/current"):
+			_, _ = io.WriteString(w, `{"data":{"vmid":10042,"name":"x","status":"running"}}`)
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		case strings.HasSuffix(r.URL.Path, "/status/start"):
+			// 400 (not 500) so go-proxmox preserves the body — the
+			// classifier reads `err.Error()` for the "already running"
+			// substring, and 5xx bodies are flattened to just the
+			// status text by the lib.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"errors":{"vm":"VM 10042 is already running"}}`)
+		default:
+			t.Logf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+	require.NoError(t, p.Start(context.Background(), &VM{VMID: 10042, Node: "pve1"}))
+}
+
+// TestStop_TreatsMissingVMAsIdempotent: Stop on a deleted VM returns
+// nil. Matches the contract that Stop is on the destroy path and a
+// concurrent admin delete should not surface as an error.
+func TestStop_TreatsMissingVMAsIdempotent(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errors":{"vm":"VM does not exist"}}`))
+	}))
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+	require.NoError(t, p.Stop(context.Background(), &VM{VMID: 10042, Node: "pve1"}))
+}
+
+// TestStop_BubblesNon404Errors: errors that aren't "VM not found"
+// must surface to the caller. The getVM step is what fails here
+// (5xx for non-404), so Stop returns the wrapped error.
+func TestStop_BubblesNon404Errors(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("skipping retry-backoff path under -short")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"errors":{"vm":"transient PVE failure"}}`))
+	}))
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+	err := p.Stop(context.Background(), &VM{VMID: 10042, Node: "pve1"})
+	require.Error(t, err, "Stop must surface non-404 errors from the resolution step")
+}
+
+// ---------------------------------------------------------------------------
+// Timeout / ctx-cancellation tests for Clone / Start / Stop
+// (issue #252)
+// ---------------------------------------------------------------------------
+
+// TestClone_TimeoutCancellationUnwinds: Clone called with a tight
+// timeout against a Proxmox that hangs on every request must unwind
+// inside the timeout via ctx propagation, NOT wait for the
+// underlying HTTP client's per-attempt budget.
+func TestClone_TimeoutCancellationUnwinds(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := p.Clone(ctx, CloneOptions{NewVMID: 10042, Node: "pve1", Name: "x"})
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second,
+		"Clone ctx-timeout must unwind promptly; took %s", elapsed)
+	require.False(t, p.inFlightClones.Has(10042),
+		"the defer in Clone must clear the in-flight entry on ctx unwind")
+}
+
+// TestStart_TimeoutCancellationUnwinds: same property for Start.
+// A hung getVM step is the relevant failure mode operationally —
+// without ctx propagation a stuck node could pin the bootSem token.
+func TestStart_TimeoutCancellationUnwinds(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := p.Start(ctx, &VM{VMID: 10042, Node: "pve1"})
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second,
+		"Start ctx-timeout must unwind promptly; took %s", elapsed)
+}
+
+// TestStop_TimeoutCancellationUnwinds: same property for Stop —
+// a hung Proxmox API must not pin the destroy queue.
+func TestStop_TimeoutCancellationUnwinds(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := p.Stop(ctx, &VM{VMID: 10042, Node: "pve1"})
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	require.Less(t, elapsed, 5*time.Second,
+		"Stop ctx-timeout must unwind promptly; took %s", elapsed)
+}
+
 func TestEncodeNIC_DefaultsModelToVirtio(t *testing.T) {
 	t.Parallel()
 	got := encodeNIC(CloneNIC{Bridge: "vmbr0"})
