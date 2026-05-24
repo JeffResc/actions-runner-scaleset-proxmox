@@ -93,15 +93,26 @@ func TestE2E_SustainedHighConcurrency(t *testing.T) {
 
 	vms := awaitNAssignedVMs(t, h, "burst-set", jobs)
 
-	// Stamp every VM with its own runner ID and post JobStarted
-	// concurrently so the scaler exercises its parallel
-	// per-message path.
+	// Use each VM's JIT-mint ID as the runner ID. See the matching
+	// comment in TestE2E_ConcurrentJobs: scaler.SetRunnerID stamps
+	// that value on the row before any test message lands, so
+	// RunnerDeletions are deterministic even when the gh.Reconciler
+	// wins the Assigned -> Running CAS race against pool.MarkRunning.
 	runnerIDs := make([]int64, jobs)
-	for i := range vms {
-		runnerIDs[i] = int64(300001 + i)
+	for i, vm := range vms {
+		var minted int
+		require.Eventuallyf(t, func() bool {
+			id, ok := gh.JITMintIDForRunner(vm.name)
+			if ok {
+				minted = id
+			}
+			return ok
+		}, 30*time.Second, 100*time.Millisecond,
+			"no JIT mint observed for runner %q", vm.name)
+		runnerIDs[i] = int64(minted)
 		gh.SetRunner(fakegithub.Runner{
 			ID:     runnerIDs[i],
-			Name:   vms[i].name,
+			Name:   vm.name,
 			Status: "online",
 			Busy:   true,
 		})

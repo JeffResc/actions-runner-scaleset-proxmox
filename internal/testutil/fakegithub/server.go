@@ -100,6 +100,14 @@ type scalesetEntry struct {
 	session      *sessionState
 	statistics   fakeRunnerScaleSetStatistic
 	jitMintCount int
+	// jitMintsByName maps the runner name passed to
+	// GenerateJitRunnerConfig to the synthesised runner ID handed
+	// back. Concurrent-job tests use this to learn the JIT-mint ID
+	// for each VM after awaitNAssignedVMs returns, so they can
+	// drive JobStarted/JobCompleted with the same RunnerID the
+	// orchestrator already stamped on the row (avoiding a race
+	// with the gh.Reconciler's promote / force-destroy path).
+	jitMintsByName map[string]int
 }
 
 // New starts the fake and registers cleanup on t.Cleanup.
@@ -113,7 +121,7 @@ func New(t testing.TB, opts Options) *Server {
 		adminToken:    mintAdminJWT(),
 	}
 	for _, spec := range specs {
-		entry := &scalesetEntry{spec: spec}
+		entry := &scalesetEntry{spec: spec, jitMintsByName: map[string]int{}}
 		s.scalesets[spec.Name] = entry
 		s.scalesetsByID[spec.ID] = entry
 	}

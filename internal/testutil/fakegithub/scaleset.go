@@ -421,6 +421,9 @@ func (s *Server) handleGenerateJIT(w http.ResponseWriter, r *http.Request) {
 	// scalesets should assert on JITMintCountFor(name) rather
 	// than hardcoding 100000+N.
 	runnerID := 100000 + entry.jitMintCount
+	if body.Name != "" {
+		entry.jitMintsByName[body.Name] = runnerID
+	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, fakeJITRunnerConfig{
@@ -486,6 +489,34 @@ func (s *Server) JITMintCountFor(name string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return entry.jitMintCount
+}
+
+// JITMintIDForRunner returns the synthesised runner ID that
+// handleGenerateJIT handed back for the given runner name on the
+// single registered scaleset, and ok=false if no JIT mint has
+// happened yet for that name. Concurrent-job e2e tests call this
+// after awaitNAssignedVMs to learn the ID the orchestrator already
+// stamped on the VM row via scaler.SetRunnerID — so JobStarted /
+// JobCompleted can reference the same ID and OnRunnerOrphaned
+// deregisters the expected runner on destroy.
+//
+// Panics in multi-scaleset configs — use JITMintIDForRunnerOn.
+func (s *Server) JITMintIDForRunner(runnerName string) (int, bool) {
+	entry := s.onlyEntry("JITMintIDForRunner")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := entry.jitMintsByName[runnerName]
+	return id, ok
+}
+
+// JITMintIDForRunnerOn is the multi-scaleset variant of
+// JITMintIDForRunner. Panics on unknown scaleset names.
+func (s *Server) JITMintIDForRunnerOn(scaleset, runnerName string) (int, bool) {
+	entry := s.entryFor(scaleset, "JITMintIDForRunnerOn")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := entry.jitMintsByName[runnerName]
+	return id, ok
 }
 
 // SetStatistics overrides the per-session statistics returned for the

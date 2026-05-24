@@ -468,17 +468,39 @@ func TestE2E_StandalonePowerOffCompletes(t *testing.T) {
 		"orchestrator did not deregister the JIT-minted runner on power-off destroy")
 }
 
-// awaitNAssignedVMs polls until exactly n owner-tagged VMs are in the
-// orchestrator's vmid range, then returns their (vmid, name) tuples
-// sorted by VMID for deterministic indexing.
+// awaitNAssignedVMs polls until at least n owner-tagged VMs whose
+// names have a JIT mint recorded with fakegithub exist in the
+// orchestrator's vmid range, then returns the n with the lowest
+// VMIDs sorted in ascending order.
+//
+// Filtering by JIT mint instead of "tagged VM count == n" matters
+// when the pool refills its Hot floor after Acquire transitions
+// some rows to Assigned — the snapshot can hold tagged VMs in
+// excess of n (Hot refill clones plus the n Assigned ones), so an
+// "== n" assertion on raw tag counts is racy. JIT mint only fires
+// in scaler.provisionOne, which only runs for Assigned rows, so
+// the JIT mint table is the correct filter for "which tagged VMs
+// have crossed Hot -> Assigned".
 func awaitNAssignedVMs(t testing.TB, h *Harness, scaleSetName string, n int) []assignedVM {
 	t.Helper()
-	require.Eventually(t, func() bool {
-		return len(taggedOrchestratorVMIDs(h.Proxmox.Snapshot(), scaleSetName)) == n
+	require.Eventuallyf(t, func() bool {
+		return len(jitMintedTaggedVMs(h, scaleSetName)) >= n
 	}, 60*time.Second, 100*time.Millisecond,
-		"never observed exactly %d owner-tagged VMs in scaleset %q", n, scaleSetName)
+		"never observed %d JIT-minted owner-tagged VMs in scaleset %q", n, scaleSetName)
 
-	out := make([]assignedVM, 0, n)
+	out := jitMintedTaggedVMs(h, scaleSetName)
+	require.GreaterOrEqual(t, len(out), n,
+		"JIT-minted VM scan returned %d, want >= %d (race with destroy?)", len(out), n)
+	sort.Slice(out, func(i, j int) bool { return out[i].vmid < out[j].vmid })
+	return out[:n]
+}
+
+// jitMintedTaggedVMs returns the owner-tagged VMs in the orchestrator's
+// vmid range whose runner name has a JIT mint recorded by the fake.
+// Helper extracted so awaitNAssignedVMs's poll body and its post-poll
+// scan can share a single source of truth.
+func jitMintedTaggedVMs(h *Harness, scaleSetName string) []assignedVM {
+	out := make([]assignedVM, 0)
 	for _, vm := range h.Proxmox.Snapshot() {
 		if vm.VMID < 10000 || vm.VMID >= 11000 {
 			continue
@@ -486,10 +508,11 @@ func awaitNAssignedVMs(t testing.TB, h *Harness, scaleSetName string, n int) []a
 		if !tags.IsOwnedBy(vm.Tags, scaleSetName) {
 			continue
 		}
+		if _, ok := h.GitHub.JITMintIDForRunnerOn(scaleSetName, vm.Name); !ok {
+			continue
+		}
 		out = append(out, assignedVM{vmid: vm.VMID, name: vm.Name})
 	}
-	require.Len(t, out, n, "tagged-VM scan returned %d, want %d (race with destroy?)", len(out), n)
-	sort.Slice(out, func(i, j int) bool { return out[i].vmid < out[j].vmid })
 	return out
 }
 
@@ -535,18 +558,33 @@ func TestE2E_ConcurrentJobs(t *testing.T) {
 
 	vms := awaitNAssignedVMs(t, h, "concurrent-set", jobs)
 
-	// Assign a distinct test runner ID per VM. The IDs are chosen above
-	// the JIT-mint range (100000+counter) to make the deletion
-	// assertion unambiguous — RunnerDeletions returns every ID the
-	// orchestrator DELETEs, and we want to check the post-JobStarted
-	// IDs landed (which is the row's final RunnerID after MarkRunning
-	// overwrites the SetRunnerID-stamped value).
+	// Use each VM's JIT-mint ID as the runner ID. scaler.provisionOne
+	// stamps that value on the row via SetRunnerID before any test
+	// message lands, so the row's RunnerID at destroy time is
+	// deterministic regardless of whether pool.MarkRunning (driven by
+	// JobStarted) or gh.Reconciler's PromoteToRunning (driven by the
+	// runner-list tick) wins the Assigned -> Running CAS. The earlier
+	// shape used distinct test-issued IDs (200001+) and depended on
+	// MarkRunning to overwrite the JIT-mint stamp; under CI load that
+	// races with the reconciler's {assigned,missing} force-destroy
+	// grace and produced flakes where RunnerDeletions held the JIT-
+	// mint IDs instead of the test ones. The "MarkRunning overwrites
+	// RunnerID" path is exercised by internal/pool unit tests.
 	runnerIDs := make([]int64, jobs)
-	for i := range vms {
-		runnerIDs[i] = int64(200001 + i)
+	for i, vm := range vms {
+		var minted int
+		require.Eventuallyf(t, func() bool {
+			id, ok := gh.JITMintIDForRunner(vm.name)
+			if ok {
+				minted = id
+			}
+			return ok
+		}, 30*time.Second, 100*time.Millisecond,
+			"no JIT mint observed for runner %q", vm.name)
+		runnerIDs[i] = int64(minted)
 		gh.SetRunner(fakegithub.Runner{
 			ID:     runnerIDs[i],
-			Name:   vms[i].name,
+			Name:   vm.name,
 			Status: "online",
 			Busy:   true,
 		})
@@ -585,10 +623,10 @@ func TestE2E_ConcurrentJobs(t *testing.T) {
 	}, 60*time.Second, 200*time.Millisecond,
 		"not all %d original VMs were destroyed after JobCompleted", jobs)
 
-	// Every test-issued runner ID must show up in RunnerDeletions.
-	// OnRunnerOrphaned uses the row's RunnerID — which MarkRunning
-	// overwrote to our test-issued value — so this checks that each
-	// per-VM deregistration round-tripped correctly.
+	// Every JIT-mint runner ID must show up in RunnerDeletions.
+	// OnRunnerOrphaned uses the row's RunnerID (the value
+	// SetRunnerID stamped at JIT-mint time) so this checks that
+	// each per-VM deregistration round-tripped correctly.
 	require.Eventually(t, func() bool {
 		deleted := make(map[int64]struct{})
 		for _, id := range gh.RunnerDeletions() {
