@@ -50,6 +50,18 @@ type Harness struct {
 	t      testing.TB
 }
 
+// ScalesetSpec is one entry in Options.Scalesets — the multi-
+// scaleset shape (issue #1). Zero-value Org and ScaleSetName get
+// auto-assigned ("scaleset-<i>" / "org-<i>") so callers only need to
+// declare differences (e.g. distinct HotSize per pool).
+type ScalesetSpec struct {
+	Name                 string
+	Org                  string
+	HotSize              int
+	WarmSize             int
+	MaxConcurrentRunners int
+}
+
 // Options configures a single Start call. Zero values give a
 // well-behaved orchestrator: hot pool 2 / warm 0 / max-concurrent 4,
 // org-scoped, polling intervals dropped to ~hundreds-of-ms so tests
@@ -99,6 +111,15 @@ type Options struct {
 	// Identity is the replica's NodeID in raft mode. Defaults to
 	// RaftCluster.Peers[ReplicaIndex].NodeID when empty.
 	Identity string
+
+	// Scalesets, when non-empty, configures the orchestrator with
+	// the plural `scalesets:` shape (issue #1 multi-scaleset
+	// runtime). Mutually exclusive with the singular ScaleSetName /
+	// Org / HotSize / WarmSize / MaxConcurrentRunners fields above;
+	// the harness panics if both are set. When FakeGitHub is nil
+	// the harness creates one with matching multi-scaleset entries
+	// so each per-scaleset listener resolves its own scope.
+	Scalesets []ScalesetSpec
 }
 
 // RaftCluster manages the in-process raft transport network shared
@@ -167,17 +188,41 @@ func NewRaftCluster(t testing.TB, adminAddrs []string) *RaftCluster {
 // post-shutdown state.
 func Start(t testing.TB, opts Options) *Harness {
 	t.Helper()
-	if opts.HotSize == 0 {
-		opts.HotSize = 2
-	}
-	if opts.MaxConcurrentRunners == 0 {
-		opts.MaxConcurrentRunners = 8
-	}
-	if opts.Org == "" {
-		opts.Org = "octocat"
-	}
-	if opts.ScaleSetName == "" {
-		opts.ScaleSetName = "test-scaleset"
+	multi := len(opts.Scalesets) > 0
+	if multi {
+		// Validate mutual exclusivity loudly so a test that mixes
+		// the singular + plural shapes doesn't get a half-applied
+		// config silently.
+		if opts.ScaleSetName != "" || opts.Org != "" || opts.HotSize != 0 || opts.WarmSize != 0 || opts.MaxConcurrentRunners != 0 {
+			panic("e2e: Options.Scalesets and the singular ScaleSetName/Org/HotSize/WarmSize/MaxConcurrentRunners fields are mutually exclusive")
+		}
+		// Auto-fill per-scaleset defaults so callers can declare
+		// only what differs (e.g. a distinct HotSize).
+		for i := range opts.Scalesets {
+			ss := &opts.Scalesets[i]
+			if ss.Name == "" {
+				ss.Name = fmt.Sprintf("scaleset-%d", i)
+			}
+			if ss.Org == "" {
+				ss.Org = fmt.Sprintf("org-%d", i)
+			}
+			if ss.MaxConcurrentRunners == 0 {
+				ss.MaxConcurrentRunners = 8
+			}
+		}
+	} else {
+		if opts.HotSize == 0 {
+			opts.HotSize = 2
+		}
+		if opts.MaxConcurrentRunners == 0 {
+			opts.MaxConcurrentRunners = 8
+		}
+		if opts.Org == "" {
+			opts.Org = "octocat"
+		}
+		if opts.ScaleSetName == "" {
+			opts.ScaleSetName = "test-scaleset"
+		}
 	}
 
 	proxmox := opts.FakeProxmox
@@ -188,9 +233,17 @@ func Start(t testing.TB, opts Options) *Harness {
 	}
 	gh := opts.FakeGitHub
 	if gh == nil {
-		gh = fakegithub.New(t, fakegithub.Options{
-			ScaleSet: fakegithub.ScaleSetOptions{Name: opts.ScaleSetName},
-		})
+		if multi {
+			ghOpts := make([]fakegithub.ScaleSetOptions, 0, len(opts.Scalesets))
+			for _, ss := range opts.Scalesets {
+				ghOpts = append(ghOpts, fakegithub.ScaleSetOptions{Name: ss.Name})
+			}
+			gh = fakegithub.New(t, fakegithub.Options{Scalesets: ghOpts})
+		} else {
+			gh = fakegithub.New(t, fakegithub.Options{
+				ScaleSet: fakegithub.ScaleSetOptions{Name: opts.ScaleSetName},
+			})
+		}
 	}
 
 	// Pre-bind two ports so we know where to point readiness probes
@@ -230,6 +283,18 @@ func Start(t testing.TB, opts Options) *Harness {
 		ObsAddr:              obsAddr,
 		AdminAddr:            adminAddr,
 	}
+	if multi {
+		cv.Scalesets = make([]scalesetCfg, 0, len(opts.Scalesets))
+		for _, ss := range opts.Scalesets {
+			cv.Scalesets = append(cv.Scalesets, scalesetCfg{
+				Name:                 ss.Name,
+				Org:                  ss.Org,
+				HotSize:              ss.HotSize,
+				WarmSize:             ss.WarmSize,
+				MaxConcurrentRunners: ss.MaxConcurrentRunners,
+			})
+		}
+	}
 	var (
 		raftTransport raft.Transport
 		raftLocalAddr raft.ServerAddress
@@ -268,9 +333,21 @@ func Start(t testing.TB, opts Options) *Harness {
 	}
 	configPath := writeConfig(t, cv)
 
+	// In single-scaleset mode the ConfigURL embeds the configured org
+	// so the scaleset library's path parse extracts it as the scope.
+	// In multi-scaleset mode each entry has its own org and the
+	// shared PAT auth can only hold ONE ConfigURL — so we feed it a
+	// placeholder path that satisfies the library's "needs an org or
+	// owner/repo" parse. fakegithub's listener routes by scaleset
+	// name (in the ?name= query) and by the URL {id} param, neither
+	// of which cares about the configURL's org segment.
+	configURL := gh.ConfigURL(opts.Org)
+	if multi {
+		configURL = gh.ConfigURL("multi-scaleset-placeholder")
+	}
 	auth, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
 		Token:       ghToken,
-		ConfigURL:   gh.ConfigURL(opts.Org),
+		ConfigURL:   configURL,
 		RESTBaseURL: gh.RESTBaseURL(),
 	})
 	require.NoError(t, err)
@@ -409,6 +486,11 @@ type configValues struct {
 	ObsAddr              string
 	AdminAddr            string
 
+	// Scalesets, when non-nil, drives the multi-scaleset template
+	// branch (issue #1). The singular Org / ScaleSetName / sizing
+	// fields are ignored when this is set.
+	Scalesets []scalesetCfg
+
 	// Cluster mode plumbing. When ClusterMode is "raft" the template
 	// emits the cluster.raft block; otherwise it's omitted
 	// (default = standalone).
@@ -423,21 +505,52 @@ type configValues struct {
 	CommitTimeout    string
 }
 
+// scalesetCfg is the template-side representation of one entry in
+// the multi-scaleset config. Fields map 1:1 to the YAML keys the
+// orchestrator's config.Scalesets schema expects.
+type scalesetCfg struct {
+	Name                 string
+	Org                  string
+	HotSize              int
+	WarmSize             int
+	MaxConcurrentRunners int
+}
+
 const configTmpl = `
 github:
   auth_mode: pat
   pat: {}
+{{- if not .Scalesets }}
   scope:
     org: {{.Org}}
+{{- end }}
   poll_interval: 200ms
   assigned_grace: 5s
   running_idle_grace: 1s
   assigned_offline_grace: 5s
+{{- if .Scalesets }}
+scalesets:
+{{- range .Scalesets }}
+  - name: {{.Name}}
+    labels: [self-hosted, linux, x64, e2e]
+    runner_group: default
+    max_concurrent_runners: {{.MaxConcurrentRunners}}
+    scope:
+      org: {{.Org}}
+    profiles:
+      - name: default
+        labels: [self-hosted, linux, x64, e2e]
+        hot_size: {{.HotSize}}
+        warm_size: {{.WarmSize}}
+        max_concurrent_runners: {{.MaxConcurrentRunners}}
+{{- end }}
+{{- else }}
 scaleset:
   name: {{.ScaleSetName}}
   labels: [self-hosted, linux, x64, e2e]
   runner_group: default
   max_concurrent_runners: {{.MaxConcurrentRunners}}
+{{- end }}
 proxmox:
   endpoint: {{.ProxmoxURL}}
   insecure_skip_verify: true
