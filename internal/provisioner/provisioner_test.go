@@ -141,7 +141,7 @@ func TestInjectJITConfig_RoutesToCorrectPath(t *testing.T) {
 	defer srv.Close()
 
 	p := newTestProvisioner(t, srv, "pve1")
-	const jit = "ZW5jb2RlZGppdGNvbmZpZ2Jsb2I=" // base64("encodedjitconfigblob"); shape matches GitHub's JIT output
+	const jit = "eyJydW5uZXJfaWQiOjQyfQ==" // base64({"runner_id":42}); valid JSON object so decoded validation passes
 	err := p.InjectJITConfig(context.Background(), &VM{VMID: 12345, Node: "pve3"}, jit)
 	require.NoError(t, err)
 
@@ -193,6 +193,89 @@ func TestJITConfigPattern_AcceptsBothBase64Alphabets(t *testing.T) {
 				"expected pattern to accept %q", tc.input)
 		})
 	}
+}
+
+// TestValidateDecodedJITConfig pins the decoded-payload defense-in-
+// depth check (#251): even a payload that survives the base64
+// character-set regex must base64-decode to a non-empty JSON object,
+// because the orchestrator's only legitimate producer is the GitHub
+// API and any other shape indicates an upstream contract break.
+func TestValidateDecodedJITConfig(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{
+			name:  "valid std-alphabet JSON object",
+			input: "eyJydW5uZXJfaWQiOjQyfQ==", // {"runner_id":42}
+		},
+		{
+			name:  "valid url-safe alphabet JSON object",
+			input: "eyJydW5uZXJfaWQiOjQyfQ", // unpadded url-safe of same
+		},
+		{
+			name:  "valid nested JSON",
+			input: "eyJydW5uZXIiOnsiaWQiOjQyLCJuYW1lIjoieCJ9fQ==", // {"runner":{"id":42,"name":"x"}}
+		},
+		{
+			name:    "decodes but is a JSON array, not object",
+			input:   "WzEsMiwzXQ==", // [1,2,3]
+			wantErr: "not a JSON object",
+		},
+		{
+			name:    "decodes but is a JSON string, not object",
+			input:   "ImhpIg==", // "hi"
+			wantErr: "not a JSON object",
+		},
+		{
+			name:    "decodes but is not JSON at all",
+			input:   "aGVsbG8gd29ybGQ=", // "hello world"
+			wantErr: "not a JSON object",
+		},
+		{
+			name:    "decodes to an empty JSON object",
+			input:   "e30=", // {}
+			wantErr: "no fields",
+		},
+		{
+			name:    "decodes to an empty payload",
+			input:   "", // empty; caught earlier by InjectJITConfig but the helper itself rejects too
+			wantErr: "empty",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateDecodedJITConfig(c.input)
+			if c.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, err.Error(), c.wantErr)
+		})
+	}
+}
+
+// TestInjectJITConfig_RejectsBase64ShapedButNotJSON pins the
+// end-to-end defense for #251: a payload that passes the
+// character-set regex but doesn't decode to a JSON object must
+// surface as a validation error BEFORE the qemu-guest-agent
+// round-trip — so a future code path that loses GitHub-API context
+// can't accidentally write an error string into the runner's
+// jitconfig.env.
+func TestInjectJITConfig_RejectsBase64ShapedButNotJSON(t *testing.T) {
+	t.Parallel()
+	p := newTestProvisioner(t, mockServer(t, &captured{}, http.StatusOK, `{}`), "pve1")
+	// "encodedjitconfigblob" is base64-shaped and the regex accepts
+	// it (this is the same fixture other tests used to use), but it
+	// decodes to "encodedjitconfigblob" — not JSON.
+	err := p.InjectJITConfig(context.Background(),
+		&VM{VMID: 1, Node: "pve1"}, "ZW5jb2RlZGppdGNvbmZpZ2Jsb2I=")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "decoded validation")
 }
 
 // TestInjectJITConfig_RejectsNonBase64 guards the syntax check that

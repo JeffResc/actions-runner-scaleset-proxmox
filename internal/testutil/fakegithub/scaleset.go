@@ -1,6 +1,7 @@
 package fakegithub
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -426,14 +427,23 @@ func (s *Server) handleGenerateJIT(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	// Produce a base64-encoded JSON object so the orchestrator's
+	// decoded-payload validation (validateDecodedJITConfig) accepts
+	// it. Real GitHub JITs are also base64-encoded JSON; the exact
+	// fields don't matter to the e2e harness because the in-VM
+	// runner is faked.
+	jitBlob, _ := json.Marshal(map[string]any{
+		"runner_id":   runnerID,
+		"runner_name": body.Name,
+		"scaleset_id": entry.spec.ID,
+	})
 	writeJSON(w, http.StatusOK, fakeJITRunnerConfig{
 		Runner: fakeRunnerReference{
 			ID:               runnerID,
 			Name:             body.Name,
 			RunnerScaleSetID: entry.spec.ID,
 		},
-		// Base64-encoded test config (literal bytes, no actual runner config).
-		EncodedJITConfig: "ZmFrZWdpdGh1Yi1qaXQtY29uZmln",
+		EncodedJITConfig: base64.StdEncoding.EncodeToString(jitBlob),
 	})
 }
 
