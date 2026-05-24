@@ -3,6 +3,7 @@ package scaler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -443,10 +444,16 @@ func TestHandleJobStarted_RoutedJobDoesNotIncrementUnrouted(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Joined label key the recorder would have used IF this were a miss.
-	require.Equal(t, 0.0,
-		counterValue(t, metrics.UnroutedJobs, "test", "linux|self-hosted|x64"),
-		"a matched job must not increment unrouted_jobs_total")
+	// Cardinality-capped bucket the recorder would have used IF this
+	// were a miss; assert zero increments across all buckets so the
+	// matched-job-must-not-count guarantee holds regardless of where
+	// the hash lands.
+	for i := 0; i < unroutedLabelsBucketCount; i++ {
+		bucket := fmt.Sprintf("bucket-%02d", i)
+		require.Equal(t, 0.0,
+			counterValue(t, metrics.UnroutedJobs, "test", bucket),
+			"a matched job must not increment unrouted_jobs_total (bucket=%s)", bucket)
+	}
 }
 
 func TestHandleJobStarted_UnroutedJobIncrementsCounter(t *testing.T) {
@@ -465,9 +472,13 @@ func TestHandleJobStarted_UnroutedJobIncrementsCounter(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// Find the bucket the unrouted labels hashed into; cardinality
+	// cap means we can't predict it inline without re-deriving the
+	// hash, so search across the bucket space.
+	wantBucket := joinLabelsForMetric([]string{"self-hosted", "windows"})
 	require.Equal(t, 1.0,
-		counterValue(t, metrics.UnroutedJobs, "test", "self-hosted|windows"),
-		"unrouted job must increment scaleset_unrouted_jobs_total with sorted|joined labels")
+		counterValue(t, metrics.UnroutedJobs, "test", wantBucket),
+		"unrouted job must increment scaleset_unrouted_jobs_total in its hashed bucket")
 }
 
 func TestHandleJobStarted_NoRouterAttachedIsNoop(t *testing.T) {
@@ -485,9 +496,12 @@ func TestHandleJobStarted_NoRouterAttachedIsNoop(t *testing.T) {
 		RunnerID:   44,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 0.0,
-		counterValue(t, metrics.UnroutedJobs, "test", "matches|never"),
-		"nil router must NOT touch the unrouted counter")
+	for i := 0; i < unroutedLabelsBucketCount; i++ {
+		bucket := fmt.Sprintf("bucket-%02d", i)
+		require.Equal(t, 0.0,
+			counterValue(t, metrics.UnroutedJobs, "test", bucket),
+			"nil router must NOT touch the unrouted counter (bucket=%s)", bucket)
+	}
 }
 
 func TestJoinLabelsForMetric_StableAcrossOrdering(t *testing.T) {
@@ -498,8 +512,31 @@ func TestJoinLabelsForMetric_StableAcrossOrdering(t *testing.T) {
 	a := joinLabelsForMetric([]string{"self-hosted", "linux", "x64"})
 	b := joinLabelsForMetric([]string{"x64", "self-hosted", "linux"})
 	require.Equal(t, a, b)
-	require.Equal(t, "linux|self-hosted|x64", a)
-	require.Equal(t, "", joinLabelsForMetric(nil))
+	require.Regexp(t, `^bucket-\d{2}$`, a, "output must be the cardinality-capped bucket form")
+	require.Equal(t, "empty", joinLabelsForMetric(nil))
+}
+
+// TestJoinLabelsForMetric_BoundedCardinality is the load-bearing
+// guard for #240: a workflow author who embeds an ephemeral string
+// (PR number, commit SHA, UUID, ...) in `runs-on` must not be able
+// to blow up the metrics endpoint with an unbounded series count.
+// Drive thousands of distinct inputs and assert the output bucket
+// set never exceeds unroutedLabelsBucketCount.
+func TestJoinLabelsForMetric_BoundedCardinality(t *testing.T) {
+	t.Parallel()
+	seen := make(map[string]struct{}, unroutedLabelsBucketCount)
+	for i := 0; i < 5000; i++ {
+		// Each call gets a unique label set (e.g. a UUID injected
+		// into the `runs-on` request labels).
+		out := joinLabelsForMetric([]string{"self-hosted", "linux", fmt.Sprintf("uuid-%d", i)})
+		seen[out] = struct{}{}
+	}
+	require.LessOrEqual(t, len(seen), unroutedLabelsBucketCount,
+		"5000 distinct inputs must hash to <= %d buckets (cardinality cap)",
+		unroutedLabelsBucketCount)
+	require.Greater(t, len(seen), unroutedLabelsBucketCount/4,
+		"hash distribution should populate at least a quarter of buckets across 5000 inputs (got %d / %d)",
+		len(seen), unroutedLabelsBucketCount)
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +661,98 @@ func TestHandleJobStarted_QuotaUnderCapNoThrottle(t *testing.T) {
 	require.Equal(t, 0.0,
 		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
 		"under-cap job must NOT increment throttled counter")
+}
+
+// TestHandleJobStarted_QuotaBoundaries covers the cap edge cases
+// previously untested (#250): cap=0 (treated as disabled/no
+// enforcement, never throttles), cap=1 (single-slot — throttles
+// the moment count>1), and a large overflow (count >> cap; the
+// metric is .Inc()'d exactly once per call, NOT once per excess
+// VM, so an overflow of 100 still bumps the counter by 1).
+func TestHandleJobStarted_QuotaBoundaries(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name             string
+		cap              int
+		count            int
+		wantThrottleHits float64
+	}{
+		// cap=0 short-circuits in recordQuota — treated as "no
+		// enforcement" so even a count over 0 emits no throttle.
+		{"cap=0 never throttles", 0, 50, 0},
+		// cap=1 single-slot: under cap, no throttle.
+		{"cap=1 under cap", 1, 1, 0},
+		// cap=1 single-slot: count=2 > cap=1 → throttle.
+		{"cap=1 over cap", 1, 2, 1},
+		// Large overflow: the throttle is per-call (Inc), NOT per
+		// excess VM — so 100 jobs > cap=10 still increments by 1
+		// for one observed job.
+		{"large overflow increments once", 10, 100, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			metrics := observability.NewMetrics(prometheus.NewRegistry())
+			log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+			s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+			qr, err := quotas.New(quotas.Config{DefaultPerRepo: tc.cap})
+			require.NoError(t, err)
+			s.SetQuotas(qr)
+			s.SetQuotaCounter(&stubQuotaCounter{
+				repoCounts: map[string]int{"acme/platform": tc.count},
+			})
+
+			err = s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+				JobMessageBase: scaleset.JobMessageBase{
+					OwnerName: "acme", RepositoryName: "platform",
+				},
+				RunnerName: "gh-runner-test-10047",
+				RunnerID:   47,
+			})
+			require.NoError(t, err)
+
+			got := counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform")
+			require.Equal(t, tc.wantThrottleHits, got,
+				"cap=%d count=%d → expected %v throttle hits, got %v",
+				tc.cap, tc.count, tc.wantThrottleHits, got)
+		})
+	}
+}
+
+// errQuotaCounter satisfies QuotaCounter by always returning an
+// error — used to pin the quota-lookup-error path.
+type errQuotaCounter struct{ err error }
+
+func (e *errQuotaCounter) CountByRepo(string) (int, error) { return 0, e.err }
+func (e *errQuotaCounter) CountByOrg(string) (int, error)  { return 0, e.err }
+
+// TestHandleJobStarted_QuotaLookupErrorDoesNotEmitMetric pins the
+// log-only behavior on quota-count failure: a downstream error
+// must NOT increment the throttled counter (false signal) and must
+// NOT escalate to the listener.
+func TestHandleJobStarted_QuotaLookupErrorDoesNotEmitMetric(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 5})
+	require.NoError(t, err)
+	s.SetQuotas(qr)
+	s.SetQuotaCounter(&errQuotaCounter{err: errors.New("store unavailable")})
+
+	err = s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{
+			OwnerName: "acme", RepositoryName: "platform",
+		},
+		RunnerName: "gh-runner-test-10048",
+		RunnerID:   48,
+	})
+	require.NoError(t, err, "lookup errors must NOT escalate to the listener")
+	require.Equal(t, 0.0,
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
+		"lookup error must NOT increment throttled counter — false signal")
 }
 
 func TestHandleJobStarted_DisabledQuotaResolverIsNoop(t *testing.T) {
