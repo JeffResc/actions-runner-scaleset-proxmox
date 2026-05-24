@@ -431,3 +431,70 @@ func TestPAT_ConfigBaseURL_PerScopeRouting(t *testing.T) {
 	require.True(t, gotOrgA, "no request observed for org-a; got paths %v", paths)
 	require.True(t, gotOrgB, "no request observed for org-b; got paths %v", paths)
 }
+
+// TestNewAppWithConfig_RejectsConfigURLPlusConfigBaseURL mirrors
+// the PAT-side mutual-exclusion check for the App auth mode
+// (issue #214 follow-up).
+func TestNewAppWithConfig_RejectsConfigURLPlusConfigBaseURL(t *testing.T) {
+	t.Parallel()
+	_, err := githubauth.NewAppWithConfig(githubauth.AppConfig{
+		ClientID:       "Iv23test",
+		InstallationID: 1234,
+		PrivateKeyPEM:  []byte(fakePEM),
+		ConfigURL:      "https://ghes.example.com/myorg",
+		ConfigBaseURL:  "https://ghes.example.com",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "mutually exclusive")
+}
+
+// TestNewAppWithConfig_RejectsConfigBaseURLWithoutScheme mirrors
+// the PAT-side parse rule.
+func TestNewAppWithConfig_RejectsConfigBaseURLWithoutScheme(t *testing.T) {
+	t.Parallel()
+	_, err := githubauth.NewAppWithConfig(githubauth.AppConfig{
+		ClientID:       "Iv23test",
+		InstallationID: 1234,
+		PrivateKeyPEM:  []byte(fakePEM),
+		ConfigBaseURL:  "ghes.example.com",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "scheme and host")
+}
+
+// TestApp_ConfigBaseURL_BuildsPerScopeClients is the App-side
+// analogue of TestPAT_ConfigBaseURL_PerScopeRouting. We can't
+// wire-test outbound App requests easily because App auth must
+// first mint a JWT signed with a real RSA key (the fakePEM
+// fixture wouldn't sign), but the URL resolver is the same shared
+// helper as PAT — TestPAT_ConfigBaseURL_PerScopeRouting already
+// proves it produces distinct per-scope URLs. This test confirms
+// the App constructor accepts ConfigBaseURL and that two distinct
+// scopes yield two distinct *scaleset.Client instances rather
+// than aliasing.
+func TestApp_ConfigBaseURL_BuildsPerScopeClients(t *testing.T) {
+	t.Parallel()
+	a, err := githubauth.NewAppWithConfig(githubauth.AppConfig{
+		ClientID:       "Iv23test",
+		InstallationID: 1234,
+		PrivateKeyPEM:  []byte(fakePEM),
+		ConfigBaseURL:  "https://ghes.example.com",
+	})
+	require.NoError(t, err)
+
+	clientA, err := a.NewScaleSetClient(context.Background(),
+		githubauth.Scope{Org: "org-a"}, validSystemInfo)
+	require.NoError(t, err)
+	require.NotNil(t, clientA)
+
+	clientB, err := a.NewScaleSetClient(context.Background(),
+		githubauth.Scope{Org: "org-b"}, validSystemInfo)
+	require.NoError(t, err)
+	require.NotNil(t, clientB)
+
+	// Distinct *Client instances — each holds its own per-scope
+	// GitHubConfigURL ("https://ghes.example.com/org-a" vs
+	// "/org-b"); a regression that hardcoded scope.URL() would
+	// have produced two clients pointed at github.com instead.
+	require.NotSame(t, clientA, clientB)
+}

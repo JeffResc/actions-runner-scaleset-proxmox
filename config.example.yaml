@@ -33,6 +33,14 @@ github:
   #   # app_id: 123456
   #   installation_id: 789012
   #   private_key_path: /etc/scaleset/github-app.pem
+  #   # GHES (mirrors the pat: knobs below; same per-scope
+  #   # semantics). config_url and config_base_url are mutually
+  #   # exclusive; config_url is incompatible with multi-scaleset.
+  #   # rest_base_url overrides go-github's BaseURL for the App
+  #   # installation-token fetch + subsequent REST calls.
+  #   # config_url: https://ghes.example.com/my-org
+  #   # config_base_url: https://ghes.example.com
+  #   # rest_base_url: https://ghes.example.com/api/v3/
 
   # Used when auth_mode = pat. The token must be supplied via
   # SCALESET_GITHUB_PAT_TOKEN (not written into yaml).

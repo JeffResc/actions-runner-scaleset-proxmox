@@ -96,11 +96,76 @@ type TransportWrap func(http.RoundTripper) http.RoundTripper
 // PAT
 // ---------------------------------------------------------------------------
 
-type patAuth struct {
-	token         string
+// endpointConfig holds the GHES / test-fake override knobs both
+// auth modes share. PAT and App auth get the same per-scope URL
+// resolution and REST base URL override — operators on GHES need
+// the same three knobs regardless of credential mode (issue
+// #214 + its App-side follow-up).
+type endpointConfig struct {
 	configURL     string // full URL: applies as-is regardless of scope (single-scope override)
 	configBaseURL string // base URL (no path): joined per-call with scope.PathSegment() — multi-scaleset GHES (issue #214)
 	restBaseURL   string // empty = use go-github default (https://api.github.com/)
+}
+
+// resolveScaleSetConfigURL derives the per-scope GitHubConfigURL
+// from the endpoint config, in this precedence:
+//
+//  1. configURL — operator-supplied full URL (single-scope
+//     override or test-only fake-server redirect). Returned
+//     verbatim for every scope; multi-scaleset configs against
+//     GHES MUST use configBaseURL instead so each scope produces
+//     a distinct URL.
+//  2. configBaseURL — operator-supplied scheme+host (GHES).
+//     Joined with scope.PathSegment() per-call so each scope's
+//     client handshakes against the right org/repo on the same
+//     host (issue #214).
+//  3. scope.URL() — the github.com default. Already per-scope by
+//     virtue of scope.PathSegment(), so multi-scaleset works out
+//     of the box.
+func (e endpointConfig) resolveScaleSetConfigURL(scope Scope) string {
+	if e.configURL != "" {
+		return e.configURL
+	}
+	if e.configBaseURL != "" {
+		// Trim trailing slash before joining so the result is
+		// always "<scheme>://<host>/<path>" rather than
+		// "...//<path>".
+		return strings.TrimRight(e.configBaseURL, "/") + "/" + scope.PathSegment()
+	}
+	return scope.URL()
+}
+
+// validateEndpointConfig enforces the shared input rules: the two
+// config-URL forms are mutually exclusive, ConfigBaseURL must be
+// a parseable URL with scheme+host, and RESTBaseURL (if set) must
+// end with the trailing slash go-github requires.
+func validateEndpointConfig(configURL, configBaseURL, restBaseURL string) error {
+	if configURL != "" && configBaseURL != "" {
+		return errors.New("githubauth: config_url and config_base_url are mutually exclusive — set one or neither")
+	}
+	if configBaseURL != "" {
+		u, err := url.Parse(configBaseURL)
+		if err != nil {
+			return fmt.Errorf("githubauth: config_base_url %q: %w", configBaseURL, err)
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("githubauth: config_base_url %q must include scheme and host (e.g. https://ghes.example.com)", configBaseURL)
+		}
+	}
+	if restBaseURL != "" {
+		if _, err := url.Parse(restBaseURL); err != nil {
+			return fmt.Errorf("githubauth: rest base url %q: %w", restBaseURL, err)
+		}
+		if !strings.HasSuffix(restBaseURL, "/") {
+			return fmt.Errorf("githubauth: rest base url %q must end with /", restBaseURL)
+		}
+	}
+	return nil
+}
+
+type patAuth struct {
+	token string
+	endpointConfig
 }
 
 // PATConfig configures a PAT-based [Auth] with optional base-URL overrides
@@ -150,31 +215,16 @@ func NewPATWithConfig(c PATConfig) (Auth, error) {
 	if c.Token == "" {
 		return nil, errors.New("githubauth: PAT token is required")
 	}
-	if c.ConfigURL != "" && c.ConfigBaseURL != "" {
-		return nil, errors.New("githubauth: PAT config_url and config_base_url are mutually exclusive — set one or neither")
-	}
-	if c.ConfigBaseURL != "" {
-		u, err := url.Parse(c.ConfigBaseURL)
-		if err != nil {
-			return nil, fmt.Errorf("githubauth: config_base_url %q: %w", c.ConfigBaseURL, err)
-		}
-		if u.Scheme == "" || u.Host == "" {
-			return nil, fmt.Errorf("githubauth: config_base_url %q must include scheme and host (e.g. https://ghes.example.com)", c.ConfigBaseURL)
-		}
-	}
-	if c.RESTBaseURL != "" {
-		if _, err := url.Parse(c.RESTBaseURL); err != nil {
-			return nil, fmt.Errorf("githubauth: rest base url %q: %w", c.RESTBaseURL, err)
-		}
-		if !strings.HasSuffix(c.RESTBaseURL, "/") {
-			return nil, fmt.Errorf("githubauth: rest base url %q must end with /", c.RESTBaseURL)
-		}
+	if err := validateEndpointConfig(c.ConfigURL, c.ConfigBaseURL, c.RESTBaseURL); err != nil {
+		return nil, err
 	}
 	return &patAuth{
-		token:         c.Token,
-		configURL:     c.ConfigURL,
-		configBaseURL: c.ConfigBaseURL,
-		restBaseURL:   c.RESTBaseURL,
+		token: c.Token,
+		endpointConfig: endpointConfig{
+			configURL:     c.ConfigURL,
+			configBaseURL: c.ConfigBaseURL,
+			restBaseURL:   c.RESTBaseURL,
+		},
 	}, nil
 }
 
@@ -195,36 +245,10 @@ func (p *patAuth) NewScaleSetClient(
 		return nil, err
 	}
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
-		GitHubConfigURL:     p.resolveConfigURL(scope),
+		GitHubConfigURL:     p.resolveScaleSetConfigURL(scope),
 		PersonalAccessToken: p.token,
 		SystemInfo:          sys,
 	}, opts...)
-}
-
-// resolveConfigURL derives the per-scope GitHubConfigURL from the
-// auth's configuration, in this precedence:
-//
-//  1. configURL — operator-supplied full URL (single-scope override
-//     or test-only fake-server redirect). Returned verbatim for every
-//     scope; multi-scaleset configs against GHES MUST use
-//     configBaseURL instead so each scope produces a distinct URL.
-//  2. configBaseURL — operator-supplied scheme+host (GHES). Joined
-//     with scope.PathSegment() per-call so each scope's client
-//     handshakes against the right org/repo on the same host (issue
-//     #214).
-//  3. scope.URL() — the github.com default. Already per-scope by
-//     virtue of scope.PathSegment(), so multi-scaleset works out of
-//     the box.
-func (p *patAuth) resolveConfigURL(scope Scope) string {
-	if p.configURL != "" {
-		return p.configURL
-	}
-	if p.configBaseURL != "" {
-		// Trim trailing slash before joining so the result is always
-		// "<scheme>://<host>/<path>" rather than "...//<path>".
-		return strings.TrimRight(p.configBaseURL, "/") + "/" + scope.PathSegment()
-	}
-	return scope.URL()
 }
 
 func (p *patAuth) NewRESTClient(_ context.Context, transportWraps ...TransportWrap) (*github.Client, error) {
@@ -256,43 +280,95 @@ type appAuth struct {
 	clientID       string
 	installationID int64
 	privateKeyPEM  string
+	endpointConfig
+}
+
+// AppConfig configures an App-based [Auth] with optional base-URL
+// overrides. Same shape as [PATConfig]'s override fields — operators
+// on GHES need the same per-scope routing semantics regardless of
+// whether they authenticate via PAT or GitHub App.
+type AppConfig struct {
+	// ClientID is the App Client ID string (newer Apps;
+	// "Iv23..."-style) or a numeric App ID rendered as a string
+	// (older Apps). Required.
+	ClientID string
+
+	// InstallationID is the App installation ID for the target
+	// org/repo. Required.
+	InstallationID int64
+
+	// PrivateKeyPEM is the App's RSA private key in PEM form.
+	// Required (one of PrivateKeyPEM / PrivateKeyPath must be
+	// non-empty when constructing via NewAppWithConfig directly;
+	// NewAppFromFileWithConfig reads the file and supplies this
+	// field).
+	PrivateKeyPEM []byte
+
+	// ConfigURL, ConfigBaseURL, RESTBaseURL mirror [PATConfig]'s
+	// override fields. See those for full semantics; the
+	// behaviour is identical across auth modes (issue #214's
+	// follow-up).
+	ConfigURL     string
+	ConfigBaseURL string
+	RESTBaseURL   string
+}
+
+// NewAppWithConfig is the override-aware constructor for App-based
+// auth. GHES deployments must set ConfigURL (single-scope) or
+// ConfigBaseURL (multi-scaleset) so the scaleset library hits the
+// right host. github.com callers should prefer [NewApp].
+func NewAppWithConfig(c AppConfig) (Auth, error) {
+	if c.ClientID == "" {
+		return nil, errors.New("githubauth: app client_id is required")
+	}
+	if c.InstallationID == 0 {
+		return nil, errors.New("githubauth: app installation_id is required")
+	}
+	if len(c.PrivateKeyPEM) == 0 {
+		return nil, errors.New("githubauth: app private key is required")
+	}
+	if !strings.Contains(string(c.PrivateKeyPEM), "BEGIN") {
+		return nil, errors.New("githubauth: app private key does not look like PEM")
+	}
+	if err := validateEndpointConfig(c.ConfigURL, c.ConfigBaseURL, c.RESTBaseURL); err != nil {
+		return nil, err
+	}
+	return &appAuth{
+		clientID:       c.ClientID,
+		installationID: c.InstallationID,
+		privateKeyPEM:  string(c.PrivateKeyPEM),
+		endpointConfig: endpointConfig{
+			configURL:     c.ConfigURL,
+			configBaseURL: c.ConfigBaseURL,
+			restBaseURL:   c.RESTBaseURL,
+		},
+	}, nil
 }
 
 // NewApp constructs an App-based Auth from a Client ID string. The scaleset
 // library accepts either a Client ID (e.g. "Iv23..." style) or the numeric
 // App ID as a string — callers with only the numeric ID should
-// strconv.FormatInt it before calling.
+// strconv.FormatInt it before calling. github.com only; for GHES use
+// [NewAppWithConfig].
 func NewApp(clientID string, installationID int64, privateKeyPEM []byte) (Auth, error) {
-	if clientID == "" {
-		return nil, errors.New("githubauth: app client_id is required")
-	}
-	if installationID == 0 {
-		return nil, errors.New("githubauth: app installation_id is required")
-	}
-	if len(privateKeyPEM) == 0 {
-		return nil, errors.New("githubauth: app private key is required")
-	}
-	if !strings.Contains(string(privateKeyPEM), "BEGIN") {
-		return nil, errors.New("githubauth: app private key does not look like PEM")
-	}
-	return &appAuth{
-		clientID:       clientID,
-		installationID: installationID,
-		privateKeyPEM:  string(privateKeyPEM),
-	}, nil
+	return NewAppWithConfig(AppConfig{
+		ClientID:       clientID,
+		InstallationID: installationID,
+		PrivateKeyPEM:  privateKeyPEM,
+	})
 }
 
-// NewAppFromFile reads the PEM file from disk and constructs an App auth.
-// Refuses to read a key file with world- or group-readable permissions
-// (any bit in 0o077) — the operator's deployment is misconfigured if
-// a private key is accessible by other users on the box.
-//
-// Also refuses (on unix) when the PEM is owned by a UID other than the
-// process's effective UID. mode 0600 alone is insufficient when the
-// orchestrator runs as root (or with CAP_DAC_READ_SEARCH): a key
-// dropped in by another user with mode 0600 would otherwise be
-// silently trusted.
-func NewAppFromFile(clientID string, installationID int64, pemPath string) (Auth, error) {
+// NewAppFromFileWithConfig reads the PEM file from disk and
+// constructs an App auth honouring the GHES override knobs (issue
+// #214 follow-up). Refuses to read a key file with world- or
+// group-readable permissions (any bit in 0o077) — the operator's
+// deployment is misconfigured if a private key is accessible by
+// other users on the box. Also refuses (on unix) when the PEM is
+// owned by a UID other than the process's effective UID. mode 0600
+// alone is insufficient when the orchestrator runs as root (or
+// with CAP_DAC_READ_SEARCH): a key dropped in by another user
+// with mode 0600 would otherwise be silently trusted.
+func NewAppFromFileWithConfig(c AppConfig, pemPath string) (Auth, error) {
 	if pemPath == "" {
 		return nil, errors.New("githubauth: pem path is required")
 	}
@@ -310,7 +386,18 @@ func NewAppFromFile(clientID string, installationID int64, pemPath string) (Auth
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: read private key %s: %w", pemPath, err)
 	}
-	return NewApp(clientID, installationID, pem)
+	c.PrivateKeyPEM = pem
+	return NewAppWithConfig(c)
+}
+
+// NewAppFromFile reads the PEM file from disk and constructs an
+// App auth pointed at github.com. For GHES (and any caller that
+// needs override knobs) use [NewAppFromFileWithConfig].
+func NewAppFromFile(clientID string, installationID int64, pemPath string) (Auth, error) {
+	return NewAppFromFileWithConfig(AppConfig{
+		ClientID:       clientID,
+		InstallationID: installationID,
+	}, pemPath)
 }
 
 func (a *appAuth) NewScaleSetClient(
@@ -323,7 +410,7 @@ func (a *appAuth) NewScaleSetClient(
 		return nil, err
 	}
 	return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
-		GitHubConfigURL: scope.URL(),
+		GitHubConfigURL: a.resolveScaleSetConfigURL(scope),
 		GitHubAppAuth: scaleset.GitHubAppAuth{
 			ClientID:       a.clientID,
 			InstallationID: a.installationID,
@@ -345,8 +432,18 @@ func (a *appAuth) NewRESTClient(_ context.Context, transportWraps ...TransportWr
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: app installation transport: %w", err)
 	}
+	// GHES needs a non-default API host. Use ghinstallation's
+	// SetBaseURL when configured so the App installation-token
+	// fetch hits the right server; pair it with go-github
+	// WithURLs so subsequent REST calls follow.
 	httpClient := &http.Client{Transport: applyWraps(itr, transportWraps)}
-	cli, err := github.NewClient(github.WithHTTPClient(httpClient))
+	opts := []github.ClientOptionsFunc{github.WithHTTPClient(httpClient)}
+	if a.restBaseURL != "" {
+		itr.BaseURL = strings.TrimRight(a.restBaseURL, "/")
+		base := a.restBaseURL
+		opts = append(opts, github.WithURLs(&base, &base))
+	}
+	cli, err := github.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: build app rest client: %w", err)
 	}
