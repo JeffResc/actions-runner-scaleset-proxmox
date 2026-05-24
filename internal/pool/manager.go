@@ -1612,6 +1612,26 @@ func (m *manager) kickClone(ctx context.Context, profile string, kind store.Pool
 	}()
 }
 
+// clonePrep is the bundle of state produced by prepareClone and
+// consumed by the rest of runClone. Splitting it out keeps the
+// orchestration body short and makes the rollback helper
+// (handleCloneFailure) parameterless beyond the prep itself.
+type clonePrep struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	span          trace.Span
+	ps            *profileState
+	profileName   string
+	node          string
+	vmid          int
+	name          string
+	templateVMID  int
+	templateClass string
+	ipConfig      string
+	kind          store.PoolKind
+	poweredOn     bool
+}
+
 // runClone is the body of an async clone goroutine. The caller
 // passes a *int that runClone writes the allocated vmid into as soon
 // as allocation succeeds — so the surrounding goroutine's panic-
@@ -1621,23 +1641,107 @@ func (m *manager) kickClone(ctx context.Context, profile string, kind store.Pool
 // profile selects the per-profile hardware shape and labels the
 // clone with the matching tag. An empty profile name maps to the
 // manager's default profile.
+//
+// Body is the orchestration sequence only: prepare → call provisioner
+// → on success persist row + kick boot, on failure delegate to
+// handleCloneFailure. Per-step setup (profile lookup, node
+// selection, VMID + row insert, IPAM lease) lives in prepareClone;
+// the rollback paths share handleCloneFailure.
 func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int) {
+	prep := m.prepareClone(profile, kind, poweredOn, vmidRef)
+	if prep == nil {
+		return
+	}
+	defer prep.cancel()
+	defer prep.span.End()
+
+	cloneStart := time.Now()
+	pv, err := m.prov.Clone(prep.ctx, provisioner.CloneOptions{
+		NewVMID:       prep.vmid,
+		Node:          prep.node,
+		Name:          prep.name,
+		Linked:        m.cfg.LinkedClones,
+		PoweredOn:     prep.poweredOn,
+		Profile:       prep.profileName,
+		TemplateVMID:  prep.templateVMID,
+		TemplateClass: prep.templateClass,
+		CPUCores:      prep.ps.settings.CPUCores,
+		MemoryMB:      prep.ps.settings.MemoryMB,
+		DiskGB:        prep.ps.settings.DiskGB,
+		Storage:       prep.ps.settings.Storage,
+		NICs:          prep.ps.settings.NICs,
+		IPConfig:      prep.ipConfig,
+	})
+	if err != nil {
+		m.handleCloneFailure(prep, err, "clone")
+		return
+	}
+	if m.metrics != nil {
+		m.metrics.CloneDuration.WithLabelValues(m.cfg.ScaleSetName, prep.profileName, fmt.Sprintf("%t", m.cfg.LinkedClones), prep.node).Observe(time.Since(cloneStart).Seconds())
+		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, prep.profileName, "clone-success").Inc()
+	}
+	// Feed the canary controller's clone counter (only the
+	// candidate class actually counts; the controller ignores
+	// stable for failure-rate purposes).
+	if m.cfg.Canary != nil {
+		m.cfg.Canary.RecordClone(prep.profileName, canary.Template(prep.templateClass))
+	}
+
+	// Transition row to warm (if not powered on) or booting (if powered on).
+	target := store.StateWarm
+	if prep.poweredOn {
+		target = store.StateBooting
+	}
+	updated, err := m.store.Update(prep.vmid, func(v *store.VM) {
+		v.State = target
+		v.StateSince = time.Now()
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Row was deleted while Clone was in flight — typically by
+			// admin ForceDestroy or a stuck-state sweep that didn't see
+			// the in-flight clone. The Proxmox VM is real; without an
+			// immediate destroy it lives until sweepProxmoxOrphans picks
+			// it up (OrphanGrace + reconcile tick). Destroy it now.
+			m.log.Info("clone: row deleted mid-clone, destroying orphan vm",
+				"vmid", prep.vmid, "node", prep.node)
+			m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+			return
+		}
+		m.log.Warn("clone: update row state failed", "vmid", prep.vmid, "err", err)
+		return
+	}
+
+	if prep.poweredOn {
+		m.runBootInline(prep.ctx, pv, updated)
+	}
+	m.SignalRefill()
+}
+
+// prepareClone runs the pre-Clone setup: profile lookup, node
+// selection, VMID allocation + provisioning-row insert (under
+// allocMu), and IPAM lease. Returns nil on any failure; before
+// returning nil it has logged the error, ended the span / cancelled
+// the ctx, and — if the failure happens AFTER the row was inserted
+// — invoked handleCloneFailure to mark the row Destroying and queue
+// a destroy. On success, the caller owns the returned prep and must
+// defer prep.cancel() / prep.span.End().
+func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int) *clonePrep {
 	ps := m.profileOf(profile)
 	if ps == nil {
 		m.log.Warn("clone: unknown profile; aborting", "profile", profile)
-		return
+		return nil
 	}
 	profileName := ps.settings.Name
+
 	// Derived from workerCtx so SIGTERM (and drain timeout) propagate
 	// into in-flight Proxmox calls. 15-minute deadline caps a single
 	// stuck call.
 	ctx, cancel := context.WithTimeout(m.workerCtx, 15*time.Minute)
-	defer cancel()
 	ctx, span := tracer.Start(ctx, "pool.runClone", trace.WithAttributes(
 		attribute.String("pool.kind", string(kind)),
 		attribute.Bool("powered_on", poweredOn),
 	))
-	defer span.End()
 
 	// Build the Hint with profile + existing-row context so the
 	// affinity wrapper (issue #8) can apply prefer_nodes /
@@ -1651,35 +1755,97 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	node, err := m.sel.Select(ctx, hint)
 	if err != nil {
 		m.log.Warn("clone: node selection failed", "profile", profileName, "err", err)
-		return
+		span.End()
+		cancel()
+		return nil
 	}
 	if m.cfg.LinkedClones {
 		node = m.cfg.TemplateNode
 	}
 
-	// Allocate VMID and insert the row under allocMu so concurrent
-	// goroutines don't collide on the same id.
-	m.allocMu.Lock()
-	vmid, err := m.allocateVMID(ctx)
+	vmid, name, templateVMID, templateClass, err := m.allocateVMIDAndInsertRow(ctx, ps, kind, node)
 	if err != nil {
-		m.allocMu.Unlock()
-		m.log.Warn("clone: allocate vmid failed", "err", err)
-		return
+		m.log.Warn("clone: allocate/insert failed", "profile", profileName, "err", err)
+		span.End()
+		cancel()
+		return nil
 	}
 	// Publish the allocated id to the caller so a panic later in this
 	// function logs the real vmid rather than 0.
 	if vmidRef != nil {
 		*vmidRef = vmid
 	}
-	name := fmt.Sprintf("%s%d", m.cfg.VMNamePrefix, vmid)
+	span.SetAttributes(
+		attribute.Int("vm.id", vmid),
+		attribute.String("vm.node", node),
+		attribute.String("pool.profile", profileName),
+	)
+
+	prep := &clonePrep{
+		ctx:           ctx,
+		cancel:        cancel,
+		span:          span,
+		ps:            ps,
+		profileName:   profileName,
+		node:          node,
+		vmid:          vmid,
+		name:          name,
+		templateVMID:  templateVMID,
+		templateClass: templateClass,
+		kind:          kind,
+		poweredOn:     poweredOn,
+	}
+
+	// Allocate a static IP (if the profile's IPAM is non-noop)
+	// BEFORE the Clone call so the IPConfig can be stamped into
+	// the same Config request the provisioner makes for tags +
+	// hardware. allocMu is already released here — IPAM calls
+	// can take network round-trips and must not block VMID minting.
+	allocator := ps.settings.IPAM
+	if allocator == nil {
+		allocator = ipam.Noop{}
+	}
+	ipAssignment, err := allocator.Allocate(ctx, vmid)
+	if err != nil {
+		m.log.Warn("clone: ipam allocate failed", "vmid", vmid, "profile", profileName, "err", err)
+		// Row exists; the standard failure path marks it Destroying
+		// and queues a destroy (which releases the IPAM lease — safe
+		// because Release is idempotent and nothing was allocated).
+		m.handleCloneFailure(prep, err, "ipam")
+		span.End()
+		cancel()
+		return nil
+	}
+	if ipAssignment != "" {
+		prep.ipConfig = "ip=" + ipAssignment
+	}
+	return prep
+}
+
+// allocateVMIDAndInsertRow runs the section guarded by allocMu:
+// minting a fresh VMID, computing the canary template selection,
+// and inserting the provisioning-state row. Returns the assigned
+// vmid, name, template VMID, and template class. allocMu is held
+// only for the duration of this helper — IPAM and Proxmox calls
+// happen outside the lock. The defer guarantees release even on
+// panic, which would otherwise wedge every subsequent clone.
+func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState, kind store.PoolKind, node string) (vmid int, name string, templateVMID int, templateClass string, err error) {
+	m.allocMu.Lock()
+	defer m.allocMu.Unlock()
+
+	vmid, err = m.allocateVMID(ctx)
+	if err != nil {
+		return 0, "", 0, "", fmt.Errorf("allocate vmid: %w", err)
+	}
+	name = fmt.Sprintf("%s%d", m.cfg.VMNamePrefix, vmid)
 	// Canary template selection. Pre-computed before the row
 	// Insert so the Template field is set in one atomic write —
 	// avoiding a second Update between Insert and Clone that
 	// could race with reconcile-loop accounting.
-	templateVMID := ps.settings.TemplateVMID
-	templateClass := string(canary.Stable)
+	templateVMID = ps.settings.TemplateVMID
+	templateClass = string(canary.Stable)
 	if m.cfg.Canary != nil {
-		if pr, perr := m.cfg.Canary.Pick(profileName, vmid); perr == nil {
+		if pr, perr := m.cfg.Canary.Pick(ps.settings.Name, vmid); perr == nil {
 			if pr.TemplateVMID > 0 {
 				templateVMID = pr.TemplateVMID
 			}
@@ -1690,127 +1856,38 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		VMID:     vmid,
 		Node:     node,
 		Name:     name,
-		Profile:  profileName,
+		Profile:  ps.settings.Name,
 		Template: templateClass,
 		PoolKind: kind,
 		State:    store.StateProvisioning,
 	}
 	if err := m.store.Insert(row); err != nil {
-		m.allocMu.Unlock()
-		m.log.Warn("clone: create row failed", "vmid", vmid, "err", err)
-		return
+		return 0, "", 0, "", fmt.Errorf("create row: %w", err)
 	}
-	m.allocMu.Unlock()
+	return vmid, name, templateVMID, templateClass, nil
+}
 
-	span.SetAttributes(
-		attribute.Int("vm.id", vmid),
-		attribute.String("vm.node", node),
-		attribute.String("pool.profile", profileName),
-	)
-
-	// Allocate a static IP (if the profile's IPAM is non-noop)
-	// BEFORE the Clone call so the IPConfig can be stamped into
-	// the same Config request the provisioner makes for tags +
-	// hardware. Allocation failures fail the clone — the
-	// orchestrator's "skip and let the next reconcile tick retry"
-	// behaviour applies via the standard runClone exit path.
-	allocator := ps.settings.IPAM
-	if allocator == nil {
-		allocator = ipam.Noop{}
+// handleCloneFailure runs the standard clone-fail cleanup for both
+// failure sites (IPAM allocation and the Proxmox Clone call): mark
+// the row Destroying and queue a destroy via the sync-fallback
+// helper. The op tag drives the clone-failed metric increment (only
+// emitted for "clone" — IPAM failures don't yet have a dedicated
+// metric, matching the pre-refactor behaviour).
+func (m *manager) handleCloneFailure(prep *clonePrep, err error, op string) {
+	if prep.span != nil {
+		prep.span.RecordError(err)
+		prep.span.SetStatus(codes.Error, op+" failed")
 	}
-	ipAssignment, err := allocator.Allocate(ctx, vmid)
-	if err != nil {
-		m.log.Warn("clone: ipam allocate failed", "vmid", vmid, "profile", profileName, "err", err)
-		// Treat as a clone failure — destroy the freshly-inserted
-		// row so the next reconcile pass can retry.
-		if _, updErr := m.store.Update(vmid, func(v *store.VM) {
-			v.State = store.StateDestroying
-			v.StateSince = time.Now()
-		}); updErr != nil {
-			m.log.Warn("clone: ipam-fail mark destroying failed", "vmid", vmid, "err", updErr)
-		}
-		m.destroyOrSyncFallback(vmid, node, profileName)
-		return
+	if m.metrics != nil && op == "clone" {
+		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, prep.profileName, "clone-failed").Inc()
 	}
-	ipConfig := ""
-	if ipAssignment != "" {
-		ipConfig = "ip=" + ipAssignment
-	}
-
-	cloneStart := time.Now()
-	pv, err := m.prov.Clone(ctx, provisioner.CloneOptions{
-		NewVMID:       vmid,
-		Node:          node,
-		Name:          name,
-		Linked:        m.cfg.LinkedClones,
-		PoweredOn:     poweredOn,
-		Profile:       profileName,
-		TemplateVMID:  templateVMID,
-		TemplateClass: templateClass,
-		CPUCores:      ps.settings.CPUCores,
-		MemoryMB:      ps.settings.MemoryMB,
-		DiskGB:        ps.settings.DiskGB,
-		Storage:       ps.settings.Storage,
-		NICs:          ps.settings.NICs,
-		IPConfig:      ipConfig,
-	})
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "clone failed")
-		m.log.Warn("clone: provisioner failed", "vmid", vmid, "err", err)
-		if m.metrics != nil {
-			m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, profileName, "clone-failed").Inc()
-		}
-		// Mark the row destroying and let the destroy path clean up.
-		if _, updErr := m.store.Update(vmid, func(v *store.VM) {
-			v.State = store.StateDestroying
-			v.StateSince = time.Now()
-		}); updErr != nil {
-			m.log.Warn("clone: mark destroying failed", "vmid", vmid, "err", updErr)
-		}
-		m.destroyOrSyncFallback(vmid, node, profileName)
-		return
-	}
-	if m.metrics != nil {
-		m.metrics.CloneDuration.WithLabelValues(m.cfg.ScaleSetName, profileName, fmt.Sprintf("%t", m.cfg.LinkedClones), node).Observe(time.Since(cloneStart).Seconds())
-		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, profileName, "clone-success").Inc()
-	}
-	// Feed the canary controller's clone counter (only the
-	// candidate class actually counts; the controller ignores
-	// stable for failure-rate purposes).
-	if m.cfg.Canary != nil {
-		m.cfg.Canary.RecordClone(profileName, canary.Template(templateClass))
-	}
-
-	// Transition row to warm (if not powered on) or booting (if powered on).
-	target := store.StateWarm
-	if poweredOn {
-		target = store.StateBooting
-	}
-	updated, err := m.store.Update(vmid, func(v *store.VM) {
-		v.State = target
+	if _, updErr := m.store.Update(prep.vmid, func(v *store.VM) {
+		v.State = store.StateDestroying
 		v.StateSince = time.Now()
-	})
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			// Row was deleted while Clone was in flight — typically by
-			// admin ForceDestroy or a stuck-state sweep that didn't see
-			// the in-flight clone. The Proxmox VM is real; without an
-			// immediate destroy it lives until sweepProxmoxOrphans picks
-			// it up (OrphanGrace + reconcile tick). Destroy it now.
-			m.log.Info("clone: row deleted mid-clone, destroying orphan vm",
-				"vmid", vmid, "node", node)
-			m.destroyOrSyncFallback(vmid, node, profileName)
-			return
-		}
-		m.log.Warn("clone: update row state failed", "vmid", vmid, "err", err)
-		return
+	}); updErr != nil {
+		m.log.Warn("clone: mark destroying failed", "vmid", prep.vmid, "op", op, "err", updErr)
 	}
-
-	if poweredOn {
-		m.runBootInline(ctx, pv, updated)
-	}
-	m.SignalRefill()
+	m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
 }
 
 // runBoot is the body of a warm->hot promotion goroutine.

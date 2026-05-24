@@ -83,6 +83,11 @@ type fakeProv struct {
 	// past the cooldown."
 	recentlyDestroyedSet map[int]bool
 
+	// isRecentlyDestroyedPanic, when true, makes IsRecentlyDestroyed
+	// panic. Used by the allocMu lock-on-panic regression test to
+	// inject a panic deep inside allocateVMIDAndInsertRow.
+	isRecentlyDestroyedPanic bool
+
 	// inFlightClones drives InFlightCloneCount.
 	inFlightClones int
 
@@ -197,11 +202,19 @@ func (f *fakeProv) PowerState(ctx context.Context, v *provisioner.VM) (string, e
 
 // IsRecentlyDestroyed returns whatever the test seeded into
 // recentlyDestroyedSet. The cooldown arg is ignored — tests model
-// "advance past the cooldown" by toggling map membership.
+// "advance past the cooldown" by toggling map membership. If
+// isRecentlyDestroyedPanic is set, the call panics — used by the
+// allocMu-lock-on-panic regression test to inject a panic deep inside
+// the locked critical section.
 func (f *fakeProv) IsRecentlyDestroyed(vmid int, _ time.Duration) bool {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.recentlyDestroyedSet[vmid]
+	shouldPanic := f.isRecentlyDestroyedPanic
+	result := f.recentlyDestroyedSet[vmid]
+	f.mu.Unlock()
+	if shouldPanic {
+		panic("fakeProv: simulated IsRecentlyDestroyed panic")
+	}
+	return result
 }
 
 // InFlightCloneCount returns the value the test seeded.
