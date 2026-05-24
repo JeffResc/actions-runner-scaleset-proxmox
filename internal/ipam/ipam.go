@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // ErrNoAllocation is returned by Release when the allocator has no
@@ -68,8 +69,10 @@ func (Noop) Release(context.Context, int) error { return nil }
 // rejects allocations once the list is exhausted. Production
 // users should plug in a real IPAM (NetBox, etc.).
 type Static struct {
+	mu   sync.Mutex
 	pool []string
 	in   map[int]string // vmid -> ip
+	used map[string]int // ip -> vmid (reverse index for O(1) free-ip lookup)
 }
 
 // NewStatic builds a Static allocator from a slice of IPs. The
@@ -82,7 +85,11 @@ func NewStatic(pool []string) (*Static, error) {
 	}
 	cp := make([]string, len(pool))
 	copy(cp, pool)
-	return &Static{pool: cp, in: make(map[int]string, len(cp))}, nil
+	return &Static{
+		pool: cp,
+		in:   make(map[int]string, len(cp)),
+		used: make(map[string]int, len(cp)),
+	}, nil
 }
 
 // Allocate hands out the next free IP from the pool. Returns an
@@ -90,6 +97,8 @@ func NewStatic(pool []string) (*Static, error) {
 // surface this as a clone failure that the next reconcile tick
 // will retry against the (possibly now-released) pool.
 func (s *Static) Allocate(_ context.Context, vmid int) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if existing, ok := s.in[vmid]; ok {
 		// Idempotent: repeated Allocate for the same vmid returns
 		// the already-assigned IP. Useful when the pool's clone
@@ -98,17 +107,12 @@ func (s *Static) Allocate(_ context.Context, vmid int) (string, error) {
 		return existing, nil
 	}
 	for _, ip := range s.pool {
-		assigned := false
-		for _, taken := range s.in {
-			if taken == ip {
-				assigned = true
-				break
-			}
+		if _, taken := s.used[ip]; taken {
+			continue
 		}
-		if !assigned {
-			s.in[vmid] = ip
-			return ip, nil
-		}
+		s.in[vmid] = ip
+		s.used[ip] = vmid
+		return ip, nil
 	}
 	return "", fmt.Errorf("ipam: static pool exhausted (%d IPs)", len(s.pool))
 }
@@ -117,6 +121,11 @@ func (s *Static) Allocate(_ context.Context, vmid int) (string, error) {
 // release (vmid not present) is a no-op — matches the noop
 // allocator's contract.
 func (s *Static) Release(_ context.Context, vmid int) error {
-	delete(s.in, vmid)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ip, ok := s.in[vmid]; ok {
+		delete(s.used, ip)
+		delete(s.in, vmid)
+	}
 	return nil
 }

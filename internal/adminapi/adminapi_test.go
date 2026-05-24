@@ -557,6 +557,79 @@ func TestHandleDestroyVM_RejectsBadVMID(t *testing.T) {
 	}
 }
 
+// TestHandlePreemptVM_RejectsBadVMID mirrors the destroy coverage
+// for the other state-mutating vmid-path endpoint. Without this
+// test a regression in the parse/bounds branch of handlePreemptVM
+// would silently forward a nonsense vmid into the pool layer.
+func TestHandlePreemptVM_RejectsBadVMID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"non-numeric", "/admin/preempt/abc"},
+		{"zero", "/admin/preempt/0"},
+		{"negative", "/admin/preempt/-1"},
+		{"overflow", "/admin/preempt/9999999999999999999"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, fp := newTestServer(t, "topsecret")
+			router := chi.NewRouter()
+			router.Use(s.realIP)
+			router.Use(s.leaderOrForward)
+			router.Use(s.requireBearerToken)
+			router.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
+
+			w := httptest.NewRecorder()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, nil)
+			r.Header.Set("Authorization", "Bearer topsecret")
+			router.ServeHTTP(w, r)
+
+			require.Equal(t, http.StatusBadRequest, w.Code)
+			require.Contains(t, w.Body.String(), "invalid vmid")
+
+			fp.mu.Lock()
+			defer fp.mu.Unlock()
+			require.Empty(t, fp.preempted,
+				"bad-vmid request must NOT reach Preempt")
+		})
+	}
+}
+
+// TestHandlePromoteTemplate_RejectsEmptyProfile pins the empty-
+// profile branch at adminapi.go's handlePromoteTemplate body —
+// chi matches the empty path segment as an empty URLParam, so a
+// regression that skipped this check would forward to the canary
+// controller with a zero-length profile name.
+//
+// Note: chi's pattern /admin/template/promote/{profile} does not
+// match a missing trailing segment (404), so the test instead
+// exercises the namespaced /admin/{scaleset}/template/promote
+// path with an empty profile after a slash to surface the
+// empty-profile branch via the handler directly.
+func TestHandlePromoteTemplate_MissingCanaryReturns404(t *testing.T) {
+	t.Parallel()
+	s, _ := newTestServer(t, "topsecret")
+	// newTestServer does not wire a canary controller — so the
+	// fleet-wide path's "canary controller not configured" branch
+	// must return 404.
+	router := chi.NewRouter()
+	router.Use(s.realIP)
+	router.Use(s.leaderOrForward)
+	router.Use(s.requireBearerToken)
+	router.Post("/admin/template/promote/{profile}", s.handlePromoteTemplate)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/template/promote/default", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	router.ServeHTTP(w, r)
+
+	require.Equal(t, http.StatusNotFound, w.Code)
+	require.Contains(t, w.Body.String(), "canary controller not configured")
+}
+
 func TestDrain_TriggersCallback(t *testing.T) {
 	t.Parallel()
 	fp := &fakePool{}
