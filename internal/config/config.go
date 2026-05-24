@@ -269,6 +269,26 @@ type GitHubAppConfig struct {
 	AppID          int64  `yaml:"app_id,omitempty"`
 	InstallationID int64  `yaml:"installation_id" validate:"required,gt=0"`
 	PrivateKeyPath string `yaml:"private_key_path" validate:"required,file"`
+
+	// ConfigURL mirrors GitHubPATConfig.ConfigURL — a full URL with
+	// the org/repo baked in. Use for single-scaleset GHES + App
+	// auth. Mutually exclusive with ConfigBaseURL; the config
+	// validator rejects setting both, and refuses ConfigURL when
+	// more than one scaleset is declared (issue #214 + the App-side
+	// follow-up).
+	ConfigURL string `yaml:"config_url,omitempty"`
+
+	// ConfigBaseURL mirrors GitHubPATConfig.ConfigBaseURL — a
+	// scheme+host the orchestrator joins with each scaleset's
+	// scope at runtime. Required for multi-scaleset GHES + App
+	// auth.
+	ConfigBaseURL string `yaml:"config_base_url,omitempty"`
+
+	// RESTBaseURL overrides the go-github BaseURL the App-auth REST
+	// client points at. Required for GHES so the App installation
+	// token fetch + subsequent runner-list calls hit the right
+	// host. Must end with a trailing slash (go-github requirement).
+	RESTBaseURL string `yaml:"rest_base_url,omitempty"`
 }
 
 // Issuer returns the JWT issuer string for the App — preferring ClientID
@@ -1333,6 +1353,16 @@ func (c *Config) Resolve() error {
 			return errors.New("github.app: set exactly one of client_id or app_id (both are present)")
 		case !hasClient && !hasAppID:
 			return errors.New("github.app: set exactly one of client_id or app_id (both are empty)")
+		}
+		// Mutual exclusion + multi-scaleset rule, mirroring the PAT
+		// side. App auth gets the same per-scope routing semantics
+		// for GHES (issue #214 follow-up).
+		if c.GitHub.App.ConfigURL != "" && c.GitHub.App.ConfigBaseURL != "" {
+			return errors.New("github.app: config_url and config_base_url are mutually exclusive — set one or neither")
+		}
+		if c.GitHub.App.ConfigURL != "" && len(c.Scalesets) > 1 {
+			return fmt.Errorf("github.app.config_url is incompatible with multi-scaleset (%d scalesets declared); use github.app.config_base_url so each scaleset's scope produces the right per-scope URL",
+				len(c.Scalesets))
 		}
 	}
 	// GitHub scope: with N > 1 scalesets the legacy github.scope
