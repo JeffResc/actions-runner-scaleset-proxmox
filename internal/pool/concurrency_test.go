@@ -171,6 +171,41 @@ func TestAdopt_ConcurrentCallsAreSafe(t *testing.T) {
 	}
 }
 
+// TestAllocateVMIDAndInsertRow_ReleasesLockOnPanic pins the fix
+// for the allocMu lock-leak bug. Before the fix, runClone took
+// allocMu manually and unlocked via three explicit Unlock() calls;
+// a panic anywhere between Lock() and the final Unlock() (e.g.
+// inside allocateVMID's call to Provisioner.IsRecentlyDestroyed)
+// left the mutex held forever, deadlocking every subsequent clone.
+//
+// The fix is `defer m.allocMu.Unlock()`. This test injects a panic
+// via the fake provisioner's IsRecentlyDestroyed, recovers it, and
+// asserts the mutex is now free — proving the defer fired even
+// though the function exited abnormally.
+func TestAllocateVMIDAndInsertRow_ReleasesLockOnPanic(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{isRecentlyDestroyedPanic: true}
+	mgr := newTestManager(t, st, fp, Config{
+		VMIDRange: config.VMIDRange{Min: 60000, Max: 60099},
+	})
+
+	ps := mgr.profileOf("")
+	require.NotNil(t, ps, "default profile must exist")
+
+	func() {
+		defer func() {
+			r := recover()
+			require.NotNil(t, r, "fake provisioner must have panicked inside the locked section")
+		}()
+		_, _, _, _, _ = mgr.allocateVMIDAndInsertRow(context.Background(), ps, store.PoolKindHot, "pve1")
+	}()
+
+	require.True(t, mgr.allocMu.TryLock(),
+		"allocMu must be free after a panic inside the locked section; the defer in allocateVMIDAndInsertRow is what guarantees this")
+	mgr.allocMu.Unlock()
+}
+
 // TestRapidStateCycling drives a single VMID through the full
 // transient state cycle the audit flagged: Hot → Assigned →
 // Running → Draining → Destroyed. Each step is asserted to
