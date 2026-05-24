@@ -1602,11 +1602,13 @@ scalesets:
     max_concurrent_runners: 10
     scope:
       org: org-a
+    vmid_range: { min: 10000, max: 14999 }
   - name: gpu-pool
     labels: [self-hosted, linux, gpu]
     max_concurrent_runners: 4
     scope:
       org: org-b
+    vmid_range: { min: 15000, max: 19999 }
     profiles:
       - name: gpu
         labels: [self-hosted, linux, gpu]
@@ -1718,10 +1720,12 @@ scalesets:
     labels: [a]
     max_concurrent_runners: 5
     scope: { org: org-a }
+    vmid_range: { min: 10000, max: 14999 }
   - name: b
     labels: [b]
     max_concurrent_runners: 5
     scope: { org: org-b }
+    vmid_range: { min: 15000, max: 19999 }
 proxmox:
   endpoint: https://pve.example.com:8006/api2/json
   auth:
@@ -1984,4 +1988,82 @@ func TestParse_PATConfigBaseURLAcceptedWithMultiScaleset(t *testing.T) {
 	cfg, err := config.Parse([]byte(ok))
 	require.NoError(t, err)
 	require.Equal(t, "https://ghes.example.com", cfg.GitHub.PAT.ConfigBaseURL)
+}
+
+// TestScalesets_RejectsMissingVMIDRangeWithMulti confirms the
+// issue #222 guard: with N > 1 scalesets, every entry must
+// declare its own vmid_range so per-scaleset pool.Manager
+// allocators don't race on the same shared global range.
+func TestScalesets_RejectsMissingVMIDRangeWithMulti(t *testing.T) {
+	bad := strings.Replace(validMultiScalesetYAML,
+		"    vmid_range: { min: 10000, max: 14999 }\n", "", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "vmid_range is required with multi-scaleset")
+	require.Contains(t, err.Error(), "issue #222")
+}
+
+// TestScalesets_RejectsOverlappingVMIDRanges locks in the
+// pairwise overlap rejection. Two scalesets that BOTH declare
+// ranges but overlap them would still race; the validator
+// catches that at load.
+func TestScalesets_RejectsOverlappingVMIDRanges(t *testing.T) {
+	bad := strings.Replace(validMultiScalesetYAML,
+		"    vmid_range: { min: 15000, max: 19999 }",
+		"    vmid_range: { min: 14500, max: 19999 }", // overlaps 10000-14999
+		1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "overlaps")
+}
+
+// TestScalesets_AcceptsDisjointVMIDRanges is the happy-path
+// counterpart — disjoint declared ranges parse and validate
+// cleanly. validMultiScalesetYAML already declares disjoint
+// ranges so this is redundant with TestScalesets_PluralFormParses
+// today, but locks the expectation in case future schema work
+// changes the default fixture.
+func TestScalesets_AcceptsDisjointVMIDRanges(t *testing.T) {
+	cfg, err := config.Parse([]byte(validMultiScalesetYAML))
+	require.NoError(t, err)
+	require.Equal(t, 10000, cfg.Scalesets[0].VMIDRange.Min)
+	require.Equal(t, 14999, cfg.Scalesets[0].VMIDRange.Max)
+	require.Equal(t, 15000, cfg.Scalesets[1].VMIDRange.Min)
+	require.Equal(t, 19999, cfg.Scalesets[1].VMIDRange.Max)
+}
+
+// TestScalesets_RejectsMalformedVMIDRange covers the per-entry
+// well-formedness checks: min > 0 and max > min.
+func TestScalesets_RejectsMalformedVMIDRange(t *testing.T) {
+	t.Run("min_must_be_positive", func(t *testing.T) {
+		bad := strings.Replace(validMultiScalesetYAML,
+			"    vmid_range: { min: 10000, max: 14999 }",
+			"    vmid_range: { min: 0, max: 14999 }", 1)
+		_, err := config.Parse([]byte(bad))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "min must be > 0")
+	})
+	t.Run("max_must_exceed_min", func(t *testing.T) {
+		bad := strings.Replace(validMultiScalesetYAML,
+			"    vmid_range: { min: 10000, max: 14999 }",
+			"    vmid_range: { min: 10000, max: 10000 }", 1)
+		_, err := config.Parse([]byte(bad))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "must be greater than min")
+	})
+}
+
+// TestScalesets_SingleScalesetInheritsGlobalRange documents the
+// back-compat behaviour: N == 1 scalesets are allowed to inherit
+// cfg.Proxmox.VMIDRange (there's no sibling to collide with).
+// The singular-form projection used by every existing single-
+// scaleset config exercises this path.
+func TestScalesets_SingleScalesetInheritsGlobalRange(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.Len(t, cfg.Scalesets, 1)
+	// Inherited path: entry's VMIDRange is nil; app.entryVMIDRange
+	// falls back to cfg.Proxmox.VMIDRange.
+	require.Nil(t, cfg.Scalesets[0].VMIDRange)
 }
