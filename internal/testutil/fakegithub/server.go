@@ -18,6 +18,14 @@
 // and will be migrated incrementally — keeping that as a follow-up
 // avoids a 40+ line mechanical churn here that doesn't enable
 // anything new.
+//
+// Multi-scaleset support (issue #1 / PR #207 follow-up): pass
+// Options.Scalesets to host N distinct scale sets behind one
+// httptest server. Each entry gets its own ID, session, statistics,
+// JIT mint counter, and runner-table partition (no cross-contamination).
+// The singular Options.ScaleSet form keeps working for the existing
+// single-scaleset tests and is normalised into a 1-entry Scalesets
+// list at construction.
 package fakegithub
 
 import (
@@ -48,10 +56,18 @@ type Options struct {
 	// startup. Tests can mutate the table later via SetRunner.
 	InitialRunners []Runner
 
-	// ScaleSet configures the scale-set the fake serves on the
-	// scaleset-library endpoints. Zero-value defaults to ID=42,
-	// Name="test-scaleset", RunnerGroupID=1.
+	// ScaleSet configures the SINGLE scale set the fake serves on the
+	// scaleset-library endpoints. Mutually exclusive with Scalesets.
+	// Zero-value defaults to ID=42, Name="test-scaleset",
+	// RunnerGroupID=1.
 	ScaleSet ScaleSetOptions
+
+	// Scalesets configures N scale sets behind one httptest server
+	// (issue #1 multi-scaleset runtime tests). Mutually exclusive with
+	// ScaleSet. Each entry has its own ID, session, statistics, and
+	// JIT mint counter; the orchestrator's per-scaleset workers route
+	// to the right entry via the URL {id} param.
+	Scalesets []ScaleSetOptions
 }
 
 // Server is the fake GitHub REST API. Construct with New; the embedded
@@ -63,46 +79,43 @@ type Server struct {
 	runners   map[int64]Runner
 	deletions []int64
 
-	// scaleset-library state
-	scaleSet     fakeRunnerScaleSet
-	adminToken   string
-	session      *sessionState
-	jitMintCount int
+	// scalesets is the per-scaleset state, indexed by scaleset name
+	// (the operator-facing identifier). scalesetsByID is a parallel
+	// view for routing handlers that key off the URL {id} param.
+	// Both maps are populated in New and never resized afterwards,
+	// so reads happen without a write lock once construction is done
+	// (the surrounding mu guards per-entry mutable state instead).
+	scalesets     map[string]*scalesetEntry
+	scalesetsByID map[int]*scalesetEntry
 
-	// statistics is what the fake reports in every session-create,
-	// session-refresh, and GetMessage envelope. Zero-valued by default;
-	// tests use SetStatistics to drive the orchestrator's listener
-	// loop — TotalAssignedJobs is what HandleDesiredRunnerCount keys
-	// on, which is the only signal that triggers a Hot → Assigned
-	// transition end-to-end.
-	statistics fakeRunnerScaleSetStatistic
-
-	// nextMessageID is the per-server message-ID counter used by the
-	// PostJob* helpers. Each posted envelope claims a unique ID so the
-	// listener's lastMessageID tracking advances naturally.
+	adminToken    string
 	nextMessageID int
+}
+
+// scalesetEntry is the per-scaleset state. Each entry has its own
+// session lifecycle, statistics, and JIT mint counter so multi-
+// scaleset tests can assert on each scale set independently.
+type scalesetEntry struct {
+	spec         fakeRunnerScaleSet
+	session      *sessionState
+	statistics   fakeRunnerScaleSetStatistic
+	jitMintCount int
 }
 
 // New starts the fake and registers cleanup on t.Cleanup.
 func New(t testing.TB, opts Options) *Server {
 	t.Helper()
-	if opts.ScaleSet.ID == 0 {
-		opts.ScaleSet.ID = 42
-	}
-	if opts.ScaleSet.Name == "" {
-		opts.ScaleSet.Name = "test-scaleset"
-	}
-	if opts.ScaleSet.RunnerGroupID == 0 {
-		opts.ScaleSet.RunnerGroupID = 1
-	}
+	specs := normaliseScalesetOptions(opts)
 	s := &Server{
-		runners: map[int64]Runner{},
-		scaleSet: fakeRunnerScaleSet{
-			ID:            opts.ScaleSet.ID,
-			Name:          opts.ScaleSet.Name,
-			RunnerGroupID: opts.ScaleSet.RunnerGroupID,
-		},
-		adminToken: mintAdminJWT(),
+		runners:       map[int64]Runner{},
+		scalesets:     make(map[string]*scalesetEntry, len(specs)),
+		scalesetsByID: make(map[int]*scalesetEntry, len(specs)),
+		adminToken:    mintAdminJWT(),
+	}
+	for _, spec := range specs {
+		entry := &scalesetEntry{spec: spec}
+		s.scalesets[spec.Name] = entry
+		s.scalesetsByID[spec.ID] = entry
 	}
 	for _, r := range opts.InitialRunners {
 		s.runners[r.ID] = r
@@ -112,6 +125,74 @@ func New(t testing.TB, opts Options) *Server {
 	return s
 }
 
+// normaliseScalesetOptions resolves the singular-vs-plural Options
+// shape into a deterministic ScaleSetOptions list with stable
+// defaults. Auto-assigns IDs / RunnerGroupIDs / Names when the
+// caller omitted them so two unnamed scalesets don't collide.
+func normaliseScalesetOptions(opts Options) []fakeRunnerScaleSet {
+	switch {
+	case len(opts.Scalesets) > 0:
+		if (opts.ScaleSet != ScaleSetOptions{}) {
+			panic("fakegithub: Options.ScaleSet and Options.Scalesets are mutually exclusive")
+		}
+		out := make([]fakeRunnerScaleSet, 0, len(opts.Scalesets))
+		seenName := make(map[string]struct{}, len(opts.Scalesets))
+		seenID := make(map[int]struct{}, len(opts.Scalesets))
+		nextID := 42
+		for i, ss := range opts.Scalesets {
+			name := ss.Name
+			if name == "" {
+				name = fmt.Sprintf("test-scaleset-%d", i)
+			}
+			if _, dup := seenName[name]; dup {
+				panic(fmt.Sprintf("fakegithub: duplicate scaleset name %q in Options.Scalesets", name))
+			}
+			seenName[name] = struct{}{}
+			id := ss.ID
+			if id == 0 {
+				for {
+					if _, used := seenID[nextID]; !used {
+						id = nextID
+						break
+					}
+					nextID++
+				}
+				nextID++
+			}
+			if _, dup := seenID[id]; dup {
+				panic(fmt.Sprintf("fakegithub: duplicate scaleset id %d in Options.Scalesets", id))
+			}
+			seenID[id] = struct{}{}
+			rg := ss.RunnerGroupID
+			if rg == 0 {
+				rg = 1
+			}
+			out = append(out, fakeRunnerScaleSet{
+				ID:            id,
+				Name:          name,
+				RunnerGroupID: rg,
+			})
+		}
+		return out
+	default:
+		ss := opts.ScaleSet
+		if ss.ID == 0 {
+			ss.ID = 42
+		}
+		if ss.Name == "" {
+			ss.Name = "test-scaleset"
+		}
+		if ss.RunnerGroupID == 0 {
+			ss.RunnerGroupID = 1
+		}
+		return []fakeRunnerScaleSet{{
+			ID:            ss.ID,
+			Name:          ss.Name,
+			RunnerGroupID: ss.RunnerGroupID,
+		}}
+	}
+}
+
 // ConfigURL returns a URL suitable for githubauth.PATConfig.ConfigURL.
 // The scaleset library parses the path as <org> (1 segment) or
 // <owner>/<repo> (2 segments); we always serve an org-style URL so
@@ -119,10 +200,19 @@ func New(t testing.TB, opts Options) *Server {
 // orchestrator's listener handshake land on this server.
 func (s *Server) ConfigURL(org string) string { return s.URL + "/" + org }
 
-// ScaleSetID returns the runner-scale-set ID the fake claims when the
-// orchestrator looks it up by name. Test assertions on JIT mint
-// records / runner IDs can reference this without hard-coding.
-func (s *Server) ScaleSetID() int { return s.scaleSet.ID }
+// ScaleSetID returns the runner-scale-set ID the fake claims for the
+// single registered scaleset. Panics in multi-scaleset configs — use
+// ScaleSetIDFor(name) instead.
+func (s *Server) ScaleSetID() int {
+	return s.onlyEntry("ScaleSetID").spec.ID
+}
+
+// ScaleSetIDFor returns the ID for the named scaleset (multi-scaleset
+// tests). Panics on unknown names so test sequencing bugs surface
+// loudly.
+func (s *Server) ScaleSetIDFor(name string) int {
+	return s.entryFor(name, "ScaleSetIDFor").spec.ID
+}
 
 // RESTBaseURL returns the URL suitable for passing as
 // githubauth.PATConfig.RESTBaseURL (trailing slash included — go-github
@@ -147,6 +237,32 @@ func (s *Server) RunnerDeletions() []int64 {
 	out := make([]int64, len(s.deletions))
 	copy(out, s.deletions)
 	return out
+}
+
+// onlyEntry returns the single configured scaleset entry or panics
+// if there are multiple. Used by the legacy singular accessors so
+// they fail loud when a test mistakes them for the multi-aware
+// variants.
+func (s *Server) onlyEntry(caller string) *scalesetEntry {
+	if len(s.scalesets) != 1 {
+		panic(fmt.Sprintf("fakegithub: %s called on multi-scaleset server (%d entries); use %sFor(name) instead",
+			caller, len(s.scalesets), caller))
+	}
+	for _, e := range s.scalesets {
+		return e
+	}
+	return nil // unreachable
+}
+
+// entryFor returns the named entry or panics. Tests should never
+// reference a scaleset they didn't configure; the panic surfaces the
+// typo immediately.
+func (s *Server) entryFor(name, caller string) *scalesetEntry {
+	e, ok := s.scalesets[name]
+	if !ok {
+		panic(fmt.Sprintf("fakegithub: %s(%q): no such scaleset configured", caller, name))
+	}
+	return e
 }
 
 func (s *Server) routes() http.Handler {
@@ -235,9 +351,10 @@ func (s *Server) routes() http.Handler {
 	r.Delete("/_apis/distributedtask/pools/{pool}/agents/{id}", s.handleRunnerDelete)
 
 	// Custom message-queue path — the URL we return from session
-	// create. The path is opaque to the library; we choose it.
-	r.Get("/_messages/{sid}", s.handleGetMessage)
-	r.Delete("/_messages/{sid}/{mid}", s.handleDeleteMessage)
+	// create. The session ID disambiguates which scaleset's message
+	// stream the long-poll should pull from. Format: /_messages/{ssID}/{sid}.
+	r.Get("/_messages/{ssID}/{sid}", s.handleGetMessage)
+	r.Delete("/_messages/{ssID}/{sid}/{mid}", s.handleDeleteMessage)
 
 	// Anything else: 501 with a clear message so tests fail loud
 	// instead of silently routing to a generic 404 the orchestrator

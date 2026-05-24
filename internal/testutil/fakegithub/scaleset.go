@@ -94,13 +94,15 @@ type fakeRunnerReference struct {
 // stable value if they need to assert on it.
 type ScaleSetOptions struct {
 	// ID is the runner-scale-set ID the fake claims when GetRunnerScaleSet
-	// is hit. Zero defaults to 42.
+	// is hit. Zero defaults to 42 (or auto-assigned in multi-scaleset
+	// configs to avoid collisions).
 	ID int
 
 	// Name must match cfg.scaleset.name in the orchestrator's config —
 	// otherwise the lookup returns "not found" and the orchestrator
 	// attempts to create it (which the fake also supports). Empty
-	// defaults to "test-scaleset".
+	// defaults to "test-scaleset" (or "test-scaleset-N" in multi-
+	// scaleset configs).
 	Name string
 
 	// RunnerGroupID defaults to 1 (the "Default" group).
@@ -111,9 +113,10 @@ type ScaleSetOptions struct {
 // Session machinery (long-poll capable)
 // ---------------------------------------------------------------------------
 
-// sessionState holds one open message session. The orchestrator opens
-// exactly one session at startup, so we don't need fancy multi-session
-// indexing — a single atomic pointer is enough.
+// sessionState holds one open message session. Each per-scaleset
+// entry has its own *sessionState; the orchestrator's per-scaleset
+// listener opens one session against one scale set's ID, so the
+// 1:1 mapping holds across multi-scaleset configs.
 type sessionState struct {
 	id     uuid.UUID
 	owner  string
@@ -152,6 +155,47 @@ func mintAdminJWT() string {
 }
 
 // ---------------------------------------------------------------------------
+// Per-request entry lookup
+// ---------------------------------------------------------------------------
+
+// entryByURLID resolves the {id} URL param to a scaleset entry and
+// writes a 404 if no entry matches. Returns nil when the lookup
+// fails so callers should `if entry == nil { return }`.
+func (s *Server) entryByURLID(w http.ResponseWriter, r *http.Request) *scalesetEntry {
+	raw := chi.URLParam(r, "id")
+	id, err := strconv.Atoi(raw)
+	if err != nil {
+		http.Error(w, "bad scaleset id "+raw, http.StatusBadRequest)
+		return nil
+	}
+	entry, ok := s.scalesetsByID[id]
+	if !ok {
+		http.Error(w, fmt.Sprintf("scaleset %d not found", id), http.StatusNotFound)
+		return nil
+	}
+	return entry
+}
+
+// entryByURLSSID resolves the {ssID} URL param to a scaleset entry.
+// Used by the message-queue routes which include the scaleset ID
+// alongside the session ID to disambiguate which entry's session
+// stream a long-poll targets.
+func (s *Server) entryByURLSSID(w http.ResponseWriter, r *http.Request) *scalesetEntry {
+	raw := chi.URLParam(r, "ssID")
+	id, err := strconv.Atoi(raw)
+	if err != nil {
+		http.Error(w, "bad scaleset id "+raw, http.StatusBadRequest)
+		return nil
+	}
+	entry, ok := s.scalesetsByID[id]
+	if !ok {
+		http.Error(w, fmt.Sprintf("scaleset %d not found", id), http.StatusNotFound)
+		return nil
+	}
+	return entry
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -182,105 +226,138 @@ func (s *Server) handleRunnerGroupLookup(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "groupName required", http.StatusBadRequest)
 		return
 	}
+	// Pick any entry's RunnerGroupID — operators that name distinct
+	// runner groups per scaleset would also need per-group routing;
+	// none of our e2e scenarios do, so returning the first match is
+	// fine. Real GitHub returns the group by name from a flat per-org
+	// list, which is what we model here.
+	groupID := 1
+	for _, entry := range s.scalesets {
+		groupID = entry.spec.RunnerGroupID
+		break
+	}
 	writeJSON(w, http.StatusOK, struct {
 		Count int               `json:"count"`
 		Value []runnerGroupResp `json:"value"`
 	}{
 		Count: 1,
-		Value: []runnerGroupResp{{ID: s.scaleSet.RunnerGroupID, Name: name}},
+		Value: []runnerGroupResp{{ID: groupID, Name: name}},
 	})
 }
 
 func (s *Server) handleScaleSetLookup(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
-	// Even when no name matches, the scaleset library treats `count:0`
-	// as "not found" (returns nil rather than error) and the
-	// orchestrator follows up with a CreateRunnerScaleSet. Match the
-	// name and return one row.
-	if name != s.scaleSet.Name {
+	entry, ok := s.scalesets[name]
+	if !ok {
+		// Even when no name matches, the scaleset library treats
+		// `count:0` as "not found" (returns nil rather than error)
+		// and the orchestrator follows up with a CreateRunnerScaleSet.
 		writeJSON(w, http.StatusOK, runnerScaleSetList{Count: 0})
 		return
 	}
 	writeJSON(w, http.StatusOK, runnerScaleSetList{
 		Count: 1,
-		Value: []fakeRunnerScaleSet{s.scaleSet},
+		Value: []fakeRunnerScaleSet{entry.spec},
 	})
 }
 
 func (s *Server) handleScaleSetCreate(w http.ResponseWriter, r *http.Request) {
-	// Accept anything the orchestrator sends; just echo back our
-	// canonical scale set. The orchestrator only looks at the
-	// returned ID + Name.
+	// Echo back the entry whose Name matches the create request.
+	// Tests that haven't pre-declared the scaleset receive the
+	// canonical default (the single configured entry).
 	var body fakeRunnerScaleSet
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	writeJSON(w, http.StatusCreated, s.scaleSet)
+	if entry, ok := s.scalesets[body.Name]; ok {
+		writeJSON(w, http.StatusCreated, entry.spec)
+		return
+	}
+	// Unknown name and we don't synthesise new scalesets at runtime
+	// — return 422 so the orchestrator surfaces the misconfiguration
+	// cleanly.
+	http.Error(w, fmt.Sprintf("scaleset %q not configured on fake", body.Name), http.StatusUnprocessableEntity)
 }
 
-func (s *Server) handleSessionCreate(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
+	entry := s.entryByURLID(w, r)
+	if entry == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.session != nil && !s.session.closed.Load() {
+	if entry.session != nil && !entry.session.closed.Load() {
 		// Cluster-mode tests can leave a stale session behind when a
 		// leader exits without explicitly closing — real GitHub
 		// expires the old session after a few minutes and the new
 		// leader simply opens a fresh one. Mirror that by retiring
 		// the prior session here instead of returning 409, which
 		// would otherwise wedge the new leader's handshake.
-		s.session.closed.Store(true)
-		close(s.session.pending)
-		s.session = nil
+		entry.session.closed.Store(true)
+		close(entry.session.pending)
+		entry.session = nil
 	}
 	sid := uuid.New()
-	s.session = &sessionState{
+	entry.session = &sessionState{
 		id:      sid,
 		owner:   "fakegithub",
 		pending: make(chan json.RawMessage, 16),
 	}
-	stats := s.statistics
+	stats := entry.statistics
 	writeJSON(w, http.StatusOK, fakeSession{
 		SessionID:               sid,
 		OwnerName:               "fakegithub",
-		RunnerScaleSet:          s.scaleSet,
-		MessageQueueURL:         fmt.Sprintf("%s/_messages/%s", s.URL, sid.String()),
+		RunnerScaleSet:          entry.spec,
+		MessageQueueURL:         fmt.Sprintf("%s/_messages/%d/%s", s.URL, entry.spec.ID, sid.String()),
 		MessageQueueAccessToken: s.adminToken,
 		Statistics:              &stats,
 	})
 }
 
-func (s *Server) handleSessionDelete(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
+	entry := s.entryByURLID(w, r)
+	if entry == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.session != nil {
-		s.session.closed.Store(true)
+	if entry.session != nil {
+		entry.session.closed.Store(true)
 		// Drain to unblock any GetMessage goroutine waiting on the
 		// channel; the orchestrator hits this on graceful shutdown.
-		close(s.session.pending)
-		s.session = nil
+		close(entry.session.pending)
+		entry.session = nil
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) handleSessionRefresh(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleSessionRefresh(w http.ResponseWriter, r *http.Request) {
+	entry := s.entryByURLID(w, r)
+	if entry == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.session == nil {
+	if entry.session == nil {
 		http.Error(w, "no open session", http.StatusGone)
 		return
 	}
-	stats := s.statistics
+	stats := entry.statistics
 	writeJSON(w, http.StatusOK, fakeSession{
-		SessionID:               s.session.id,
-		OwnerName:               s.session.owner,
-		RunnerScaleSet:          s.scaleSet,
-		MessageQueueURL:         fmt.Sprintf("%s/_messages/%s", s.URL, s.session.id.String()),
+		SessionID:               entry.session.id,
+		OwnerName:               entry.session.owner,
+		RunnerScaleSet:          entry.spec,
+		MessageQueueURL:         fmt.Sprintf("%s/_messages/%d/%s", s.URL, entry.spec.ID, entry.session.id.String()),
 		MessageQueueAccessToken: s.adminToken,
 		Statistics:              &stats,
 	})
 }
 
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
+	entry := s.entryByURLSSID(w, r)
+	if entry == nil {
+		return
+	}
 	s.mu.Lock()
-	sess := s.session
+	sess := entry.session
 	s.mu.Unlock()
 	if sess == nil || sess.closed.Load() {
 		http.Error(w, "no session", http.StatusGone)
@@ -313,6 +390,9 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleAcquireJobs(w http.ResponseWriter, r *http.Request) {
+	if entry := s.entryByURLID(w, r); entry == nil {
+		return
+	}
 	var ids []int64
 	_ = json.NewDecoder(r.Body).Decode(&ids)
 	// Pretend we acquired every requested job.
@@ -323,6 +403,10 @@ func (s *Server) handleAcquireJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGenerateJIT(w http.ResponseWriter, r *http.Request) {
+	entry := s.entryByURLID(w, r)
+	if entry == nil {
+		return
+	}
 	var body struct {
 		Name       string `json:"name"`
 		WorkFolder string `json:"workFolder"`
@@ -330,15 +414,20 @@ func (s *Server) handleGenerateJIT(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
 	s.mu.Lock()
-	s.jitMintCount++
-	runnerID := 100000 + s.jitMintCount
+	entry.jitMintCount++
+	// Synthesize a runner ID. Per-scaleset counters keep
+	// existing single-scaleset tests stable (first mint = 100001);
+	// multi-scaleset tests that need to distinguish IDs across
+	// scalesets should assert on JITMintCountFor(name) rather
+	// than hardcoding 100000+N.
+	runnerID := 100000 + entry.jitMintCount
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, fakeJITRunnerConfig{
 		Runner: fakeRunnerReference{
 			ID:               runnerID,
 			Name:             body.Name,
-			RunnerScaleSetID: s.scaleSet.ID,
+			RunnerScaleSetID: entry.spec.ID,
 		},
 		// Base64-encoded test config (literal bytes, no actual runner config).
 		EncodedJITConfig: "ZmFrZWdpdGh1Yi1qaXQtY29uZmln",
@@ -381,27 +470,45 @@ func writeRaw(w http.ResponseWriter, status int, raw json.RawMessage) {
 // Public helpers for tests
 // ---------------------------------------------------------------------------
 
-// JITMintCount returns how many JIT runner configs the fake has minted
-// since startup. E2e tests assert on this to confirm the scaler called
-// out to GitHub the expected number of times.
+// JITMintCount returns the JIT mint counter for the single registered
+// scaleset. Panics in multi-scaleset configs — use JITMintCountFor.
 func (s *Server) JITMintCount() int {
+	entry := s.onlyEntry("JITMintCount")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.jitMintCount
+	return entry.jitMintCount
 }
 
-// SetStatistics overrides the per-session statistics the fake returns.
-// Tests set TotalAssignedJobs > 0 before starting the harness so the
-// orchestrator's listener fires HandleDesiredRunnerCount on its initial
-// handshake — the only path that drives a clone+JIT-injection pass.
-//
-// Subsequent calls update what every GetMessage envelope and session
-// refresh sees. A test that sets TotalAssignedJobs back to 0 after a
-// job completes models GitHub's view of "no more queued jobs."
-func (s *Server) SetStatistics(stats Statistics) {
+// JITMintCountFor returns the per-scaleset JIT mint counter (multi-
+// scaleset tests). Panics on unknown names.
+func (s *Server) JITMintCountFor(name string) int {
+	entry := s.entryFor(name, "JITMintCountFor")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.statistics = fakeRunnerScaleSetStatistic(stats)
+	return entry.jitMintCount
+}
+
+// SetStatistics overrides the per-session statistics returned for the
+// single registered scaleset. Tests set TotalAssignedJobs > 0 before
+// starting the harness so the orchestrator's listener fires
+// HandleDesiredRunnerCount on its initial handshake — the only path
+// that drives a clone+JIT-injection pass.
+//
+// Panics in multi-scaleset configs; use SetStatisticsFor.
+func (s *Server) SetStatistics(stats Statistics) {
+	entry := s.onlyEntry("SetStatistics")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry.statistics = fakeRunnerScaleSetStatistic(stats)
+}
+
+// SetStatisticsFor overrides statistics for the named scaleset.
+// Panics on unknown names.
+func (s *Server) SetStatisticsFor(name string, stats Statistics) {
+	entry := s.entryFor(name, "SetStatisticsFor")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry.statistics = fakeRunnerScaleSetStatistic(stats)
 }
 
 // Statistics is the test-facing shape SetStatistics accepts. Mirrors
@@ -418,28 +525,50 @@ type Statistics struct {
 	TotalIdleRunners       int
 }
 
-// PostJobStarted enqueues a JobStarted message on the active session's
-// pending channel. The listener's handleMessage loop will pop it,
-// dispatch to scaler.HandleJobStarted, which calls pool.MarkRunning.
-//
-// Returns an error when no session is open (so test sequencing bugs
-// surface loudly instead of hanging on a wait-Eventually). The
-// non-blocking channel send also surfaces "pending channel full" — the
-// session buffer is 16, far more than any test scenario needs.
+// PostJobStarted enqueues a JobStarted message on the single
+// configured scaleset's session. Panics in multi-scaleset configs;
+// use PostJobStartedFor.
 func (s *Server) PostJobStarted(runnerName string, runnerID int) error {
-	return s.postMessage("JobStarted", map[string]any{
+	entry := s.onlyEntry("PostJobStarted")
+	return s.postMessage(entry, "JobStarted", map[string]any{
 		"messageType":     "JobStarted",
 		"runnerName":      runnerName,
 		"runnerId":        runnerID,
-		"runnerRequestId": int64(runnerID), // any positive int64; the orchestrator doesn't key on it
+		"runnerRequestId": int64(runnerID),
 	})
 }
 
-// PostJobCompleted enqueues a JobCompleted message. Dispatches via
-// scaler.HandleJobCompleted → pool.MarkCompleted → async destroy.
-// Mirrors PostJobStarted's contract.
+// PostJobStartedFor enqueues a JobStarted message on the named
+// scaleset's session. Panics on unknown names; returns an error when
+// no session is open for that scaleset.
+func (s *Server) PostJobStartedFor(scaleset, runnerName string, runnerID int) error {
+	entry := s.entryFor(scaleset, "PostJobStartedFor")
+	return s.postMessage(entry, "JobStarted", map[string]any{
+		"messageType":     "JobStarted",
+		"runnerName":      runnerName,
+		"runnerId":        runnerID,
+		"runnerRequestId": int64(runnerID),
+	})
+}
+
+// PostJobCompleted enqueues a JobCompleted message. See
+// PostJobStarted for semantics.
 func (s *Server) PostJobCompleted(runnerName string, runnerID int) error {
-	return s.postMessage("JobCompleted", map[string]any{
+	entry := s.onlyEntry("PostJobCompleted")
+	return s.postMessage(entry, "JobCompleted", map[string]any{
+		"messageType":     "JobCompleted",
+		"runnerName":      runnerName,
+		"runnerId":        runnerID,
+		"runnerRequestId": int64(runnerID),
+		"result":          "succeeded",
+	})
+}
+
+// PostJobCompletedFor enqueues a JobCompleted message on the named
+// scaleset's session.
+func (s *Server) PostJobCompletedFor(scaleset, runnerName string, runnerID int) error {
+	entry := s.entryFor(scaleset, "PostJobCompletedFor")
+	return s.postMessage(entry, "JobCompleted", map[string]any{
 		"messageType":     "JobCompleted",
 		"runnerName":      runnerName,
 		"runnerId":        runnerID,
@@ -450,31 +579,19 @@ func (s *Server) PostJobCompleted(runnerName string, runnerID int) error {
 
 // postMessage marshals one job message into the outer
 // runnerScaleSetMessageResponse envelope the listener expects and
-// pushes it onto the active session's pending channel.
-//
-// Wire format per github.com/actions/scaleset client.go:
-//
-//	{
-//	  "messageId":   <int>,
-//	  "messageType": "RunnerScaleSetJobMessages",
-//	  "body":        "<JSON-string-encoded array of inner messages>",
-//	  "statistics":  { ... }
-//	}
-func (s *Server) postMessage(label string, inner map[string]any) error {
+// pushes it onto the named scaleset entry's pending channel.
+func (s *Server) postMessage(entry *scalesetEntry, label string, inner map[string]any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.session == nil || s.session.closed.Load() {
-		return fmt.Errorf("fakegithub: post %s: no session open", label)
+	if entry.session == nil || entry.session.closed.Load() {
+		return fmt.Errorf("fakegithub: post %s on %q: no session open", label, entry.spec.Name)
 	}
 	bodyJSON, err := json.Marshal([]map[string]any{inner})
 	if err != nil {
-		// Marshal of a map[string]any with plain JSON-friendly values
-		// cannot fail under any realistic input; the wrap keeps the
-		// failure mode discoverable if a future caller violates that.
 		return fmt.Errorf("fakegithub: marshal %s body: %w", label, err)
 	}
 	s.nextMessageID++
-	stats := s.statistics
+	stats := entry.statistics
 	envelope, err := json.Marshal(struct {
 		MessageID   int                          `json:"messageId"`
 		MessageType string                       `json:"messageType"`
@@ -490,7 +607,7 @@ func (s *Server) postMessage(label string, inner map[string]any) error {
 		return fmt.Errorf("fakegithub: marshal %s envelope: %w", label, err)
 	}
 	select {
-	case s.session.pending <- envelope:
+	case entry.session.pending <- envelope:
 		return nil
 	default:
 		return fmt.Errorf("fakegithub: session pending channel full (cap=16) — drop %s", label)
