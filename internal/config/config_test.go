@@ -2067,3 +2067,96 @@ func TestScalesets_SingleScalesetInheritsGlobalRange(t *testing.T) {
 	// falls back to cfg.Proxmox.VMIDRange.
 	require.Nil(t, cfg.Scalesets[0].VMIDRange)
 }
+
+// TestParse_AppConfigURLAndBaseURLMutuallyExclusive locks in the
+// App-side mutual-exclusion validation (mirrors the PAT-side
+// rule from #214; same per-scope semantics).
+func TestParse_AppConfigURLAndBaseURLMutuallyExclusive(t *testing.T) {
+	pem := keyPath(t)
+	bad := `
+github:
+  auth_mode: app
+  app:
+    client_id: "Iv23likB94"
+    installation_id: 2
+    private_key_path: ` + pem + `
+    config_url: https://ghes.example.com/myorg
+    config_base_url: https://ghes.example.com
+  scope: { org: o }
+scaleset: { name: x, max_concurrent_runners: 5 }
+proxmox:
+  endpoint: https://h:8006/api2/json
+  auth: { token_id: a!b, token_secret: testsecret }
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage: { disk: d, snippets: s }
+  network: { bridge: br0 }
+nodes: { strategy: single, single_node: n1 }
+pool: {}
+`
+	setEnv(t, map[string]string{"TEST_PVE_TOKEN": "y"})
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "mutually exclusive")
+}
+
+// TestParse_AppConfigURLRejectedWithMultiScaleset locks in the
+// App-side multi-scaleset rule: config_url forces every per-
+// scaleset client to handshake against the same scope, so we
+// reject it loudly at load time rather than silently mis-routing
+// at runtime. The multi-scaleset fixture also needs per-entry
+// vmid_range blocks (issue #222) to reach the config_url check
+// — the missing-range guard fires before the auth check
+// otherwise.
+func TestParse_AppConfigURLRejectedWithMultiScaleset(t *testing.T) {
+	pem := keyPath(t)
+	// Build a multi-scaleset config with App auth + config_url.
+	bad := `
+github:
+  auth_mode: app
+  app:
+    client_id: "Iv23likB94"
+    installation_id: 2
+    private_key_path: ` + pem + `
+    config_url: https://ghes.example.com/org-a
+
+scalesets:
+  - name: linux-x64
+    labels: [self-hosted, linux, proxmox, x64]
+    max_concurrent_runners: 10
+    scope:
+      org: org-a
+    vmid_range: { min: 10000, max: 14999 }
+  - name: gpu-pool
+    labels: [self-hosted, linux, gpu]
+    max_concurrent_runners: 4
+    scope:
+      org: org-b
+    vmid_range: { min: 15000, max: 19999 }
+
+proxmox:
+  endpoint: https://h:8006/api2/json
+  auth:
+    token_id: a!b
+    token_secret: testsecret
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage: { disk: d, snippets: s }
+  network: { bridge: br0 }
+
+nodes: { strategy: single, single_node: n1 }
+
+pool:
+  hot_size: 0
+  warm_size: 0
+  reconcile_interval: 5s
+  vm_max_age: 12h
+  drain_timeout: 15m
+  boot_max_attempts: 3
+`
+	setEnv(t, map[string]string{"TEST_PVE_TOKEN": "y"})
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "config_url")
+	require.Contains(t, err.Error(), "multi-scaleset")
+}

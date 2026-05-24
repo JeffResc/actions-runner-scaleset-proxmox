@@ -782,11 +782,13 @@ func buildGitHubAuth(cfg *config.Config, override githubauth.Auth) (githubauth.A
 			ConfigBaseURL: cfg.GitHub.PAT.ConfigBaseURL,
 		})
 	case "app":
-		return githubauth.NewAppFromFile(
-			cfg.GitHub.App.Issuer(),
-			cfg.GitHub.App.InstallationID,
-			cfg.GitHub.App.PrivateKeyPath,
-		)
+		return githubauth.NewAppFromFileWithConfig(githubauth.AppConfig{
+			ClientID:       cfg.GitHub.App.Issuer(),
+			InstallationID: cfg.GitHub.App.InstallationID,
+			ConfigURL:      cfg.GitHub.App.ConfigURL,
+			ConfigBaseURL:  cfg.GitHub.App.ConfigBaseURL,
+			RESTBaseURL:    cfg.GitHub.App.RESTBaseURL,
+		}, cfg.GitHub.App.PrivateKeyPath)
 	}
 	return nil, fmt.Errorf("unknown github.auth_mode %q", cfg.GitHub.AuthMode)
 }
