@@ -212,3 +212,179 @@ func TestRapidStateCycling(t *testing.T) {
 	_, err = st.Get(50000)
 	require.Error(t, err, "row must be deleted after the full cycle")
 }
+
+// TestAllocateVMID_NoCollisionAcrossDisjointRanges pins the
+// per-scaleset VMID range race fix from PR #223. Two pool managers
+// configured with adjacent, disjoint VMID ranges (gap of one) drive
+// many concurrent allocateVMID calls. A regression that reintroduced
+// shared allocator state across managers would either return out-of-
+// range IDs or — worse — mint the same ID from both managers,
+// corrupting the Proxmox cluster on the next Clone.
+//
+// The fix is structural (per-manager allocator scoped to the
+// manager's VMIDRange); this test guards against future refactors
+// (shared free-list optimization, cross-scaleset rebalance) that
+// could silently break it.
+func TestAllocateVMID_NoCollisionAcrossDisjointRanges(t *testing.T) {
+	t.Parallel()
+
+	const (
+		// Two adjacent ranges with a one-id gap to make boundary errors
+		// (off-by-one returns from either side) detectable.
+		aMin, aMax = 70100, 70199
+		bMin, bMax = 70201, 70300
+	)
+	stA := newTestStore(t)
+	stB := newTestStore(t)
+	mgrA := newTestManager(t, stA, &fakeProv{}, Config{
+		VMIDRange: config.VMIDRange{Min: aMin, Max: aMax},
+	})
+	mgrB := newTestManager(t, stB, &fakeProv{}, Config{
+		VMIDRange: config.VMIDRange{Min: bMin, Max: bMax},
+	})
+
+	const workersPerMgr = 8
+	const callsPerWorker = 12
+
+	type result struct {
+		mgr  string
+		vmid int
+	}
+	results := make(chan result, 2*workersPerMgr*callsPerWorker)
+
+	allocator := func(name string, m *manager, st *store.Store) {
+		var wg sync.WaitGroup
+		for w := 0; w < workersPerMgr; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < callsPerWorker; i++ {
+					id, err := m.allocateVMID(context.Background())
+					if err != nil {
+						// Range may be momentarily saturated; that's fine,
+						// just don't insert and don't record.
+						continue
+					}
+					// Insert into the store so subsequent calls in this
+					// manager see the id as taken; this is what the real
+					// runClone does immediately after allocateVMID.
+					if insErr := st.Insert(&store.VM{
+						VMID:     id,
+						Node:     "pve1",
+						Name:     "stress",
+						Profile:  defaultProfileName,
+						PoolKind: store.PoolKindHot,
+						State:    store.StateProvisioning,
+					}); insErr != nil {
+						// Lost the race against another worker on the same
+						// manager — discard and continue.
+						continue
+					}
+					results <- result{mgr: name, vmid: id}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	var wgManagers sync.WaitGroup
+	wgManagers.Add(2)
+	go func() { defer wgManagers.Done(); allocator("A", mgrA, stA) }()
+	go func() { defer wgManagers.Done(); allocator("B", mgrB, stB) }()
+	wgManagers.Wait()
+	close(results)
+
+	seen := make(map[int]string, 2*workersPerMgr*callsPerWorker)
+	for r := range results {
+		// Owning-range check: A's ids in [aMin..aMax], B's in [bMin..bMax].
+		switch r.mgr {
+		case "A":
+			require.GreaterOrEqual(t, r.vmid, aMin, "manager A returned id %d outside its range", r.vmid)
+			require.LessOrEqual(t, r.vmid, aMax, "manager A returned id %d outside its range", r.vmid)
+		case "B":
+			require.GreaterOrEqual(t, r.vmid, bMin, "manager B returned id %d outside its range", r.vmid)
+			require.LessOrEqual(t, r.vmid, bMax, "manager B returned id %d outside its range", r.vmid)
+		}
+		// No-collision-across-managers check: same vmid must not appear
+		// from both managers. Same-vmid same-manager is impossible
+		// because the store insert above is the dedup.
+		if prev, dup := seen[r.vmid]; dup {
+			require.Equal(t, prev, r.mgr,
+				"vmid %d minted by both manager %q and manager %q — VMID-range isolation regressed",
+				r.vmid, prev, r.mgr)
+		}
+		seen[r.vmid] = r.mgr
+	}
+}
+
+// TestDrain_ReleasesDestroySemTokensOnTimeout pins the invariant
+// that drain's force-cancel path releases every destroySem token
+// held by in-flight workers. Without that release, a subsequent
+// drain (or a test that reuses the manager) would block forever
+// because the semaphore is full of orphaned tokens.
+//
+// Before any related future refactor of the destroy worker
+// goroutine, this test catches a regression where the deferred
+// destroySem.Release isn't reached on ctx-cancel exit paths.
+//
+// Approach: queue more destroys than the semaphore allows, hang
+// them all on a Destroy that blocks on ctx, trigger drain with a
+// short timeout, then verify TryAcquire(maxConcurrentDestroys)
+// succeeds — proving every token was returned.
+func TestDrain_ReleasesDestroySemTokensOnTimeout(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{destroyHang: true}
+
+	// Seed 20 Assigned rows so MarkCompleted has work to queue.
+	const seeded = 20
+	for i := 0; i < seeded; i++ {
+		require.NoError(t, st.Insert(&store.VM{
+			VMID:     80000 + i,
+			Node:     "pve1",
+			Name:     "stuck",
+			Profile:  defaultProfileName,
+			PoolKind: store.PoolKindHot,
+			State:    store.StateAssigned,
+		}))
+	}
+
+	mgr := newTestManager(t, st, fp, Config{
+		DrainTimeout: 100 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- mgr.Run(ctx) }()
+
+	// Queue all 20 destroys. Semaphore cap is 8, so at most 8 land
+	// in `<-ctx.Done()` simultaneously; the rest sit on Acquire.
+	for i := 0; i < seeded; i++ {
+		require.NoError(t, mgr.MarkCompleted(context.Background(), 80000+i))
+	}
+
+	// Give the dispatcher a moment to acquire semaphore tokens for
+	// the first batch and launch the hanging Destroy calls.
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.destroys) > 0
+	}, time.Second, 10*time.Millisecond, "no destroys ever entered the hang path")
+
+	// Trigger drain. DrainTimeout (100ms) should fire because the
+	// hanging Destroys won't return until workerCtx cancels them.
+	cancel()
+	select {
+	case err := <-runDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after drain timeout + worker cancel")
+	}
+
+	// THE invariant: every destroySem token released. If this fails,
+	// a future caller / a re-Run of the manager would deadlock on
+	// the first Acquire.
+	require.True(t, mgr.destroySem.TryAcquire(8),
+		"destroySem still holds tokens after drain — workers leaked their slots on the ctx-cancel path")
+	mgr.destroySem.Release(8)
+}
