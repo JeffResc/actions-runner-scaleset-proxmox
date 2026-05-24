@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -373,13 +374,28 @@ func (s *ScopedMetrics) ObserveCall(endpoint, statusClass string) {
 // the cluster.Coordinator drives [Health.MarkLeader] as leadership
 // transitions, which in turn shifts /readyz's gate set: standbys are
 // ready as long as Proxmox is reachable (so they can take over);
-// leaders also need listenerConnected and recoveryDone.
+// leaders additionally require every registered scaleset to have its
+// per-scaleset listener-connected + recovery-done flags set.
+//
+// Multi-scaleset (issue #1): the leader plane runs one stack per
+// scale set, and any one of them not being ready is enough to keep
+// /readyz red. Call RegisterScaleset(name) once per declared scale
+// set at startup; the leader's per-scaleset workers call
+// MarkScalesetListenerConnected and MarkScalesetRecoveryDone as
+// they progress, and ClearScalesetState on deposal so the
+// next-elected replica's gates start clean.
 type Health struct {
+	leader          atomic.Bool
+	proxmoxLastSeen atomic.Pointer[time.Time]
+	proxmoxMaxStale time.Duration
+
+	mu        sync.RWMutex
+	scalesets map[string]*scalesetReady
+}
+
+type scalesetReady struct {
 	listenerConnected atomic.Bool
 	recoveryDone      atomic.Bool
-	leader            atomic.Bool
-	proxmoxLastSeen   atomic.Pointer[time.Time]
-	proxmoxMaxStale   time.Duration
 }
 
 // NewHealth returns a Health tracker. proxmoxMaxStale defines how long the
@@ -398,23 +414,59 @@ func (h *Health) MarkProxmoxOK() {
 	h.proxmoxLastSeen.Store(&now)
 }
 
-// MarkListenerConnected records that the scaleset Listener has accepted at
-// least one message session — proof that GitHub credentials and
-// connectivity are working.
-func (h *Health) MarkListenerConnected() { h.listenerConnected.Store(true) }
+// RegisterScaleset records that the named scale set exists. Ready()
+// gates leader readiness on every registered scaleset having its
+// listener-connected + recovery-done flags set. Idempotent —
+// calling twice for the same name is a no-op.
+func (h *Health) RegisterScaleset(name string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.scalesets == nil {
+		h.scalesets = make(map[string]*scalesetReady)
+	}
+	if _, ok := h.scalesets[name]; !ok {
+		h.scalesets[name] = &scalesetReady{}
+	}
+}
 
-// MarkRecoveryDone records that the initial crash-recovery pass completed.
-func (h *Health) MarkRecoveryDone() { h.recoveryDone.Store(true) }
+// MarkScalesetListenerConnected records that the named scale set's
+// listener has accepted at least one message session — proof that
+// GitHub credentials and connectivity are working for that scale
+// set. Unregistered names are silently ignored.
+func (h *Health) MarkScalesetListenerConnected(name string) {
+	h.mu.RLock()
+	r := h.scalesets[name]
+	h.mu.RUnlock()
+	if r != nil {
+		r.listenerConnected.Store(true)
+	}
+}
 
-// ClearListenerConnected resets the listener-connected gate. Called by
-// the cluster.Coordinator's OnDeposed so a freshly demoted replica
-// stops claiming a working scaleset-listener session.
-func (h *Health) ClearListenerConnected() { h.listenerConnected.Store(false) }
+// MarkScalesetRecoveryDone records that the initial crash-recovery
+// pass completed for the named scale set.
+func (h *Health) MarkScalesetRecoveryDone(name string) {
+	h.mu.RLock()
+	r := h.scalesets[name]
+	h.mu.RUnlock()
+	if r != nil {
+		r.recoveryDone.Store(true)
+	}
+}
 
-// ClearRecoveryDone resets the recovery gate. Called on deposal so the
-// next-elected replica's /readyz only flips green after IT has finished
-// its own Recover() pass.
-func (h *Health) ClearRecoveryDone() { h.recoveryDone.Store(false) }
+// ClearScalesetState resets both gates for the named scale set.
+// Called on deposal so a freshly demoted replica stops claiming a
+// working scaleset session, and the next-elected replica's /readyz
+// only flips green after IT has finished its own Recover().
+// Unregistered names are silently ignored.
+func (h *Health) ClearScalesetState(name string) {
+	h.mu.RLock()
+	r := h.scalesets[name]
+	h.mu.RUnlock()
+	if r != nil {
+		r.listenerConnected.Store(false)
+		r.recoveryDone.Store(false)
+	}
+}
 
 // MarkLeader records the current leadership state for this replica.
 // Pass true when leadership is acquired, false when it is lost.
@@ -424,10 +476,11 @@ func (h *Health) MarkLeader(leader bool) { h.leader.Store(leader) }
 //
 //   - All replicas require Proxmox reachable within the staleness window
 //     (so a standby that has lost Proxmox cannot safely take over).
-//   - Leaders additionally require listenerConnected and recoveryDone.
+//   - Leaders additionally require every registered scale set's
+//     listener-connected + recovery-done flags to be set.
 //
 // Standbys whose Proxmox is reachable are ready even though they have
-// never connected the scaleset listener — that work is leader-only.
+// never connected any scaleset listener — that work is leader-only.
 func (h *Health) Ready() bool {
 	last := h.proxmoxLastSeen.Load()
 	if last == nil {
@@ -437,8 +490,18 @@ func (h *Health) Ready() bool {
 		return false
 	}
 	if h.leader.Load() {
-		if !h.listenerConnected.Load() || !h.recoveryDone.Load() {
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+		if len(h.scalesets) == 0 {
+			// A leader with no registered scalesets has nothing to
+			// be ready about. Defensive — production always
+			// registers at least one before promotion.
 			return false
+		}
+		for _, r := range h.scalesets {
+			if !r.listenerConnected.Load() || !r.recoveryDone.Load() {
+				return false
+			}
 		}
 	}
 	return true

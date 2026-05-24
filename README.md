@@ -26,7 +26,7 @@ The config now accepts a top-level `scalesets:` list — one entry per scale set
 
 Every per-scaleset Prometheus metric now carries `scaleset=<name>` as its first label so dashboards can slice cleanly. Admin endpoints are also reachable under `/admin/{scaleset}/...` (e.g. `/admin/{scaleset}/state`, `/admin/{scaleset}/preempt/{vmid}`, `/admin/{scaleset}/template/promote/{profile}`); the un-namespaced `/admin/...` paths keep working for backwards compatibility when there is exactly one scale set.
 
-**Runtime status:** the parser, validator, metrics, and admin API are ready for multiple scale sets, but the leader-plane orchestration still runs exactly one scale set per process — configurations with more than one entry are rejected at startup with a migration message. The runtime fan-out lands in a follow-up PR.
+**Runtime fan-out:** under leader election, each declared scale set runs its own per-scaleset pool manager, scaler, listener, GitHub REST reconciler, canary controller, schedule runner, store, and provisioner (with its own owner-tagged crash recovery). The per-scaleset workers are spawned under a single supervisor errgroup: a panic or returned error in one worker is recovered and logged but does NOT propagate to its siblings, so one failing scale set never poisons the others. Sibling shutdown only happens via process-wide ctx cancel (SIGTERM, admin drain, leader deposal). Readiness is leader-aware AND per-scaleset: `/readyz` only flips green when every registered scale set has signaled both listener-connected and recovery-done; one stalled scale set is enough to hold the gate red.
 
 ## Runner profiles
 
