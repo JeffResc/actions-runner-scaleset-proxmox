@@ -1106,10 +1106,22 @@ var (
 func init() {
 	schemaEnvMap = make(map[string]string)
 	schemaKeySet = make(map[string]struct{})
-	buildSchema(reflect.TypeOf(Config{}), "")
+	walkSchema(reflect.TypeOf(Config{}), "", false)
 }
 
-func buildSchema(t reflect.Type, prefix string) {
+// walkSchema recursively visits every yaml-tagged field on the
+// Config struct (including nested struct + slice-of-struct fields)
+// and registers each path into schemaKeySet. Top-level paths also
+// register an envPrefix-derived alias into schemaEnvMap.
+//
+// inSliceElem distinguishes top-level recursion (env-mapping
+// enabled) from per-element walks of a slice-of-struct field
+// (schema-key-set only). Env-override of slice elements would
+// require per-index env names, which is intentionally unsupported.
+//
+// Pointer types are unwrapped so optional config blocks declared
+// as `*FooConfig` still get their fields registered.
+func walkSchema(t reflect.Type, prefix string, inSliceElem bool) {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
@@ -1127,8 +1139,10 @@ func buildSchema(t reflect.Type, prefix string) {
 			key = prefix + "." + tag
 		}
 		schemaKeySet[key] = struct{}{}
-		envName := envPrefix + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
-		schemaEnvMap[envName] = key
+		if !inSliceElem {
+			envName := envPrefix + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+			schemaEnvMap[envName] = key
+		}
 
 		ft := f.Type
 		if ft.Kind() == reflect.Pointer {
@@ -1136,7 +1150,7 @@ func buildSchema(t reflect.Type, prefix string) {
 		}
 		switch ft.Kind() { //nolint:exhaustive // only struct + slice-of-struct need recursion; other kinds are leaves
 		case reflect.Struct:
-			buildSchema(ft, key)
+			walkSchema(ft, key, inSliceElem)
 		case reflect.Slice:
 			elem := ft.Elem()
 			if elem.Kind() == reflect.Pointer {
@@ -1145,37 +1159,10 @@ func buildSchema(t reflect.Type, prefix string) {
 			if elem.Kind() == reflect.Struct {
 				// Slice-of-struct: register element field key paths so a
 				// typo'd YAML key inside (e.g. profiles[0].nme) still
-				// fails the strict-mode walk. Env-override of slice
-				// elements is not supported (no stable per-index env
-				// name), so we don't add these to schemaEnvMap.
-				buildSliceElemSchema(elem, key)
-			}
-		}
-	}
-}
-
-func buildSliceElemSchema(t reflect.Type, prefix string) {
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		tag := strings.Split(f.Tag.Get("yaml"), ",")[0]
-		if tag == "" || tag == "-" {
-			continue
-		}
-		key := prefix + "." + tag
-		schemaKeySet[key] = struct{}{}
-		ft := f.Type
-		if ft.Kind() == reflect.Pointer {
-			ft = ft.Elem()
-		}
-		if ft.Kind() == reflect.Struct {
-			buildSliceElemSchema(ft, key)
-		} else if ft.Kind() == reflect.Slice {
-			elem := ft.Elem()
-			if elem.Kind() == reflect.Pointer {
-				elem = elem.Elem()
-			}
-			if elem.Kind() == reflect.Struct {
-				buildSliceElemSchema(elem, key)
+				// fails the strict-mode walk. Per-element walks skip the
+				// env-mapping side because there's no stable per-index
+				// env name.
+				walkSchema(elem, key, true)
 			}
 		}
 	}
