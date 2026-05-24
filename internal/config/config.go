@@ -1515,17 +1515,6 @@ func (c *Config) resolveCluster() error {
 	if r.DataDir == "" {
 		return errors.New("cluster.raft.data_dir is required when cluster.mode=raft (raft consensus state must survive restart)")
 	}
-	// Inter-replica admin traffic carries the bearer secret on every
-	// standby→leader hop (see internal/cluster/forwarder.go). Without
-	// TLS on the admin listener (and matching TLS on the dial side
-	// the forwarder makes via the same admin_api.tls bundle), that
-	// secret traverses the cluster subnet in cleartext. Reject the
-	// config at load time so the operator can't bring up a raft
-	// cluster with the admin secret on the wire — single-node
-	// deployments keep TLS optional for lab use.
-	if c.AdminAPI.HTTPAddr != "" && c.AdminAPI.TLS == nil {
-		return errors.New("admin_api.tls is required when cluster.mode=raft (the bearer secret is forwarded standby→leader on every admin call)")
-	}
 	return nil
 }
 
