@@ -1937,3 +1937,51 @@ func TestParse_EmptyTokenSecretEnvRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "proxmox.auth.token_secret",
 		"the error must name the missing field so the operator can find it")
 }
+
+// TestParse_PATConfigURLAndBaseURLMutuallyExclusive locks in the
+// config-side mutual-exclusion validation (issue #214). The two
+// override modes have incompatible per-scope behaviour; silently
+// picking one would be a footgun in a production GHES rollout.
+func TestParse_PATConfigURLAndBaseURLMutuallyExclusive(t *testing.T) {
+	bad := strings.Replace(validPATYAML,
+		"  pat:\n    token: testtoken",
+		"  pat:\n    token: testtoken\n    config_url: https://ghes.example.com/my-org\n    config_base_url: https://ghes.example.com",
+		1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "mutually exclusive")
+}
+
+// TestParse_PATConfigURLRejectedWithMultiScaleset confirms the
+// orchestrator refuses to start when the operator declares
+// multiple scalesets but pins github.pat.config_url to a single
+// org/repo URL. config_url forces every per-scaleset client to
+// handshake against the same scope — a silent bug that this
+// validation surfaces at load time.
+func TestParse_PATConfigURLRejectedWithMultiScaleset(t *testing.T) {
+	// Build a YAML with scalesets: [...] and github.pat.config_url
+	// set. Start from the multi-scaleset fixture (already exercised
+	// by TestScalesets_PluralFormParses).
+	bad := strings.Replace(validMultiScalesetYAML,
+		"  pat:\n    token: testtoken",
+		"  pat:\n    token: testtoken\n    config_url: https://ghes.example.com/org-a",
+		1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "config_url")
+	require.Contains(t, err.Error(), "multi-scaleset")
+}
+
+// TestParse_PATConfigBaseURLAcceptedWithMultiScaleset confirms the
+// inverse: a multi-scaleset config with github.pat.config_base_url
+// set loads cleanly. This is the supported GHES multi-scaleset
+// shape.
+func TestParse_PATConfigBaseURLAcceptedWithMultiScaleset(t *testing.T) {
+	ok := strings.Replace(validMultiScalesetYAML,
+		"  pat:\n    token: testtoken",
+		"  pat:\n    token: testtoken\n    config_base_url: https://ghes.example.com",
+		1)
+	cfg, err := config.Parse([]byte(ok))
+	require.NoError(t, err)
+	require.Equal(t, "https://ghes.example.com", cfg.GitHub.PAT.ConfigBaseURL)
+}

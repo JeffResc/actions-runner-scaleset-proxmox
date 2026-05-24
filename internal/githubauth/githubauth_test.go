@@ -339,3 +339,95 @@ func TestApp_NewRESTClient_RejectsNonNumericClientID(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "numeric app_id")
 }
+
+// TestScope_PathSegment locks in the helper exposed for GHES
+// multi-scaleset URL composition (issue #214). PathSegment returns
+// "<org>" for an org scope and "<owner>/<repo>" for a repo scope —
+// the suffix the scaleset library appends to its config base URL.
+func TestScope_PathSegment(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "myorg", githubauth.Scope{Org: "myorg"}.PathSegment())
+	require.Equal(t, "owner/repo", githubauth.Scope{Repo: "owner/repo"}.PathSegment())
+}
+
+// TestNewPATWithConfig_RejectsConfigURLPlusConfigBaseURL locks in
+// the mutual-exclusion rule. The two override modes have different
+// per-scope behaviour and silently picking one would be a footgun.
+func TestNewPATWithConfig_RejectsConfigURLPlusConfigBaseURL(t *testing.T) {
+	t.Parallel()
+	_, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:         "ghp_test",
+		ConfigURL:     "https://ghes.example.com/myorg",
+		ConfigBaseURL: "https://ghes.example.com",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "mutually exclusive")
+}
+
+// TestNewPATWithConfig_RejectsConfigBaseURLWithoutScheme locks in
+// the schema requirement: ConfigBaseURL must be parseable as a full
+// "scheme://host" URL so the join-with-scope.PathSegment() produces
+// a sensible result. "ghes.example.com" alone would silently
+// produce "/<org>" which the scaleset library would treat as a
+// relative path and explode on.
+func TestNewPATWithConfig_RejectsConfigBaseURLWithoutScheme(t *testing.T) {
+	t.Parallel()
+	_, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:         "ghp_test",
+		ConfigBaseURL: "ghes.example.com",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "scheme and host")
+}
+
+// TestPAT_ConfigBaseURL_PerScopeRouting is the core regression
+// guard for issue #214. With ConfigBaseURL set, two distinct scopes
+// must produce two distinct outbound config URLs (org-a and org-b
+// must each hit their own /<org> path on the same host). The
+// previous ConfigURL-only behaviour would have routed both to the
+// same configured URL.
+func TestPAT_ConfigBaseURL_PerScopeRouting(t *testing.T) {
+	t.Parallel()
+	var (
+		mu    sync.Mutex
+		paths []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		http.Error(w, "stub", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	a, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:         "ghp_test",
+		ConfigBaseURL: srv.URL,
+	})
+	require.NoError(t, err)
+
+	for _, org := range []string{"org-a", "org-b"} {
+		c, err := a.NewScaleSetClient(context.Background(),
+			githubauth.Scope{Org: org}, validSystemInfo)
+		require.NoError(t, err)
+		require.NotNil(t, c)
+		callCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = c.GetRunnerScaleSet(callCtx, 1, "any")
+		cancel()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, paths, "expected scaleset client to hit the configured base URL at least once per scope")
+	gotOrgA, gotOrgB := false, false
+	for _, p := range paths {
+		if strings.Contains(p, "org-a") {
+			gotOrgA = true
+		}
+		if strings.Contains(p, "org-b") {
+			gotOrgB = true
+		}
+	}
+	require.True(t, gotOrgA, "no request observed for org-a; got paths %v", paths)
+	require.True(t, gotOrgB, "no request observed for org-b; got paths %v", paths)
+}

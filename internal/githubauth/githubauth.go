@@ -50,11 +50,23 @@ func (s Scope) Validate() error {
 }
 
 // URL returns the GitHub config URL the scaleset library expects.
+// Hardcodes github.com as the host; for GHES, callers must use
+// [PATConfig.ConfigURL] (single-scaleset) or
+// [PATConfig.ConfigBaseURL] (multi-scaleset, issue #214).
 func (s Scope) URL() string {
+	return "https://github.com/" + s.PathSegment()
+}
+
+// PathSegment returns the scope-identifying suffix the scaleset
+// library appends to a base URL — "<org>" for org scope or
+// "<owner>/<repo>" for repo scope. Callers building a GHES config
+// URL join this onto their base host (e.g.
+// "https://ghes.example.com/" + scope.PathSegment()).
+func (s Scope) PathSegment() string {
 	if s.Org != "" {
-		return "https://github.com/" + s.Org
+		return s.Org
 	}
-	return "https://github.com/" + s.Repo
+	return s.Repo
 }
 
 // Auth is implemented by both auth modes. Callers invoke NewScaleSetClient
@@ -85,23 +97,44 @@ type TransportWrap func(http.RoundTripper) http.RoundTripper
 // ---------------------------------------------------------------------------
 
 type patAuth struct {
-	token       string
-	configURL   string // empty = use scope.URL() — production default
-	restBaseURL string // empty = use go-github default (https://api.github.com/)
+	token         string
+	configURL     string // full URL: applies as-is regardless of scope (single-scope override)
+	configBaseURL string // base URL (no path): joined per-call with scope.PathSegment() — multi-scaleset GHES (issue #214)
+	restBaseURL   string // empty = use go-github default (https://api.github.com/)
 }
 
 // PATConfig configures a PAT-based [Auth] with optional base-URL overrides
 // for both the scaleset client and the go-github REST client. The
-// override fields are e2e-test hooks — production callers should use
-// [NewPAT] which leaves both empty.
+// override fields are e2e-test hooks and GHES-deployment hooks —
+// production callers against github.com should use [NewPAT] which
+// leaves all three empty.
 type PATConfig struct {
 	// Token is the personal access token. Required.
 	Token string
 
-	// ConfigURL, when non-empty, replaces scope.URL() as the
-	// GitHubConfigURL passed to scaleset.NewClientWithPersonalAccessToken.
-	// Use this to point the scaleset listener at a fake GitHub server.
+	// ConfigURL, when non-empty, replaces scope.URL() verbatim as
+	// the GitHubConfigURL passed to scaleset.NewClientWithPersonal-
+	// AccessToken. Every per-scope NewScaleSetClient call gets the
+	// same URL — appropriate for single-scaleset deployments and
+	// for redirecting test clients at a fake GitHub server.
+	//
+	// Mutually exclusive with ConfigBaseURL — set one or neither.
+	// Multi-scaleset GHES deployments must use ConfigBaseURL so
+	// each per-scope client gets the right org/repo path (issue
+	// #214).
 	ConfigURL string
+
+	// ConfigBaseURL, when non-empty, is treated as a scheme + host
+	// only (the path component is ignored). NewScaleSetClient
+	// constructs the per-scope GitHubConfigURL by joining
+	// ConfigBaseURL with scope.PathSegment(). Required for multi-
+	// scaleset deployments against GHES where each scaleset's
+	// scope points at a different org/repo on the same host.
+	//
+	// Mutually exclusive with ConfigURL. For github.com leave both
+	// empty — the default scope.URL() resolution already produces
+	// the right per-scope URL.
+	ConfigBaseURL string
 
 	// RESTBaseURL, when non-empty, overrides the go-github client's
 	// BaseURL. Must end with a trailing slash (go-github requirement);
@@ -117,6 +150,18 @@ func NewPATWithConfig(c PATConfig) (Auth, error) {
 	if c.Token == "" {
 		return nil, errors.New("githubauth: PAT token is required")
 	}
+	if c.ConfigURL != "" && c.ConfigBaseURL != "" {
+		return nil, errors.New("githubauth: PAT config_url and config_base_url are mutually exclusive — set one or neither")
+	}
+	if c.ConfigBaseURL != "" {
+		u, err := url.Parse(c.ConfigBaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("githubauth: config_base_url %q: %w", c.ConfigBaseURL, err)
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return nil, fmt.Errorf("githubauth: config_base_url %q must include scheme and host (e.g. https://ghes.example.com)", c.ConfigBaseURL)
+		}
+	}
 	if c.RESTBaseURL != "" {
 		if _, err := url.Parse(c.RESTBaseURL); err != nil {
 			return nil, fmt.Errorf("githubauth: rest base url %q: %w", c.RESTBaseURL, err)
@@ -126,9 +171,10 @@ func NewPATWithConfig(c PATConfig) (Auth, error) {
 		}
 	}
 	return &patAuth{
-		token:       c.Token,
-		configURL:   c.ConfigURL,
-		restBaseURL: c.RESTBaseURL,
+		token:         c.Token,
+		configURL:     c.ConfigURL,
+		configBaseURL: c.ConfigBaseURL,
+		restBaseURL:   c.RESTBaseURL,
 	}, nil
 }
 
@@ -148,15 +194,37 @@ func (p *patAuth) NewScaleSetClient(
 	if err := scope.Validate(); err != nil {
 		return nil, err
 	}
-	configURL := p.configURL
-	if configURL == "" {
-		configURL = scope.URL()
-	}
 	return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
-		GitHubConfigURL:     configURL,
+		GitHubConfigURL:     p.resolveConfigURL(scope),
 		PersonalAccessToken: p.token,
 		SystemInfo:          sys,
 	}, opts...)
+}
+
+// resolveConfigURL derives the per-scope GitHubConfigURL from the
+// auth's configuration, in this precedence:
+//
+//  1. configURL — operator-supplied full URL (single-scope override
+//     or test-only fake-server redirect). Returned verbatim for every
+//     scope; multi-scaleset configs against GHES MUST use
+//     configBaseURL instead so each scope produces a distinct URL.
+//  2. configBaseURL — operator-supplied scheme+host (GHES). Joined
+//     with scope.PathSegment() per-call so each scope's client
+//     handshakes against the right org/repo on the same host (issue
+//     #214).
+//  3. scope.URL() — the github.com default. Already per-scope by
+//     virtue of scope.PathSegment(), so multi-scaleset works out of
+//     the box.
+func (p *patAuth) resolveConfigURL(scope Scope) string {
+	if p.configURL != "" {
+		return p.configURL
+	}
+	if p.configBaseURL != "" {
+		// Trim trailing slash before joining so the result is always
+		// "<scheme>://<host>/<path>" rather than "...//<path>".
+		return strings.TrimRight(p.configBaseURL, "/") + "/" + scope.PathSegment()
+	}
+	return scope.URL()
 }
 
 func (p *patAuth) NewRESTClient(_ context.Context, transportWraps ...TransportWrap) (*github.Client, error) {

@@ -289,6 +289,25 @@ func (g GitHubAppConfig) Issuer() string {
 // it into yaml is not recommended.
 type GitHubPATConfig struct {
 	Token string `yaml:"token" koanf:"token"`
+
+	// ConfigURL overrides the default GitHub config URL the
+	// scaleset library uses. Set the full URL (e.g.
+	// "https://ghes.example.com/myorg") for a GHES single-scaleset
+	// deployment. Mutually exclusive with ConfigBaseURL.
+	//
+	// Multi-scaleset GHES deployments MUST use ConfigBaseURL, not
+	// ConfigURL — otherwise every scaleset's listener would
+	// register against the same hard-coded scope (issue #214).
+	ConfigURL string `yaml:"config_url,omitempty"`
+
+	// ConfigBaseURL is the GHES base host (scheme + host only,
+	// e.g. "https://ghes.example.com"). The orchestrator joins it
+	// with each scaleset's scope at runtime to produce the per-
+	// scope GitHubConfigURL. Required for multi-scaleset GHES;
+	// for github.com leave both ConfigURL and ConfigBaseURL empty
+	// — the default per-scope URL derivation already targets the
+	// right per-org/repo endpoint.
+	ConfigBaseURL string `yaml:"config_base_url,omitempty"`
 }
 
 // GitHubScope selects the registration target. Exactly one of Org or Repo
@@ -1287,6 +1306,22 @@ func (c *Config) Resolve() error {
 	if c.GitHub.PAT != nil {
 		if c.GitHub.PAT.Token == "" {
 			return errors.New("github.pat.token: required (set via yaml or SCALESET_GITHUB_PAT_TOKEN)")
+		}
+		// Mutual exclusion: config_url is the full URL (single-
+		// scope override); config_base_url is the scheme+host
+		// (per-scope URL is joined at runtime). Setting both is
+		// ambiguous.
+		if c.GitHub.PAT.ConfigURL != "" && c.GitHub.PAT.ConfigBaseURL != "" {
+			return errors.New("github.pat: config_url and config_base_url are mutually exclusive — set one or neither")
+		}
+		// Multi-scaleset GHES deployments must use config_base_url,
+		// not config_url. config_url is a full URL with the org/repo
+		// baked in, so every per-scaleset client would handshake
+		// against the same scope — the wrong one for all but one of
+		// the scalesets (issue #214).
+		if c.GitHub.PAT.ConfigURL != "" && len(c.Scalesets) > 1 {
+			return fmt.Errorf("github.pat.config_url is incompatible with multi-scaleset (%d scalesets declared); use github.pat.config_base_url so each scaleset's scope produces the right per-scope URL",
+				len(c.Scalesets))
 		}
 	}
 	// GitHub App: exactly one of client_id / app_id.

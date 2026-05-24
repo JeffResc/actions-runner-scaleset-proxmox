@@ -333,23 +333,23 @@ func Start(t testing.TB, opts Options) *Harness {
 	}
 	configPath := writeConfig(t, cv)
 
-	// In single-scaleset mode the ConfigURL embeds the configured org
-	// so the scaleset library's path parse extracts it as the scope.
-	// In multi-scaleset mode each entry has its own org and the
-	// shared PAT auth can only hold ONE ConfigURL — so we feed it a
-	// placeholder path that satisfies the library's "needs an org or
-	// owner/repo" parse. fakegithub's listener routes by scaleset
-	// name (in the ?name= query) and by the URL {id} param, neither
-	// of which cares about the configURL's org segment.
-	configURL := gh.ConfigURL(opts.Org)
-	if multi {
-		configURL = gh.ConfigURL("multi-scaleset-placeholder")
-	}
-	auth, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+	// Single-scaleset mode: ConfigURL embeds the configured org so
+	// the scaleset library's path parse extracts it as the scope.
+	// Multi-scaleset mode: ConfigBaseURL holds JUST the test server
+	// URL; the orchestrator's per-scaleset NewScaleSetClient joins
+	// it with each scope's PathSegment() to produce the per-scope
+	// config URL (issue #214). This exercises the same code path
+	// real GHES multi-scaleset operators use.
+	patCfg := githubauth.PATConfig{
 		Token:       ghToken,
-		ConfigURL:   configURL,
 		RESTBaseURL: gh.RESTBaseURL(),
-	})
+	}
+	if multi {
+		patCfg.ConfigBaseURL = gh.URL
+	} else {
+		patCfg.ConfigURL = gh.ConfigURL(opts.Org)
+	}
+	auth, err := githubauth.NewPATWithConfig(patCfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
