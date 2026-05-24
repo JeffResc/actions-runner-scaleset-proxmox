@@ -550,9 +550,18 @@ github:
     org: {{.Org}}
 {{- end }}
   poll_interval: 200ms
-  assigned_grace: 5s
+  # Match the prod defaults (5m) for the two "runner missing /
+  # offline while Assigned" grace timers. The e2e harness has to
+  # register the GH-side runner AFTER awaitNAssignedVMs returns,
+  # which under -race + sustained-burst load (12 VMs in
+  # TestE2E_SustainedHighConcurrency) can take 30s+ end-to-end.
+  # The original 5s graces raced the reconciler's {assigned,
+  # missing} force-destroy path and produced the flakes tracked
+  # in issue #224. running_idle_grace stays short so JobCompleted
+  # → destroy assertions remain quick.
+  assigned_grace: 5m
   running_idle_grace: 1s
-  assigned_offline_grace: 5s
+  assigned_offline_grace: 5m
 {{- if .Scalesets }}
 scalesets:
 {{- range .Scalesets }}
@@ -603,7 +612,14 @@ pool:
   drain_timeout: 5s
   boot_max_attempts: 3
   power_poll_interval: 100ms
-  vmid_reuse_cooldown: 1s
+  # 10m cooldown so the lowest-free VMID allocator does NOT reuse a
+  # just-destroyed VMID inside a single test. Test runner-table
+  # entries (gh.SetRunner) are keyed by name = "<prefix><vmid>"; if
+  # a fresh Hot-refill clone landed on the same VMID, the
+  # gh.Reconciler would re-match the stale runner registration to
+  # the new Hot row and trip "hot row observed as busy; promoting"
+  # mid-test (see issue #224).
+  vmid_reuse_cooldown: 10m
   orphan_grace: 5s
   clone_inflight_grace: 1m
 observability:
