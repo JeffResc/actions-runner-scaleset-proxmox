@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakegithub"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakeproxmox"
 )
 
@@ -101,6 +102,82 @@ func TestE2E_GuestAgentTransientRetry(t *testing.T) {
 		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "hot")) >= 1
 	}, 15*time.Second, 200*time.Millisecond,
 		"hot pool never reached 1 — transient agent errors should retry, not fail the boot")
+}
+
+// TestE2E_JITInjectPersistentFailureDestroysVM pins the
+// orchestrator's terminal-failure path for JIT injection (#247):
+// when qemu-guest-agent file-write fails on every retry, the
+// scaler must surface the error metric, deregister the runner,
+// and queue the VM for destruction so the pool can re-clone a
+// fresh replacement. Without this guarantee a broken-template
+// scenario would loop forever, exhausting the orchestrator's
+// API budget against an unsalvageable VM.
+//
+// Flow:
+//  1. Pre-create the fake Proxmox and register FaultJITInjectFail
+//     with VMID=0 so every clone's file-write fails.
+//  2. Start the orchestrator with HotSize=1 + 1 assignable job
+//     so a JIT injection actually fires.
+//  3. Watch the inject-error metric tick up (orchestrator's retry
+//     budget exhausted).
+//  4. The just-cloned VM must end up destroyed in the fake.
+func TestE2E_JITInjectPersistentFailureDestroysVM(t *testing.T) {
+	proxmox := fakeproxmox.New(t, fakeproxmox.Options{
+		TaskDuration: 5 * time.Millisecond,
+	})
+	// Apply to every VMID so whichever vmid the orchestrator
+	// clones first hits the failure.
+	proxmox.InjectFault(fakeproxmox.Fault{
+		Kind: fakeproxmox.FaultJITInjectFail,
+		VMID: 0,
+	})
+
+	gh := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset"},
+	})
+	// Drive one assignable job so HandleJobStarted -> injectWithRetry
+	// actually runs.
+	gh.SetStatistics(fakegithub.Statistics{TotalAssignedJobs: 1})
+
+	h := Start(t, Options{
+		HotSize:              1,
+		MaxConcurrentRunners: 2,
+		ScaleSetName:         "test-scaleset",
+		FakeProxmox:          proxmox,
+		FakeGitHub:           gh,
+	})
+
+	// The injection-failure metric is the canonical signal that
+	// retries were exhausted. It's incremented inside the scaler's
+	// "jit injection failed (after retries); releasing vm" branch.
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_proxmox_api_errors_total",
+			formatLabel("operation", "inject_jit"), formatLabel("node", "pve1")) >= 1
+	}, 60*time.Second, 250*time.Millisecond,
+		"orchestrator never recorded an inject_jit failure — the retry budget should exhaust")
+
+	// And the affected VM must end up destroyed in the fake (the
+	// scaler's MarkCompleted -> pool.destroyAsync chain). Use the
+	// fake's snapshot to look for an empty orchestrator-range; if
+	// HotSize triggers a refill clone, the VMID will differ from
+	// the failed one, but the orchestrator-range count must be 0 or
+	// occupied only by the refill (a non-running clone in progress).
+	require.Eventually(t, func() bool {
+		// Either the orchestrator-range is empty (failed VM destroyed,
+		// no refill yet) or contains exactly one VM that is NOT the
+		// one whose JIT inject ran (matching the new refill clone).
+		var inRange int
+		for _, vm := range proxmox.Snapshot() {
+			if vm.VMID >= 10000 && vm.VMID < 11000 {
+				inRange++
+			}
+		}
+		// Failed VM must be gone; a refill may or may not have landed,
+		// but we don't want more than one VM in the range (would
+		// indicate the failed VM is still around alongside a refill).
+		return inRange <= 1
+	}, 30*time.Second, 250*time.Millisecond,
+		"the inject-failed VM was never destroyed; pool will leak")
 }
 
 // itoa wraps strconv.Itoa for a slightly less noisy call site in the

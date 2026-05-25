@@ -60,8 +60,21 @@ func (s *Server) handleAgentGetOSInfo(w http.ResponseWriter, r *http.Request) {
 // (the orchestrator's only consumers are file-read against the same
 // path, and we ack file-write as success in either case). Returns
 // {"data": null} like real Proxmox.
+//
+// When FaultJITInjectFail is registered for the target VMID (or
+// VMID==0 to match all), every write returns 500 with a permission-
+// denied body. This is the persistent-failure shape #247 exercises.
 func (s *Server) handleAgentFileWrite(w http.ResponseWriter, r *http.Request) {
 	if !s.assertVMRunning(w, r) {
+		return
+	}
+	vmid, _ := vmidParam(r)
+	s.store.mu.Lock()
+	_, faulted := s.store.matchFaultLocked(FaultJITInjectFail, vmid)
+	s.store.mu.Unlock()
+	if faulted {
+		writeError(w, http.StatusInternalServerError,
+			"permission denied: cannot write /opt/actions-runner/jitconfig.env.tmp")
 		return
 	}
 	var body map[string]any

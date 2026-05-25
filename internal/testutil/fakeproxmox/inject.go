@@ -45,6 +45,15 @@ const (
 	// by Duration, exposing the window between Clone returning and
 	// tags landing.
 	FaultTagApplyDelay
+
+	// FaultJITInjectFail makes every agent/file-write call return 500
+	// with a "permission denied" body — modelling the case where the
+	// in-VM qemu-guest-agent is broken or the runner template is
+	// missing the writable jitconfig directory. Used by the
+	// inject-retry-exhaustion e2e test (#247) to drive a clone through
+	// the orchestrator's full inject → retry → mark-completed →
+	// destroy chain.
+	FaultJITInjectFail
 )
 
 // Fault describes a single injected failure. Match semantics:
