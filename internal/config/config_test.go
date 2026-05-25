@@ -1862,6 +1862,53 @@ func TestParse_VMIDRangeEdgeCases(t *testing.T) {
 	}
 }
 
+// TestParse_VMIDRangeAcceptsProxmoxReservedRange documents the
+// current policy on VMIDs Proxmox reserves for cluster internals
+// (typically <100): the orchestrator accepts them. The validator
+// only enforces gt=0 and Max > Min; it does NOT carve out the
+// reserved band.
+//
+// This is a deliberate pin, not an assertion of best practice —
+// operators who care about avoiding Proxmox's reserved IDs should
+// configure min >= 100 themselves. Surfacing this as a test means
+// any future change to the policy (e.g. rejecting min < 100) will
+// fail loudly here and force an intentional decision.
+func TestParse_VMIDRangeAcceptsProxmoxReservedRange(t *testing.T) {
+	t.Parallel()
+	y := strings.Replace(validPATYAML,
+		"vmid_range: { min: 10000, max: 19999 }",
+		"vmid_range: { min: 50, max: 99 }", 1)
+	// Template VMID stays at 9000 in validPATYAML — already outside
+	// the [50, 99] range, so the cross-field validator passes.
+
+	_, err := config.Parse([]byte(y))
+	require.NoError(t, err,
+		"current policy: VMIDs in Proxmox's reserved range (<100) are accepted; "+
+			"if this test starts failing, document the new rejection rule explicitly")
+}
+
+// TestParse_VMIDRangeAcceptsSingleSlotPlusOne pins the smallest
+// valid range. min=1000 max=1001 is a two-VMID range — enough for
+// the orchestrator's cooldown semantics (one destroyed VMID can
+// still settle while the next clone targets the alternative).
+// Anything tighter (min == max) is rejected by gtfield=Min, as
+// covered in TestParse_VMIDRangeEdgeCases above.
+func TestParse_VMIDRangeAcceptsSingleSlotPlusOne(t *testing.T) {
+	t.Parallel()
+	y := strings.Replace(validPATYAML,
+		"vmid_range: { min: 10000, max: 19999 }",
+		"vmid_range: { min: 1000, max: 1001 }", 1)
+	// Pool sizing must fit within the 2-slot range to avoid the
+	// HotSize+WarmSize > MaxConcurrentRunners cross-field check.
+	y = strings.Replace(y, "max_concurrent_runners: 10", "max_concurrent_runners: 2", 1)
+	y = strings.Replace(y, "hot_size: 2", "hot_size: 1", 1)
+	y = strings.Replace(y, "warm_size: 3", "warm_size: 1", 1)
+
+	_, err := config.Parse([]byte(y))
+	require.NoError(t, err,
+		"a 2-slot range must parse cleanly; this is the operational floor")
+}
+
 // TestTLS_InsecureSkipVerifyAndCAFileBothHonored pins the current
 // contract of [TLSConfig.BuildClientTLS]: when both
 // InsecureSkipVerify=true and a CAFile are set, BOTH are applied —
