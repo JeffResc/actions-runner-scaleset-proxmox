@@ -12,9 +12,9 @@
 // re-applies the night override instead of briefly snapping
 // back to defaults.
 //
-// Time is injectable via Clock so tests drive deterministic
-// fires with a fake clock — the real clock implementation just
-// wraps time.Now / time.NewTimer.
+// Time is injectable via jonboulle/clockwork.Clock so tests drive
+// deterministic fires with a fake clock; production wires
+// clockwork.NewRealClock().
 package schedule
 
 import (
@@ -25,6 +25,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/jonboulle/clockwork"
 	"github.com/robfig/cron/v3"
 )
 
@@ -56,27 +57,6 @@ type Entry struct {
 // pool.Manager.SetTargetSizes.
 type ApplyFunc func(profile string, hotSize, warmSize int)
 
-// Clock abstracts time for tests. The production implementation
-// is RealClock; tests inject a FakeClock that records sleeps and
-// fires them on demand.
-type Clock interface {
-	Now() time.Time
-	// After returns a channel that delivers exactly one tick at
-	// now+d. Cancelling is handled by the caller via select on
-	// ctx.Done().
-	After(d time.Duration) <-chan time.Time
-}
-
-// RealClock is the wall-clock production implementation.
-type RealClock struct{}
-
-// Now returns time.Now in UTC so callers normalise on a single
-// reference rather than the host's local zone.
-func (RealClock) Now() time.Time { return time.Now() }
-
-// After delegates to time.After.
-func (RealClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
-
 // Metrics is the subset of observability.Metrics the Runner
 // consumes. Defined as an interface so the package stays free
 // of the observability import (and so tests can stub).
@@ -105,7 +85,7 @@ func (noopMetrics) SetActive(string, string) {}
 type Runner struct {
 	entries []*Entry
 	apply   ApplyFunc
-	clock   Clock
+	clock   clockwork.Clock
 	log     *slog.Logger
 	metrics Metrics
 }
@@ -113,12 +93,18 @@ type Runner struct {
 // NewRunner constructs a Runner. Entries with empty Profile are
 // rejected: every override must name a profile so the apply
 // callback knows which pool to update. apply is required.
-func NewRunner(entries []Entry, apply ApplyFunc, clock Clock, log *slog.Logger, metrics Metrics) (*Runner, error) {
+//
+// Each entry whose Location resolves to UTC by default (the
+// caller passed an empty timezone) is logged at Info on
+// construction so the operator can confirm the wall-clock time
+// the cron will fire against — a common footgun called out in
+// #255.
+func NewRunner(entries []Entry, apply ApplyFunc, clock clockwork.Clock, log *slog.Logger, metrics Metrics) (*Runner, error) {
 	if apply == nil {
 		return nil, errors.New("schedule: apply func is required")
 	}
 	if clock == nil {
-		clock = RealClock{}
+		clock = clockwork.NewRealClock()
 	}
 	if log == nil {
 		log = slog.Default()
@@ -144,9 +130,22 @@ func NewRunner(entries []Entry, apply ApplyFunc, clock Clock, log *slog.Logger, 
 		if e.Duration <= 0 {
 			return nil, fmt.Errorf("schedule: entries[%d] %q: duration must be > 0", i, e.Name)
 		}
+		defaultedToUTC := false
 		if e.Location == nil {
 			e.Location = time.UTC
+			defaultedToUTC = true
 		}
+		// Log the resolved timezone so an operator who omitted
+		// `timezone:` in their schedule config can see at startup
+		// what wall-clock zone the cron will fire against. Cron
+		// expressions like "0 8 * * 1-5" mean very different
+		// things in UTC vs. America/New_York; surfacing the
+		// resolved value at Info catches the most common config
+		// mistake without forcing a breaking validation change.
+		r.log.Info("schedule: entry timezone resolved",
+			"name", e.Name, "profile", e.Profile,
+			"cron", e.Spec, "timezone", e.Location.String(),
+			"defaulted_to_utc", defaultedToUTC)
 		r.entries = append(r.entries, &e)
 	}
 	return r, nil

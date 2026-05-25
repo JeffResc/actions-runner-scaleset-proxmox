@@ -20,6 +20,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	"github.com/hashicorp/raft"
+	"github.com/jonboulle/clockwork"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"golang.org/x/sync/errgroup"
@@ -929,7 +930,7 @@ func scheduleRunnerForScaleset(ss config.ScaleSetEntry, poolDefaults config.Pool
 			log.Warn("schedule: SetTargetSizes failed", "profile", profile, "err", err)
 		}
 	}
-	return schedule.NewRunner(entries, apply, schedule.RealClock{}, log, scheduleMetricsAdapter{m: metrics})
+	return schedule.NewRunner(entries, apply, clockwork.NewRealClock(), log, scheduleMetricsAdapter{m: metrics})
 }
 
 // canaryControllerFromConfig projects per-profile canary fields

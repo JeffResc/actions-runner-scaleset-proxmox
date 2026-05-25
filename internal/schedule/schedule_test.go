@@ -8,77 +8,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jonboulle/clockwork"
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/schedule"
 )
 
-// fakeClock is a deterministic test clock. Tests advance time
-// via Advance and the Runner unblocks one wait at a time. The
-// implementation is intentionally simple: only one outstanding
-// After call is permitted at a time, which matches the Runner's
-// design (single-goroutine event loop).
-type fakeClock struct {
-	mu       sync.Mutex
-	now      time.Time
-	pending  chan time.Time
-	pendingD time.Duration
-	calls    chan struct{} // one item per After call (buffered)
-}
-
-func newFakeClock(start time.Time) *fakeClock {
-	return &fakeClock{now: start, calls: make(chan struct{}, 16)}
-}
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) After(d time.Duration) <-chan time.Time {
-	c.mu.Lock()
-	ch := make(chan time.Time, 1)
-	c.pending = ch
-	c.pendingD = d
-	c.mu.Unlock()
-	select {
-	case c.calls <- struct{}{}:
-	default:
-	}
-	return ch
-}
-
-// waitForAfterCall blocks until the Runner calls After at
-// least once since the last drain. Consumes one signal so
-// successive waits track successive After invocations 1:1.
-func (c *fakeClock) waitForAfterCall(t *testing.T) {
+// waitForAfterCall blocks until the Runner has registered a
+// pending After() call on the fake clock. clockwork.FakeClock
+// tracks sleepers as a count; once the Runner reaches its
+// `<-r.clock.After(...)` select, BlockUntilContext(1) returns.
+// After Advance fires the wait, the count drops to 0 — the next
+// call to waitForAfterCall blocks until the Runner re-enters
+// After.
+func waitForAfterCall(t *testing.T, c *clockwork.FakeClock) {
 	t.Helper()
-	select {
-	case <-c.calls:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Runner did not call clock.After within 2s")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.BlockUntilContext(ctx, 1); err != nil {
+		t.Fatalf("Runner did not call clock.After within 2s: %v", err)
 	}
-}
-
-// Advance moves the clock forward by d and fires the pending
-// After channel iff its deadline is now <= the new clock.
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(d)
-	if c.pending != nil {
-		if c.pendingD <= d {
-			ch := c.pending
-			now := c.now
-			c.pending = nil
-			c.mu.Unlock()
-			ch <- now
-			return
-		}
-		c.pendingD -= d
-	}
-	c.mu.Unlock()
 }
 
 type applyCall struct {
@@ -148,7 +98,7 @@ func TestRunner_FireAppliesOverridesThenWindowExpires(t *testing.T) {
 	// Start one minute before an "every hour at minute 30" fire
 	// so the first cron.Next is exactly 1m out.
 	start := time.Date(2026, 5, 23, 12, 29, 0, 0, time.UTC)
-	clock := newFakeClock(start)
+	clock := clockwork.NewFakeClockAt(start)
 	rec := newRecorder()
 
 	entry := schedule.Entry{
@@ -172,14 +122,14 @@ func TestRunner_FireAppliesOverridesThenWindowExpires(t *testing.T) {
 	go func() { defer close(runDone); _ = r.Run(ctx) }()
 
 	// First clock.After call is for the 1m wait to first fire.
-	clock.waitForAfterCall(t)
+	waitForAfterCall(t, clock)
 	clock.Advance(1 * time.Minute)
 	rec.waitForCalls(t, 1)
 	require.Equal(t, []applyCall{{"cpu", 10, 20}}, rec.snapshot())
 
 	// Runner then waits to either the next fire (1h away) or the
 	// window expiry (5m away). 5m wins.
-	clock.waitForAfterCall(t)
+	waitForAfterCall(t, clock)
 	clock.Advance(5 * time.Minute)
 	rec.waitForCalls(t, 2)
 	require.Equal(t, []applyCall{
@@ -197,7 +147,7 @@ func TestRunner_StartupReplayActivatesMidWindow(t *testing.T) {
 	// we're firmly inside the window. Runner must apply the
 	// override immediately at startup.
 	start := time.Date(2026, 5, 23, 13, 30, 0, 0, time.UTC)
-	clock := newFakeClock(start)
+	clock := clockwork.NewFakeClockAt(start)
 	rec := newRecorder()
 
 	entry := schedule.Entry{
@@ -235,7 +185,7 @@ func TestRunner_OverlappingSchedulesLastFiredWins(t *testing.T) {
 	// Startup at 14:30 — both windows are open, afternoon's
 	// firedAt (14:00) is more recent so it wins.
 	start := time.Date(2026, 5, 23, 14, 30, 0, 0, time.UTC)
-	clock := newFakeClock(start)
+	clock := clockwork.NewFakeClockAt(start)
 	rec := newRecorder()
 
 	morning := schedule.Entry{
@@ -266,7 +216,7 @@ func TestRunner_OverlappingSchedulesLastFiredWins(t *testing.T) {
 
 func TestRunner_NoEntriesBlocksUntilCancel(t *testing.T) {
 	t.Parallel()
-	clock := newFakeClock(time.Now())
+	clock := clockwork.NewFakeClockAt(time.Now())
 	rec := newRecorder()
 	r, err := schedule.NewRunner(nil, rec.apply, clock, quietLogger(), nil)
 	require.NoError(t, err)
@@ -288,7 +238,7 @@ func TestRunner_NoEntriesBlocksUntilCancel(t *testing.T) {
 
 func TestRunner_RejectsBadEntries(t *testing.T) {
 	t.Parallel()
-	clock := newFakeClock(time.Now())
+	clock := clockwork.NewFakeClockAt(time.Now())
 	rec := newRecorder()
 
 	_, err := schedule.NewRunner([]schedule.Entry{{
