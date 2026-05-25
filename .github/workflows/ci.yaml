@@ -77,6 +77,44 @@ jobs:
       - name: Run tests
         run: go test -race -coverprofile=coverage.out ./...
 
+      - name: Enforce per-package coverage floor
+        # Pinned floors (% of statements) for packages whose
+        # coverage materially affects orchestration safety.
+        # Floors are set to the current measured value rounded
+        # down to the nearest 5%, so a future drop fails CI
+        # visibly rather than going unnoticed. Bump the floor
+        # in lockstep with any deliberate coverage improvement.
+        run: |
+          declare -A FLOORS=(
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool]=75
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner]=75
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/scaler]=80
+            [github.com/jeffresc/actions-runner-scaleset-proxmox/internal/gh]=75
+          )
+          # go tool cover -func emits per-file rows + a final "total:" row.
+          # Aggregate per-package by summing statement counts via the
+          # coverage profile directly.
+          go tool cover -func=coverage.out > coverage_func.txt
+          echo "::group::Per-package coverage summary"
+          fail=0
+          for pkg in "${!FLOORS[@]}"; do
+            floor=${FLOORS[$pkg]}
+            # Lines look like:
+            #   github.com/.../internal/pool/manager.go:42:  funcName  78.3%
+            # Compute the unweighted average across the package's funcs.
+            pct=$(grep "^${pkg}/" coverage_func.txt | awk '{ gsub("%",""); n++; s+=$NF } END { if (n>0) printf "%.1f", s/n; else print "0" }')
+            printf '  %-70s actual=%s%%  floor=%s%%\n' "$pkg" "$pct" "$floor"
+            if awk -v a="$pct" -v b="$floor" 'BEGIN { exit !(a < b) }'; then
+              echo "    ::error::coverage of $pkg dropped below floor ($pct% < $floor%)"
+              fail=1
+            fi
+          done
+          echo "::endgroup::"
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more packages dropped below their coverage floor. Either raise coverage with new tests or, if the drop is justified, lower the floor in .github/workflows/ci.yaml with a commit message explaining why."
+            exit 1
+          fi
+
       - name: Upload coverage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

@@ -410,9 +410,16 @@ func (k *raftCoord) Run(ctx context.Context) error {
 			defer close(shutdownDone)
 			_ = k.r.Shutdown().Error()
 		}()
+		// time.NewTimer (not time.After) so the timer is GC'd on
+		// the happy path. time.After's runtime timer dangles for
+		// the full 5s on every clean shutdown — harmless once, but
+		// onDeposeWait below uses the same pattern in a leadership-
+		// flap path that can fire frequently.
+		shutdownTimer := time.NewTimer(5 * time.Second)
+		defer shutdownTimer.Stop()
 		select {
 		case <-shutdownDone:
-		case <-time.After(5 * time.Second):
+		case <-shutdownTimer.C:
 			k.log.Warn("cluster: raft shutdown exceeded deadline; abandoning")
 		}
 		// Close BoltDB handles AFTER raft.Shutdown returns — raft
@@ -466,9 +473,11 @@ func (k *raftCoord) Run(ctx context.Context) error {
 			defer close(done)
 			leaderWG.Wait()
 		}()
+		deposeTimer := time.NewTimer(k.onDeposeWait)
+		defer deposeTimer.Stop()
 		select {
 		case <-done:
-		case <-time.After(k.onDeposeWait):
+		case <-deposeTimer.C:
 			k.log.Warn("cluster: previous OnElected did not return within onDeposeWait; proceeding",
 				"node_id", k.cfg.NodeID, "wait", k.onDeposeWait)
 		}
