@@ -111,6 +111,15 @@ type Metrics struct {
 	// PoolDestroyBacklogDepth tracks the live depth of the destroy
 	// dispatcher queue. The bound is 2 * the destroy semaphore cap.
 	PoolDestroyBacklogDepth *prometheus.GaugeVec
+
+	// PanicsRecovered counts panics caught by the pool's async
+	// worker recover() guards. Each increment indicates a real bug
+	// in a worker goroutine that the recover prevented from
+	// crashing the process — operators should alert on
+	// rate(panics_recovered_total[5m]) > 0 because a recovered
+	// panic in a clone/destroy/boot path can leak a Proxmox VM
+	// (and historically did, before the allocMu defer fix).
+	PanicsRecovered *prometheus.CounterVec
 }
 
 // ProxmoxOpUnknown is the fallback for off-list values of the
@@ -307,6 +316,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "pool_destroy_backlog_depth",
 			Help: "Current depth of the pool destroy dispatcher queue, by scaleset.",
 		}, []string{"scaleset"}),
+		PanicsRecovered: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "panics_recovered_total",
+			Help: "Panics caught by the pool's async worker recover() guards, by operation. Non-zero rate indicates a real bug — alert on rate(panics_recovered_total[5m]) > 0.",
+		}, []string{"scaleset", "op"}),
 	}
 	reg.MustRegister(
 		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
@@ -317,6 +330,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions, m.CanaryReverts,
 		m.ScheduleFires, m.ScheduleActive,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
+		m.PanicsRecovered,
 		m.Leader,
 	)
 	return m

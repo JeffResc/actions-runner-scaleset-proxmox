@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
@@ -204,6 +205,38 @@ func TestAllocateVMIDAndInsertRow_ReleasesLockOnPanic(t *testing.T) {
 	require.True(t, mgr.allocMu.TryLock(),
 		"allocMu must be free after a panic inside the locked section; the defer in allocateVMIDAndInsertRow is what guarantees this")
 	mgr.allocMu.Unlock()
+}
+
+// TestLogRecoveredPanic_IncrementsPanicMetric pins #254: every
+// panic caught by the pool's recover() guards must bump
+// scaleset_panics_recovered_total{op}. Operators alert on
+// rate(panics_recovered_total[5m]) > 0 — silent panics in worker
+// goroutines historically masked real bugs (the allocMu lock-leak
+// regression caught by [TestAllocateVMIDAndInsertRow_ReleasesLockOnPanic]
+// is the canonical example).
+func TestLogRecoveredPanic_IncrementsPanicMetric(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{})
+
+	// Drive the helper directly with a non-nil panic value and
+	// assert the counter ticks. Going through a real goroutine +
+	// defer + recover sequence is overkill — logRecoveredPanic is
+	// the single chokepoint every site funnels through.
+	mgr.logRecoveredPanic("test-op", 42, "simulated panic")
+
+	// Counter labels: (scaleset, op). newTestManager defaults
+	// ScaleSetName to "test".
+	got := promtestutil.ToFloat64(mgr.metrics.PanicsRecovered.WithLabelValues("test", "test-op"))
+	require.InEpsilon(t, 1.0, got, 1e-9,
+		"a recovered panic must increment scaleset_panics_recovered_total once")
+
+	// A nil panic value (caller's recover() returned nil because
+	// no panic was in flight) must NOT increment.
+	mgr.logRecoveredPanic("test-op", 42, nil)
+	got = promtestutil.ToFloat64(mgr.metrics.PanicsRecovered.WithLabelValues("test", "test-op"))
+	require.InEpsilon(t, 1.0, got, 1e-9,
+		"nil-panic call must be a no-op; counter must still be 1")
 }
 
 // TestRapidStateCycling drives a single VMID through the full

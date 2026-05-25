@@ -43,6 +43,9 @@ func (m *manager) logRecoveredPanic(opName string, vmid int, r any) {
 	}
 	m.log.Error("panic in async pool worker",
 		"op", opName, "vmid", vmid, "panic", fmt.Sprintf("%v", r))
+	if m.metrics != nil && m.metrics.PanicsRecovered != nil {
+		m.metrics.PanicsRecovered.WithLabelValues(m.cfg.ScaleSetName, opName).Inc()
+	}
 }
 
 // ErrUnknownProfile is returned by SetTargetSizes (and any future
