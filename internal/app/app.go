@@ -197,168 +197,14 @@ func Run(ctx context.Context, opts Options) error {
 		CommitSHA: "",
 	}
 
-	runOneScaleset := func(leaderCtx context.Context, entry config.ScaleSetEntry, state *scalesetState) error {
-		scope := githubauth.Scope{Org: entry.Scope.Org, Repo: entry.Scope.Repo}
-		ssSysInfo := sysInfo // copy; ScaleSetID stamped per-scaleset below
-		ghClient, err := auth.NewScaleSetClient(leaderCtx, scope, ssSysInfo)
-		if err != nil {
-			return fmt.Errorf("build scaleset client: %w", err)
-		}
-		restCli, err := auth.NewRESTClient(leaderCtx, githubauth.WithRateLimitMetrics(metrics.ForScaleset(entry.Name)))
-		if err != nil {
-			return fmt.Errorf("build github rest client: %w", err)
-		}
-
-		rss, err := ensureScaleSetForEntry(leaderCtx, ghClient, entry, log)
-		if err != nil {
-			return fmt.Errorf("ensure runner scale set: %w", err)
-		}
-		ssSysInfo.ScaleSetID = rss.ID
-		ghClient.SetSystemInfo(ssSysInfo)
-		log.Info("runner scale set ready", "scaleset", entry.Name, "name", rss.Name, "id", rss.ID)
-
-		// Build the per-profile canary controller. Errors are
-		// non-fatal — log + degrade to no-canary (every clone
-		// uses the profile's stable TemplateVMID).
-		canaryCtrl, cerr := canaryControllerForScaleset(entry, cfg.Proxmox.TemplateVMID)
-		if cerr != nil {
-			log.Warn("canary: controller build failed; canary rollout disabled", "scaleset", entry.Name, "err", cerr)
-			canaryCtrl = nil
-		}
-		state.canaryPtr.Store(canaryCtrl)
-		defer state.canaryPtr.Store(nil)
-
-		st, err := store.New()
-		if err != nil {
-			return fmt.Errorf("init store: %w", err)
-		}
-
-		mgr, err := pool.NewManager(pool.Config{
-			HotSize:              cfg.Pool.HotSize,
-			WarmSize:             cfg.Pool.WarmSize,
-			MaxConcurrentRunners: entry.MaxConcurrentRunners,
-			ReconcileInterval:    cfg.Pool.ReconcileInterval.D(),
-			PowerPollInterval:    cfg.Pool.PowerPollInterval.D(),
-			VMMaxAge:             cfg.Pool.VMMaxAge.D(),
-			DrainTimeout:         cfg.Pool.DrainTimeout.D(),
-			BootMaxAttempts:      cfg.Pool.BootMaxAttempts,
-			Profiles:             profileSettingsForScaleset(entry, cfg),
-			Canary:               canaryCtrl,
-			ScaleSetName:         entry.Name,
-			VMNamePrefix:         state.vmPrefix,
-			VMIDRange:            entryVMIDRange(entry, cfg.Proxmox.VMIDRange),
-			LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
-			TemplateNode:         state.prov.TemplateNode(),
-			VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
-			OnRunnerOrphaned:     ghClient.RemoveRunner,
-			RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
-		}, st, state.prov, sel, log, metrics)
-		if err != nil {
-			return fmt.Errorf("init pool: %w", err)
-		}
-
-		if err := mgr.Adopt(leaderCtx); err != nil {
-			log.Warn("adopt: list-owned-vms failed; starting with empty pool", "scaleset", entry.Name, "err", err)
-		}
-		health.MarkScalesetRecoveryDone(entry.Name)
-		health.MarkProxmoxOK()
-
-		state.poolPtr.Store(&mgr)
-		defer state.poolPtr.Store(nil)
-
-		sc := scaler.New(scaler.Config{
-			ScaleSetID:   rss.ID,
-			ScaleSetName: entry.Name,
-			WorkFolder:   "_work",
-			NamePrefix:   state.vmPrefix,
-		}, ghClient, mgr, state.prov, log, metrics)
-
-		if r, err := routerForScaleset(entry); err != nil {
-			log.Warn("router: build failed; routing observations disabled", "scaleset", entry.Name, "err", err)
-		} else {
-			sc.SetRouter(r)
-		}
-		if q, err := quotasResolverFromConfig(cfg); err != nil {
-			log.Warn("quotas: resolver build failed; quotas observation disabled", "scaleset", entry.Name, "err", err)
-		} else {
-			sc.SetQuotas(q)
-			sc.SetQuotaCounter(st)
-		}
-		if pm, err := priorityMatcherFromConfig(cfg); err != nil {
-			log.Warn("priority: matcher build failed; priority observation disabled", "scaleset", entry.Name, "err", err)
-		} else {
-			sc.SetPriority(pm)
-		}
-
-		owner := scope.Org
-		if owner == "" {
-			idx := strings.IndexByte(scope.Repo, '/')
-			if idx <= 0 {
-				return fmt.Errorf("scalesets[%q].scope.repo %q is not in owner/repo form (validation should have caught this)",
-					entry.Name, scope.Repo)
-			}
-			owner = scope.Repo[:idx]
-		}
-		sessionClient, err := ghClient.MessageSessionClient(leaderCtx, rss.ID, owner)
-		if err != nil {
-			return fmt.Errorf("open message session: %w", err)
-		}
-
-		lst, err := listener.New(sessionClient, listener.Config{
-			ScaleSetID: rss.ID,
-			MaxRunners: entry.MaxConcurrentRunners,
-			Logger:     log,
-		})
-		if err != nil {
-			return fmt.Errorf("build listener: %w", err)
-		}
-
-		rec, err := gh.New(gh.Config{
-			Scope:                scope,
-			ScaleSetName:         entry.Name,
-			PollInterval:         cfg.GitHub.PollInterval.D(),
-			AssignedGrace:        cfg.GitHub.AssignedGrace.D(),
-			RunningIdleGrace:     cfg.GitHub.RunningIdleGrace.D(),
-			AssignedOfflineGrace: cfg.GitHub.AssignedOfflineGrace.D(),
-			OrphanGrace:          cfg.Pool.OrphanGrace.D(),
-			RunnerNamePrefix:     state.vmPrefix,
-		}, restCli, mgr, state.prov, log, metrics)
-		if err != nil {
-			return fmt.Errorf("build gh reconciler: %w", err)
-		}
-
-		schedRunner, serr := scheduleRunnerForScaleset(entry, cfg.Pool, mgr, log, metrics)
-		if serr != nil {
-			log.Warn("schedule: runner build failed; schedules disabled", "scaleset", entry.Name, "err", serr)
-		}
-
-		g, ctxg := errgroup.WithContext(leaderCtx)
-		g.Go(func() error { return mgr.Run(ctxg) })
-		if schedRunner != nil {
-			g.Go(func() error {
-				err := schedRunner.Run(ctxg)
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return err
-			})
-		}
-		g.Go(func() error {
-			err := rec.Run(ctxg)
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return err
-		})
-		g.Go(func() error {
-			health.MarkScalesetListenerConnected(entry.Name)
-			err := lst.Run(ctxg, sc)
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return err
-		})
-		return g.Wait()
+	deps := runOneScalesetDeps{
+		cfg:     cfg,
+		auth:    auth,
+		sel:     sel,
+		metrics: metrics,
+		health:  health,
+		log:     log,
+		sysInfo: sysInfo,
 	}
 
 	// runLeaderPlane fans the per-scaleset workers out under one
@@ -373,7 +219,10 @@ func Run(ctx context.Context, opts Options) error {
 			entry := cfg.Scalesets[i]
 			state := scStates[entry.Name]
 			g.Go(func() error {
-				return superviseScaleset(ctxg, entry, state, log, runOneScaleset)
+				return superviseScaleset(ctxg, entry, state, log,
+					func(ctx context.Context, entry config.ScaleSetEntry, state *scalesetState) error {
+						return runOneScaleset(ctx, deps, entry, state)
+					})
 			})
 		}
 		return g.Wait()
@@ -472,29 +321,7 @@ func Run(ctx context.Context, opts Options) error {
 	if defaultCanaryFn != nil {
 		admin.SetCanary(defaultCanaryFn)
 	}
-	// Register the namespaced accessors for every scaleset so
-	// `/admin/{scaleset}/...` routes resolve to the right
-	// per-scaleset pool / canary controller (issue #1). Closures
-	// capture each state pointer by reference, not by value, so
-	// reads happen at request time and reflect the current
-	// leader-election state.
-	for _, s := range cfg.Scalesets {
-		state := scStates[s.Name]
-		admin.SetScalesetPool(s.Name, func() pool.Manager {
-			p := state.poolPtr.Load()
-			if p == nil {
-				return nil
-			}
-			return *p
-		})
-		admin.SetScalesetCanary(s.Name, adminapi.CanaryAccessor(func() adminapi.CanaryPromoter {
-			c := state.canaryPtr.Load()
-			if c == nil {
-				return nil
-			}
-			return c
-		}))
-	}
+	registerScalesetAccessors(admin, scStates, cfg.Scalesets)
 
 	// Two-phase shutdown:
 	//
@@ -817,6 +644,223 @@ type scalesetState struct {
 	vmPrefix  string
 	poolPtr   atomic.Pointer[pool.Manager]
 	canaryPtr atomic.Pointer[canary.Controller]
+}
+
+// runOneScalesetDeps bundles the leader-plane-wide collaborators
+// that every per-scaleset worker shares. Extracted from Run's
+// inline closure so runOneScaleset can be invoked from tests
+// without rebuilding the closure capture set.
+type runOneScalesetDeps struct {
+	cfg     *config.Config
+	auth    githubauth.Auth
+	sel     nodeselector.Selector
+	metrics *observability.Metrics
+	health  *observability.Health
+	log     *slog.Logger
+	sysInfo scaleset.SystemInfo
+}
+
+// runOneScaleset drives one scale set's GH listener, REST
+// reconciler, pool manager, and scheduler under leaderCtx. The
+// per-scaleset worker stays running until leaderCtx is cancelled
+// (drain, deposal, or process exit) or one of its sub-tasks
+// returns a non-cancelled error.
+//
+// Sibling isolation lives in superviseScaleset; this function
+// returns the raw error so the supervisor can log it without
+// affecting other scalesets.
+//
+//nolint:funlen // deliberate top-down wiring; splitting further hides the lifecycle
+func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry config.ScaleSetEntry, state *scalesetState) error {
+	cfg, auth, sel, metrics, health, log := deps.cfg, deps.auth, deps.sel, deps.metrics, deps.health, deps.log
+	scope := githubauth.Scope{Org: entry.Scope.Org, Repo: entry.Scope.Repo}
+	ssSysInfo := deps.sysInfo // copy; ScaleSetID stamped per-scaleset below
+	ghClient, err := auth.NewScaleSetClient(leaderCtx, scope, ssSysInfo)
+	if err != nil {
+		return fmt.Errorf("build scaleset client: %w", err)
+	}
+	restCli, err := auth.NewRESTClient(leaderCtx, githubauth.WithRateLimitMetrics(metrics.ForScaleset(entry.Name)))
+	if err != nil {
+		return fmt.Errorf("build github rest client: %w", err)
+	}
+
+	rss, err := ensureScaleSetForEntry(leaderCtx, ghClient, entry, log)
+	if err != nil {
+		return fmt.Errorf("ensure runner scale set: %w", err)
+	}
+	ssSysInfo.ScaleSetID = rss.ID
+	ghClient.SetSystemInfo(ssSysInfo)
+	log.Info("runner scale set ready", "scaleset", entry.Name, "name", rss.Name, "id", rss.ID)
+
+	// Build the per-profile canary controller. Errors are
+	// non-fatal — log + degrade to no-canary (every clone
+	// uses the profile's stable TemplateVMID).
+	canaryCtrl, cerr := canaryControllerForScaleset(entry, cfg.Proxmox.TemplateVMID)
+	if cerr != nil {
+		log.Warn("canary: controller build failed; canary rollout disabled", "scaleset", entry.Name, "err", cerr)
+		canaryCtrl = nil
+	}
+	state.canaryPtr.Store(canaryCtrl)
+	defer state.canaryPtr.Store(nil)
+
+	st, err := store.New()
+	if err != nil {
+		return fmt.Errorf("init store: %w", err)
+	}
+
+	mgr, err := pool.NewManager(pool.Config{
+		HotSize:              cfg.Pool.HotSize,
+		WarmSize:             cfg.Pool.WarmSize,
+		MaxConcurrentRunners: entry.MaxConcurrentRunners,
+		ReconcileInterval:    cfg.Pool.ReconcileInterval.D(),
+		PowerPollInterval:    cfg.Pool.PowerPollInterval.D(),
+		VMMaxAge:             cfg.Pool.VMMaxAge.D(),
+		DrainTimeout:         cfg.Pool.DrainTimeout.D(),
+		BootMaxAttempts:      cfg.Pool.BootMaxAttempts,
+		Profiles:             profileSettingsForScaleset(entry, cfg),
+		Canary:               canaryCtrl,
+		ScaleSetName:         entry.Name,
+		VMNamePrefix:         state.vmPrefix,
+		VMIDRange:            entryVMIDRange(entry, cfg.Proxmox.VMIDRange),
+		LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
+		TemplateNode:         state.prov.TemplateNode(),
+		VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
+		OnRunnerOrphaned:     ghClient.RemoveRunner,
+		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
+	}, st, state.prov, sel, log, metrics)
+	if err != nil {
+		return fmt.Errorf("init pool: %w", err)
+	}
+
+	if err := mgr.Adopt(leaderCtx); err != nil {
+		log.Warn("adopt: list-owned-vms failed; starting with empty pool", "scaleset", entry.Name, "err", err)
+	}
+	health.MarkScalesetRecoveryDone(entry.Name)
+	health.MarkProxmoxOK()
+
+	state.poolPtr.Store(&mgr)
+	defer state.poolPtr.Store(nil)
+
+	sc := scaler.New(scaler.Config{
+		ScaleSetID:   rss.ID,
+		ScaleSetName: entry.Name,
+		WorkFolder:   "_work",
+		NamePrefix:   state.vmPrefix,
+	}, ghClient, mgr, state.prov, log, metrics)
+
+	if r, err := routerForScaleset(entry); err != nil {
+		log.Warn("router: build failed; routing observations disabled", "scaleset", entry.Name, "err", err)
+	} else {
+		sc.SetRouter(r)
+	}
+	if q, err := quotasResolverFromConfig(cfg); err != nil {
+		log.Warn("quotas: resolver build failed; quotas observation disabled", "scaleset", entry.Name, "err", err)
+	} else {
+		sc.SetQuotas(q)
+		sc.SetQuotaCounter(st)
+	}
+	if pm, err := priorityMatcherFromConfig(cfg); err != nil {
+		log.Warn("priority: matcher build failed; priority observation disabled", "scaleset", entry.Name, "err", err)
+	} else {
+		sc.SetPriority(pm)
+	}
+
+	owner := scope.Org
+	if owner == "" {
+		idx := strings.IndexByte(scope.Repo, '/')
+		if idx <= 0 {
+			return fmt.Errorf("scalesets[%q].scope.repo %q is not in owner/repo form (validation should have caught this)",
+				entry.Name, scope.Repo)
+		}
+		owner = scope.Repo[:idx]
+	}
+	sessionClient, err := ghClient.MessageSessionClient(leaderCtx, rss.ID, owner)
+	if err != nil {
+		return fmt.Errorf("open message session: %w", err)
+	}
+
+	lst, err := listener.New(sessionClient, listener.Config{
+		ScaleSetID: rss.ID,
+		MaxRunners: entry.MaxConcurrentRunners,
+		Logger:     log,
+	})
+	if err != nil {
+		return fmt.Errorf("build listener: %w", err)
+	}
+
+	rec, err := gh.New(gh.Config{
+		Scope:                scope,
+		ScaleSetName:         entry.Name,
+		PollInterval:         cfg.GitHub.PollInterval.D(),
+		AssignedGrace:        cfg.GitHub.AssignedGrace.D(),
+		RunningIdleGrace:     cfg.GitHub.RunningIdleGrace.D(),
+		AssignedOfflineGrace: cfg.GitHub.AssignedOfflineGrace.D(),
+		OrphanGrace:          cfg.Pool.OrphanGrace.D(),
+		RunnerNamePrefix:     state.vmPrefix,
+	}, restCli, mgr, state.prov, log, metrics)
+	if err != nil {
+		return fmt.Errorf("build gh reconciler: %w", err)
+	}
+
+	schedRunner, serr := scheduleRunnerForScaleset(entry, cfg.Pool, mgr, log, metrics)
+	if serr != nil {
+		log.Warn("schedule: runner build failed; schedules disabled", "scaleset", entry.Name, "err", serr)
+	}
+
+	g, ctxg := errgroup.WithContext(leaderCtx)
+	g.Go(func() error { return mgr.Run(ctxg) })
+	if schedRunner != nil {
+		g.Go(func() error {
+			err := schedRunner.Run(ctxg)
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		})
+	}
+	g.Go(func() error {
+		err := rec.Run(ctxg)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	})
+	g.Go(func() error {
+		health.MarkScalesetListenerConnected(entry.Name)
+		err := lst.Run(ctxg, sc)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	})
+	return g.Wait()
+}
+
+// registerScalesetAccessors wires the admin API's namespaced
+// `/admin/{scaleset}/...` routes to each scaleset's pool / canary
+// pointer (issue #1). Closures capture each state pointer by
+// reference, not by value, so reads happen at request time and
+// reflect the current leader-election state. Standby replicas
+// expose nil pointers; the admin handlers translate that into the
+// "not leader; forward" path.
+func registerScalesetAccessors(admin *adminapi.Server, scStates map[string]*scalesetState, entries []config.ScaleSetEntry) {
+	for _, s := range entries {
+		state := scStates[s.Name]
+		admin.SetScalesetPool(s.Name, func() pool.Manager {
+			p := state.poolPtr.Load()
+			if p == nil {
+				return nil
+			}
+			return *p
+		})
+		admin.SetScalesetCanary(s.Name, adminapi.CanaryAccessor(func() adminapi.CanaryPromoter {
+			c := state.canaryPtr.Load()
+			if c == nil {
+				return nil
+			}
+			return c
+		}))
+	}
 }
 
 // superviseScaleset wraps one per-scaleset worker so a panic or
