@@ -198,6 +198,8 @@ github.com/luthermonson/go-proxmox v0.5.1 h1:MO/Ir+daqtHh8XyRTcwbIwOe/FfPZev8uxh
 github.com/luthermonson/go-proxmox v0.5.1/go.mod h1:Q6ByFv9Zak9NvJwZJ36HMN5qwIZVj0isxf8u4YIk6lE=
 github.com/luthermonson/go-proxmox v0.6.0 h1:VWvQKUCxIOnxcy1cHd7jlL83OlTEBRnX2pG/YiKC/+8=
 github.com/luthermonson/go-proxmox v0.6.0/go.mod h1:Q6ByFv9Zak9NvJwZJ36HMN5qwIZVj0isxf8u4YIk6lE=
+github.com/luthermonson/go-proxmox v0.7.0 h1:ZHnmrI7Wm2BSCo2nTW4ZbxCcQO6iT2l7FCrOmZUOaao=
+github.com/luthermonson/go-proxmox v0.7.0/go.mod h1:Q6ByFv9Zak9NvJwZJ36HMN5qwIZVj0isxf8u4YIk6lE=
 github.com/magefile/mage v1.17.2 h1:fyXVu1eadI8Ap1HCCNgEhJ5McIWiYhLR8uol64ZZc40=
 github.com/magefile/mage v1.17.2/go.mod h1:Yj51kqllmsgFpvvSzgrZPK9WtluG3kUhFaBUVLo4feA=
 github.com/mattn/go-colorable v0.1.9/go.mod h1:u6P/XSegPjTcexA+o6vUJrdnUu04hMope9wVRipJSqc=
