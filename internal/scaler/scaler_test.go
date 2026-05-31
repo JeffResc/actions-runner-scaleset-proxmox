@@ -1298,3 +1298,111 @@ func TestPriorityMatcher_ConcurrentClassifyIsSafe(t *testing.T) {
 	gate.Done()
 	wg.Wait()
 }
+
+// TestMetricCardinality_UnroutedJobsBoundedByBucketCount locks
+// in #290: unrouted_jobs_total carries a free-form "labels"
+// dimension (user-supplied workflow labels) that must NOT grow
+// unbounded under attacker- or operator-controlled label
+// diversity. The orchestrator hashes labels into N=64 buckets so
+// the metric's cardinality is capped at scalesets * N regardless
+// of input. Without this cap, Prometheus would drop the entire
+// scrape past ~10k series — monitoring goes dark exactly when
+// the orchestrator is under stress.
+//
+// Drives 5000 unique label sets through the unrouted-recording
+// path and asserts the resulting series count stays at-most-N.
+func TestMetricCardinality_UnroutedJobsBoundedByBucketCount(t *testing.T) {
+	t.Parallel()
+	s, metrics := scalerWithRouter(t, []router.Profile{
+		{Name: "linux-x64", Labels: []string{"self-hosted", "linux", "x64"}},
+	})
+	for i := 0; i < 5000; i++ {
+		require.NoError(t, s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+			JobMessageBase: scaleset.JobMessageBase{
+				RequestLabels: []string{
+					"self-hosted",
+					fmt.Sprintf("dim-a-%d", i),
+					fmt.Sprintf("dim-b-%d", i%97),
+				},
+			},
+			RunnerName: fmt.Sprintf("gh-runner-test-%d", 10000+i),
+			RunnerID:   i + 1,
+		}))
+	}
+	count := testutil.CollectAndCount(metrics.UnroutedJobs)
+	require.LessOrEqual(t, count, unroutedLabelsBucketCount,
+		"unrouted_jobs_total cardinality must stay ≤ %d; saw %d distinct series after 5000 unique label sets (issue #290)",
+		unroutedLabelsBucketCount, count)
+}
+
+// TestMetricCardinality_QuotaThrottledLabelsBoundedByMatcher
+// locks in #290 for the quota path: the (scope, name) label
+// pair on quota_throttled_total reflects matcher-resolved
+// scopes, not raw job-supplied (org, repo) tuples. Even when
+// thousands of jobs from disjoint repos arrive against a single
+// per-repo default rule, the emitted series count stays bounded
+// by the number of distinct resolved matches, not the input
+// cardinality.
+//
+// With DefaultPerRepo=1 and a stub counter that always reports
+// "over cap" for any input repo, the metric records one series
+// per (repo) actually observed — bounded here by the test's
+// loop, but the load-bearing invariant is that the recording is
+// gated on the matcher's resolve, NOT on freeform label space.
+func TestMetricCardinality_QuotaThrottledLabelsBoundedByMatcher(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 1})
+	require.NoError(t, err)
+	s.SetQuotas(qr)
+	// Counter reports a single fixed repo over cap, so only ONE
+	// resolved (scope=repo, name=shared-org/repo-0) series can be
+	// emitted regardless of how many distinct jobs we drive.
+	s.SetQuotaCounter(&stubQuotaCounter{
+		repoCounts: map[string]int{"shared-org/repo-0": 99},
+	})
+
+	for i := 0; i < 200; i++ {
+		require.NoError(t, s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+			JobMessageBase: scaleset.JobMessageBase{
+				OwnerName:      "shared-org",
+				RepositoryName: fmt.Sprintf("repo-%d", i),
+			},
+			RunnerName: fmt.Sprintf("gh-runner-test-%d", 20000+i),
+			RunnerID:   10000 + i,
+		}))
+	}
+	count := testutil.CollectAndCount(metrics.QuotaThrottled)
+	require.LessOrEqual(t, count, 1,
+		"quota_throttled_total series must reflect matcher-resolved scopes, not raw job (org,repo) tuples; saw %d series after 200 distinct repos (issue #290)",
+		count)
+}
+
+// TestMetricCardinality_EmptyOrgNonEmptyRepoDoesNotCrash locks
+// in #290 paragraph 2: metric emission must tolerate mismatched
+// row metadata. The classify path produces (org, repo) where
+// repo = OwnerName + "/" + RepositoryName only when OwnerName
+// is non-empty. A regression that emitted an empty-org series
+// with a non-empty repo (or vice versa) could break the
+// exporter's "labels are populated consistently" invariant
+// when paired with future per-job recording.
+func TestMetricCardinality_EmptyOrgNonEmptyRepoDoesNotCrash(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	for _, evt := range []*scaleset.JobStarted{
+		{JobMessageBase: scaleset.JobMessageBase{OwnerName: "", RepositoryName: "lonely-repo"}, RunnerName: "gh-runner-test-10001", RunnerID: 1},
+		{JobMessageBase: scaleset.JobMessageBase{OwnerName: "", RepositoryName: ""}, RunnerName: "gh-runner-test-10002", RunnerID: 2},
+		{JobMessageBase: scaleset.JobMessageBase{OwnerName: "org-only", RepositoryName: ""}, RunnerName: "gh-runner-test-10003", RunnerID: 3},
+	} {
+		evt := evt
+		require.NotPanics(t, func() {
+			_ = s.HandleJobStarted(context.Background(), evt)
+		}, "missing or empty (org, repo) fields must NOT panic the metric exporter (issue #290)")
+	}
+}
