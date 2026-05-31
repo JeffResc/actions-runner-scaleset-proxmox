@@ -308,6 +308,73 @@ func TestRaftCoord_Run_OnDeposedFiresOnLeadershipLoss(t *testing.T) {
 	}
 }
 
+// TestRaftCoord_OnDeposed_CancelsLeaderOnlyContext pins the
+// OnDeposed → control-plane halt contract from #282: leader-only
+// work spawned inside OnElected MUST receive ctx cancellation when
+// leadership is lost. Without this, a deposed replica's pool
+// manager / admin plane / reconciler could keep firing leader-only
+// writes while a new leader is also driving them — the canonical
+// split-brain double-provisioning hazard HA mode is supposed to
+// prevent. Single-node here so the deposal is deterministic (ctx
+// cancel forces shutdown); the 3-node split-brain race is
+// inherently flaky to drive at unit scope and lives in the e2e
+// scenarios.
+func TestRaftCoord_OnDeposed_CancelsLeaderOnlyContext(t *testing.T) {
+	t.Parallel()
+
+	type workerState struct {
+		started, stopped bool
+		exitErr          error
+	}
+	var (
+		mu    sync.Mutex
+		ws    workerState
+		dCh   = make(chan struct{}, 1)
+		eGate = make(chan struct{})
+	)
+	cb := Callbacks{
+		OnElected: func(leaderCtx context.Context) {
+			mu.Lock()
+			ws.started = true
+			mu.Unlock()
+			close(eGate)
+			// Stand in for a real leader-only worker (pool manager,
+			// reconciler, etc.). Block on leaderCtx so the test can
+			// observe whether deposal actually propagates cancellation.
+			<-leaderCtx.Done()
+			mu.Lock()
+			ws.stopped = true
+			ws.exitErr = leaderCtx.Err()
+			mu.Unlock()
+		},
+		OnDeposed: func() {
+			select {
+			case dCh <- struct{}{}:
+			default:
+			}
+		},
+	}
+	c := newSingleNodeCoord(t, cb)
+	cancel, wg := runUntilLeader(t, c)
+
+	// OnElected must have fired once leadership is established.
+	select {
+	case <-eGate:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnElected never fired after single-node bootstrap")
+	}
+
+	cancel()
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.True(t, ws.started, "OnElected worker must have started")
+	require.True(t, ws.stopped, "leader-only worker must observe ctx-cancel on deposal — otherwise split-brain double-provisioning is possible (issue #282)")
+	require.ErrorIs(t, ws.exitErr, context.Canceled,
+		"leaderCtx must surface context.Canceled, not deadline / other — the deposal seam is canonical ctx-cancel")
+}
+
 func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
