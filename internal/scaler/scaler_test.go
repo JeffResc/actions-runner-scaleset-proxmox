@@ -1095,9 +1095,9 @@ func TestHandleJob_MalformedRunnerNameSurfacesAsLogNotError(t *testing.T) {
 	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, pool, stubProvForScaler{}, log, metrics)
 
 	for _, runner := range []string{
-		"",                  // empty
-		"unrelated-runner",  // wrong prefix
-		"gh-runner-test-",   // prefix only, no vmid
+		"",                 // empty
+		"unrelated-runner", // wrong prefix
+		"gh-runner-test-",  // prefix only, no vmid
 		"gh-runner-test-NaN",
 	} {
 		require.NoError(t, s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
