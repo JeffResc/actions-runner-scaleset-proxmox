@@ -37,6 +37,7 @@ import (
 // (e.g. an iterator bug in classifyAdoption, or a counter race
 // on a shared seq under concurrent Adopt classification).
 func TestE2E_ClusterLeaderLossMidConcurrentJobs(t *testing.T) {
+	t.Parallel()
 	const jobs = 3
 
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})

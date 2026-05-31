@@ -186,6 +186,17 @@ func NewRaftCluster(t testing.TB, adminAddrs []string) *RaftCluster {
 // then returns the Harness. t.Cleanup unwinds everything; tests do
 // not need to call Stop explicitly unless they want to inspect the
 // post-shutdown state.
+// Shared fake credentials for the e2e orchestrator. They are identical
+// across every scenario and are set once, process-wide, in TestMain
+// (see main_test.go) rather than per-test. Avoiding a per-test
+// t.Setenv is what lets each scenario call t.Parallel(): Go's testing
+// package panics if a test that called Setenv also goes parallel.
+const (
+	ghToken            = "ghp_fake"
+	proxmoxTokenSecret = "fake-proxmox-secret"
+	adminSecret        = "fake-admin-secret"
+)
+
 func Start(t testing.TB, opts Options) *Harness {
 	t.Helper()
 	multi := len(opts.Scalesets) > 0
@@ -231,13 +242,6 @@ func Start(t testing.TB, opts Options) *Harness {
 		obsAddr = pickAddr(t)
 		adminAddr = pickAddr(t)
 	}
-
-	const adminSecret = "fake-admin-secret"
-	const proxmoxTokenSecret = "fake-proxmox-secret"
-	const ghToken = "ghp_fake"
-	t.Setenv("SCALESET_GITHUB_PAT_TOKEN", ghToken)
-	t.Setenv("SCALESET_PROXMOX_AUTH_TOKEN_SECRET", proxmoxTokenSecret)
-	t.Setenv("SCALESET_ADMIN_API_SHARED_SECRET", adminSecret)
 
 	cv := configValues{
 		ProxmoxURL:           proxmox.URL,

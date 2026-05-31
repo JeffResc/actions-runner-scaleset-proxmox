@@ -21,6 +21,7 @@ import (
 // inspects the live /metrics endpoint to confirm the system reached
 // its steady state.
 func TestE2E_WarmPoolFills(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{
 		HotSize:              2,
 		WarmSize:             0,
@@ -73,6 +74,7 @@ func TestE2E_WarmPoolFills(t *testing.T) {
 // cleanly. The harness's Stop is wired to ctx-cancel; here we exercise
 // the operator path that hits the HTTP endpoint instead.
 func TestE2E_Drain(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{HotSize: 1, MaxConcurrentRunners: 2})
 
 	// Wait for the hot pool to fill so drain has actual work.

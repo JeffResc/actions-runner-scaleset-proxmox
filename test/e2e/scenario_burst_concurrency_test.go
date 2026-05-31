@@ -28,6 +28,7 @@ import (
 // regressed) would only surface in production once the queue
 // depth exceeded the existing test's tiny N=3.
 func TestE2E_SustainedHighConcurrency(t *testing.T) {
+	t.Parallel()
 	const (
 		jobs          = 12
 		maxConcurrent = 15

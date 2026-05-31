@@ -32,6 +32,7 @@ import (
 //   - Per-scaleset metric labels: scaleset_pool_size{scaleset=X}
 //     vs {scaleset=Y} must be independent counts, not sums.
 func TestE2E_TwoScalesetsBootSideBySide(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{
 		Scalesets: []ScalesetSpec{
 			{
@@ -107,6 +108,7 @@ func TestE2E_TwoScalesetsBootSideBySide(t *testing.T) {
 // distinguishable — a regression where both endpoints hit the same
 // underlying pool would show identical Hot counts.
 func TestE2E_TwoScalesets_NamespacedAdminRoutesIsolate(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{
 		Scalesets: []ScalesetSpec{
 			{Name: "alpha", Org: "org-alpha", HotSize: 3, MaxConcurrentRunners: 4},
