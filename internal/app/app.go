@@ -51,10 +51,6 @@ type Options struct {
 	// ConfigPath is the YAML config file path. Required.
 	ConfigPath string
 
-	// DryRun, when true, wraps the Proxmox provisioner with a logger that
-	// short-circuits destructive operations. Mirrors `--dry-run`.
-	DryRun bool
-
 	// Version is the build version (passed through to log lines and
 	// tracer service.version). Empty string is acceptable.
 	Version string
@@ -93,7 +89,7 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	slog.SetDefault(log)
-	log.Info("scaleset starting", "version", opts.Version, "config", opts.ConfigPath, "dry_run", opts.DryRun,
+	log.Info("scaleset starting", "version", opts.Version, "config", opts.ConfigPath,
 		"scalesets", len(cfg.Scalesets))
 
 	// Warn about SCALESET_*-prefixed env vars that look like overrides
@@ -147,13 +143,7 @@ func Run(ctx context.Context, opts Options) error {
 		if err != nil {
 			return fmt.Errorf("init provisioner for scaleset %q: %w", s.Name, err)
 		}
-		if opts.DryRun {
-			prov = provisioner.NewDryRun(prov, log)
-		}
 		scStates[s.Name] = &scalesetState{name: s.Name, prov: prov, vmPrefix: vmPrefix}
-	}
-	if opts.DryRun {
-		log.Info("dry-run mode active: destructive Proxmox operations will be logged, not executed")
 	}
 
 	// Pick any scaleset's provisioner for the shared

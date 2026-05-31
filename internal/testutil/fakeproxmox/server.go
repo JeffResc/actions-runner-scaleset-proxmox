@@ -25,7 +25,6 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -67,17 +66,6 @@ type Server struct {
 	*httptest.Server
 	store *store
 	opts  Options
-
-	writeMu    sync.Mutex
-	writeCalls []writeCall
-}
-
-// writeCall captures one observed write-method request. Used by
-// tests (notably the dry-run e2e) to assert the orchestrator made
-// no state-changing API calls.
-type writeCall struct {
-	Method string
-	Path   string
 }
 
 // New starts a fake Proxmox API server. The caller is responsible for
@@ -137,21 +125,6 @@ func (s *Server) SeedVM(node string, vmid int, name string, running bool, tags [
 // fake's state. Tests use it to assert on the orchestrator's effects.
 func (s *Server) Snapshot() []VMSnapshot { return s.store.snapshot() }
 
-// WriteCalls returns the list of state-changing API calls
-// (POST/PUT/PATCH/DELETE) the orchestrator made against this
-// server, in order. Used by dry-run scenarios to prove no
-// destructive operations leaked. Read-method calls (GET) are
-// not tracked.
-func (s *Server) WriteCalls() []string {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	out := make([]string, len(s.writeCalls))
-	for i, c := range s.writeCalls {
-		out[i] = c.Method + " " + c.Path
-	}
-	return out
-}
-
 // PowerOff flips a VM's Running flag to false, bypassing the qm stop
 // HTTP path. Used by e2e scenarios that want to model "the in-VM
 // runner finished and powered itself off" without faking a complete
@@ -183,21 +156,6 @@ func (s *Server) routes() http.Handler {
 			req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api2/json")
 			if req.URL.Path == "" {
 				req.URL.Path = "/"
-			}
-			next.ServeHTTP(w, req)
-		})
-	})
-	// Record every write-method call so dry-run scenarios can
-	// assert no state-changing API requests leaked. Read-method
-	// calls (GET / template discovery / list-owned) still pass
-	// through normally and aren't tracked here.
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			switch req.Method {
-			case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
-				s.writeMu.Lock()
-				s.writeCalls = append(s.writeCalls, writeCall{Method: req.Method, Path: req.URL.Path})
-				s.writeMu.Unlock()
 			}
 			next.ServeHTTP(w, req)
 		})

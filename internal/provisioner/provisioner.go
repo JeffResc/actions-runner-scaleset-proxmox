@@ -145,8 +145,8 @@ type CloneNIC struct {
 }
 
 // Provisioner is the contract the rest of the orchestrator uses to talk to
-// Proxmox. The proxmox-backed implementation is the default; a dry-run
-// implementation (see [NewDryRun]) is selected by the `--dry-run` flag.
+// Proxmox. The proxmox-backed implementation (see [New]) is the only
+// implementation in production.
 type Provisioner interface {
 	Clone(ctx context.Context, opts CloneOptions) (*VM, error)
 	Start(ctx context.Context, vm *VM) error

@@ -3,7 +3,7 @@
 //
 // Subcommands:
 //
-//	scaleset run [--config=path] [--dry-run]
+//	scaleset run [--config=path]
 //	scaleset version
 package main
 
@@ -30,10 +30,7 @@ func main() {
 		SilenceUsage:  true,
 	}
 
-	var (
-		configPath string
-		dryRun     bool
-	)
+	var configPath string
 
 	runCmd := &cobra.Command{
 		Use:   "run",
@@ -43,13 +40,11 @@ func main() {
 			defer cancel()
 			return app.Run(ctx, app.Options{
 				ConfigPath: configPath,
-				DryRun:     dryRun,
 				Version:    version,
 			})
 		},
 	}
 	runCmd.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config YAML.")
-	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Log intended Proxmox actions without executing them.")
 
 	versionCmd := &cobra.Command{
 		Use:   "version",
