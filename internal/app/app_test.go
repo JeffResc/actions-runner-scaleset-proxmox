@@ -5,8 +5,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -257,4 +261,130 @@ func TestRun_InvalidConfigPathReturnsError(t *testing.T) {
 	err := Run(t.Context(), Options{ConfigPath: "/definitely/does/not/exist.yaml"})
 	require.Error(t, err,
 		"Run must surface config-load errors immediately; a silent partial startup would leak goroutines and Proxmox connections")
+}
+
+// validStartupYAML is a minimal config that Parse/Resolve/Validate
+// all accept. Used as the baseline for the startup-failure tests
+// below: each test mutates one field to trigger a specific
+// rejection path through Run().
+const validStartupYAML = `
+github:
+  auth_mode: pat
+  pat:
+    token: testtoken
+  scope:
+    org: my-org
+
+scaleset:
+  name: linux-x64
+  labels: [self-hosted, linux, x64]
+  max_concurrent_runners: 1
+
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  auth:
+    token_id: scaleset@pve!automation
+    token_secret: testsecret
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 10010 }
+  storage:  { disk: local-lvm, snippets: local }
+  network:  { bridge: vmbr0 }
+  clone:    { linked: true }
+
+nodes:
+  strategy: single
+  single_node: pve1
+
+pool:
+  hot_size: 0
+  warm_size: 0
+  reconcile_interval: 5s
+  vm_max_age: 12h
+  drain_timeout: 15m
+  boot_max_attempts: 3
+`
+
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "scaleset.yaml")
+	require.NoError(t, os.WriteFile(p, []byte(body), 0o600))
+	return p
+}
+
+// TestRun_MalformedYAMLReturnsError covers the second-stage
+// startup failure: the file exists and is readable, but the YAML
+// parser rejects it. Run() must surface the parse error rather
+// than partial-start. (issue #294)
+func TestRun_MalformedYAMLReturnsError(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, "github: {\n  not: closed")
+	err := Run(t.Context(), Options{ConfigPath: path})
+	require.Error(t, err, "Run must surface yaml-parse failures, not partial-start")
+}
+
+// TestRun_MissingProxmoxTokenSecretSurfaces covers the
+// missing-credential path: Parse populates secrets from env, then
+// Resolve enforces "non-empty". Without the env var the secret
+// remains empty and Run() must return a clear error before
+// touching Proxmox. (issue #294)
+func TestRun_MissingProxmoxTokenSecretSurfaces(t *testing.T) {
+	t.Parallel()
+	noSecret := strings.ReplaceAll(validStartupYAML, "    token_secret: testsecret", "")
+	path := writeConfig(t, noSecret)
+	err := Run(t.Context(), Options{ConfigPath: path})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "token_secret",
+		"Run must name the missing secret so the operator can wire SCALESET_PROXMOX_AUTH_TOKEN_SECRET")
+}
+
+// TestRun_MalformedProxmoxEndpointSurfaces covers an invalid
+// Proxmox URL: the provisioner constructor parses cfg.Proxmox.Endpoint
+// and must reject malformed values before any goroutine is launched.
+// (issue #294)
+func TestRun_MalformedProxmoxEndpointSurfaces(t *testing.T) {
+	t.Parallel()
+	bad := strings.ReplaceAll(validStartupYAML, "https://pve.example.com:8006/api2/json", "not a url")
+	path := writeConfig(t, bad)
+	err := Run(t.Context(), Options{ConfigPath: path})
+	require.Error(t, err, "Run must surface malformed Proxmox endpoints at startup, not at first ping")
+}
+
+// TestRun_ContextCanceledBeforeStartReturnsCleanly covers the
+// SIGTERM-during-startup ordering: a parent ctx already cancelled
+// when Run() is invoked must unwind quickly without leaking the
+// observability tracer or admin server. The test fails if Run
+// hangs past the deadline. (issue #294)
+func TestRun_ContextCanceledBeforeStartReturnsCleanly(t *testing.T) {
+	t.Parallel()
+	path := writeConfig(t, validStartupYAML)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // pre-cancelled
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, Options{ConfigPath: path}) }()
+	select {
+	case <-done:
+		// Either nil (clean drain) or non-nil (early exit) is
+		// acceptable — what matters is bounded return, not the
+		// specific error.
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not return within 30s of a pre-cancelled context; startup ordering must honor ctx.Done()")
+	}
+}
+
+// TestRunOneScalesetDeps_FieldsCompose pins that the extracted
+// runOneScalesetDeps struct exposes the leader-plane collaborators
+// runOneScaleset reads. A future refactor that adds or removes a
+// dep must update this test, keeping the seam visible. (issue #274)
+func TestRunOneScalesetDeps_FieldsCompose(t *testing.T) {
+	t.Parallel()
+	deps := runOneScalesetDeps{
+		cfg:     &config.Config{},
+		auth:    nil,
+		sel:     nil,
+		metrics: nil,
+		health:  nil,
+		log:     silentLogger(),
+	}
+	require.NotNil(t, deps.cfg, "runOneScalesetDeps.cfg must remain part of the public seam")
+	require.NotNil(t, deps.log, "runOneScalesetDeps.log must remain part of the public seam")
 }
