@@ -52,3 +52,68 @@ func TestE2E_DryRunMakesNoRealClones(t *testing.T) {
 	require.Equal(t, 200, resp.StatusCode,
 		"dry-run is a runtime concern; /readyz should still be green")
 }
+
+// TestE2E_DryRunNoStateChangingProxmoxCalls is the stricter
+// end-to-end safety property called out by #295: the existing
+// snapshot check proves no VMs materialised, but does not prove
+// the orchestrator made no state-changing API calls at all.
+// A regression that bypassed the dry-run wrapper for, say, a
+// PUT /config (tag stamping) or DELETE (destroy reconcile)
+// would not surface in Snapshot() if the fake rejected the call
+// — but the operator who reads /metrics would still see
+// scaleset_proxmox_api_errors_total tick.
+//
+// This test asserts the absence at the wire level: zero
+// POST/PUT/PATCH/DELETE calls reached the fake during a full
+// reconcile window. Read-method calls (Ping, ListNodes,
+// ListVMs) still pass through as the production code requires
+// for /readyz.
+func TestE2E_DryRunNoStateChangingProxmoxCalls(t *testing.T) {
+	h := Start(t, Options{
+		HotSize:              2,
+		MaxConcurrentRunners: 4,
+		DryRun:               true,
+	})
+
+	// Let the reconciler tick a few times so any leaked write
+	// calls would have fired.
+	time.Sleep(1500 * time.Millisecond)
+
+	writes := h.Proxmox.WriteCalls()
+	require.Empty(t, writes,
+		"dry-run must not leak state-changing API calls; observed: %v", writes)
+}
+
+// TestE2E_DryRunOrchestrationStillRuns locks in the orchestration-
+// logic-still-runs side of #295: dry-run is about Proxmox-side
+// safety, NOT disabling pool reconcile. The pool manager's
+// reconcile loop must still fire so an operator can rehearse a
+// new config without committing real side effects. A regression
+// that gated reconcile execution behind "real provisioner" would
+// make dry-run useless for its primary purpose.
+//
+// scaleset_reconcile_duration_seconds is a histogram whose
+// count tick is observable as the metric base name with a _count
+// suffix in the /metrics scrape. We assert >= 1 reconcile pass
+// has been recorded — proof the loop ran, regardless of whether
+// any individual Clone synthetic succeeded downstream.
+func TestE2E_DryRunOrchestrationStillRuns(t *testing.T) {
+	h := Start(t, Options{
+		HotSize:              2,
+		MaxConcurrentRunners: 4,
+		DryRun:               true,
+	})
+
+	require.Eventually(t, func() bool {
+		// Reconcile histogram count is the canonical "loop ran"
+		// signal — no other emission depends on Proxmox state.
+		return h.MetricValue(t, "scaleset_reconcile_duration_seconds_count") >= 1
+	}, 10*time.Second, 200*time.Millisecond,
+		"dry-run reconcile loop must still run — the wrapper short-circuits Proxmox writes but does NOT disable orchestration logic (issue #295)")
+}
+
+// Log-tagging coverage for the [dry-run] log lines lives in the
+// internal/provisioner package (dryrun unit tests). Exercising
+// it end-to-end requires injecting a captureable slog handler
+// into app.Run, which the orchestrator doesn't expose today —
+// adding that seam is a separate refactor.
