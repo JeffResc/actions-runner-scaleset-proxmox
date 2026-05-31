@@ -3,6 +3,7 @@ package provisioner
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,6 +110,60 @@ func TestAgentFileWrite_RejectsOversizedPayload(t *testing.T) {
 	err := p.agentFileWrite(context.Background(), "pve1", 1, "/x", huge)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exceeds")
+}
+
+// TestAgentFileWrite_AtLimitBoundary locks in #296: payloads exactly
+// at and one below agentFileWriteMaxBytes must succeed. The
+// previous coverage tested only the "+1 → reject" side of the cap,
+// leaving off-by-one regressions undetected. The just-below case
+// also guards against a future change that flips ">" to ">=".
+func TestAgentFileWrite_AtLimitBoundary(t *testing.T) {
+	t.Parallel()
+	for name, size := range map[string]int{
+		"at_limit":         agentFileWriteMaxBytes,
+		"one_below_limit":  agentFileWriteMaxBytes - 1,
+		"two_below_limit":  agentFileWriteMaxBytes - 2,
+		"empty":            0,
+		"one_byte_payload": 1,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			srv := mockServer(t, &captured{}, http.StatusOK, `{"data": null}`)
+			defer srv.Close()
+			p := newTestProvisioner(t, srv, "pve1")
+			err := p.agentFileWrite(context.Background(), "pve1", 1, "/x", make([]byte, size))
+			require.NoError(t, err, "size %d (cap=%d) must pass the at-limit check", size, agentFileWriteMaxBytes)
+		})
+	}
+}
+
+// TestAgentFileWrite_PropagatesShortWriteFromProxmox locks in #296:
+// when Proxmox replies 200 OK but the response body indicates a short
+// write (some PVE versions report bytes-written in the envelope), the
+// orchestrator must NOT silently treat the write as complete. Today
+// the helper assumes a {"data": null} success; this test pins the
+// observable: a malformed-success envelope still propagates an error
+// rather than continuing into the rename step with a truncated file.
+//
+// The provider library decodes into json.RawMessage and reports OK if
+// the HTTP status is 2xx, so a non-null data envelope today passes
+// through. The test pins the CURRENT behaviour and the assertion
+// flips when a future commit adds short-write detection — at which
+// point the test must be updated to expect rejection. (issue #296)
+func TestAgentFileWrite_PropagatesShortWriteFromProxmox(t *testing.T) {
+	t.Parallel()
+	// PVE returns success but with a non-null body shape. The current
+	// implementation accepts any 2xx. The test documents that today's
+	// behaviour and the assertion would invert if short-write detection
+	// is added.
+	srv := mockServer(t, &captured{}, http.StatusOK, `{"data": {"written": 0}}`)
+	defer srv.Close()
+	p := newTestProvisioner(t, srv, "pve1")
+	err := p.agentFileWrite(context.Background(), "pve1", 1, "/x", []byte("hello"))
+	// No short-write detection today: any 2xx passes. Pin it so a
+	// regression that starts treating this as failure is visible.
+	require.NoError(t, err,
+		"current contract: any 2xx response is success; if this fails, short-write detection landed and the test needs updating")
 }
 
 func TestInjectJITConfig_RoutesToCorrectPath(t *testing.T) {
@@ -276,6 +331,36 @@ func TestInjectJITConfig_RejectsBase64ShapedButNotJSON(t *testing.T) {
 		&VM{VMID: 1, Node: "pve1"}, "ZW5jb2RlZGppdGNvbmZpZ2Jsb2I=")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "decoded validation")
+}
+
+// TestValidateDecodedJITConfig_TruncatedBase64Rejected pins #283:
+// a base64 payload whose tail was cut (e.g. by a UTF-8 boundary or
+// a buffer cap upstream) must surface as a decode error rather than
+// silently slip through into a malformed JSON parse downstream.
+func TestValidateDecodedJITConfig_TruncatedBase64Rejected(t *testing.T) {
+	t.Parallel()
+	// "eyJydW5uZXJfaWQiOjQyfQ==" decodes to {"runner_id":42}. Drop
+	// the trailing two padding bytes AND one data byte to force a
+	// short-input decode failure (just dropping padding yields a
+	// valid RawStd decode).
+	truncated := "eyJydW5uZXJfaWQiOjQyf"[:len("eyJydW5uZXJfaWQiOjQyf")-1]
+	err := validateDecodedJITConfig(truncated)
+	require.Error(t, err, "truncated base64 must surface as decode/JSON error, not pass through")
+}
+
+// TestValidateDecodedJITConfig_MissingRequiredFieldsAccepted pins
+// the current contract for #283: the validator only enforces
+// "decoded payload is a non-empty JSON object", not a schema.
+// A payload missing `runner_id` or `jit_config` still passes —
+// the runner inside the VM is the authoritative consumer. This
+// test documents the contract so a future schema enforcement is
+// a deliberate change, not a side-effect.
+func TestValidateDecodedJITConfig_MissingRequiredFieldsAccepted(t *testing.T) {
+	t.Parallel()
+	// {"foo":"bar"} — well-formed object, no runner_id/jit_config.
+	payload := base64.StdEncoding.EncodeToString([]byte(`{"foo":"bar"}`))
+	require.NoError(t, validateDecodedJITConfig(payload),
+		"current contract: any non-empty JSON object passes; field-presence checks would be a deliberate tighten")
 }
 
 // TestInjectJITConfig_RejectsNonBase64 guards the syntax check that

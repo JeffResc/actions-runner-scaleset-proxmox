@@ -1013,3 +1013,103 @@ func TestInjectWithRetry_HonorsCustomConfig(t *testing.T) {
 	require.GreaterOrEqual(t, prov.count, 2,
 		"at least one retry must have run before giving up; saw %d", prov.count)
 }
+
+// TestHandleJobCompleted_DuplicateDeliveryIsIdempotent locks in
+// the at-least-once delivery contract called out in #283: the
+// actions/scaleset listener can deliver the same JobCompleted
+// twice (network retry, session refresh). The scaler must
+// re-dispatch MarkCompleted but the second call must NOT cause
+// an error or a second destroy queue — pool.MarkCompleted's
+// state-machine guards (Draining → no-op) carry that contract,
+// and this test pins that the scaler doesn't break it by
+// returning an error on the duplicate.
+func TestHandleJobCompleted_DuplicateDeliveryIsIdempotent(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, pool, stubProvForScaler{}, log, metrics)
+
+	evt := &scaleset.JobCompleted{
+		JobMessageBase: scaleset.JobMessageBase{},
+		RunnerName:     "gh-runner-test-10042",
+		RunnerID:       42,
+	}
+	require.NoError(t, s.HandleJobCompleted(context.Background(), evt))
+	require.NoError(t, s.HandleJobCompleted(context.Background(), evt),
+		"duplicate JobCompleted (at-least-once retry) must surface as idempotent success — issue #283")
+
+	// fakePool records both calls so the assertion documents the
+	// dispatch surface; the actual idempotency guarantee lives in
+	// pool.MarkCompleted's state-transition matrix (pool tests).
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	require.Equal(t, []int{10042, 10042}, pool.markedCompleted,
+		"scaler must dispatch each delivery; idempotency is enforced downstream in pool.MarkCompleted")
+}
+
+// TestHandleJobCompleted_BeforeJobStartedDoesNotError locks in
+// the out-of-order-delivery tolerance called out in #283: GitHub's
+// at-least-once delivery can stream JobCompleted before
+// JobStarted (rare but observed under listener-session refresh).
+// The scaler must dispatch MarkCompleted on a row that is still
+// Assigned without erroring — pool.MarkCompleted handles the
+// Assigned → Draining transition directly.
+func TestHandleJobCompleted_BeforeJobStartedDoesNotError(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, pool, stubProvForScaler{}, log, metrics)
+
+	// JobCompleted first — no preceding JobStarted.
+	require.NoError(t, s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+		RunnerName: "gh-runner-test-10042",
+		RunnerID:   42,
+	}))
+	// JobStarted arrives after.
+	require.NoError(t, s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+		JobMessageBase: scaleset.JobMessageBase{},
+		RunnerName:     "gh-runner-test-10042",
+		RunnerID:       42,
+	}))
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	require.Equal(t, []int{10042}, pool.markedCompleted)
+	require.Len(t, pool.markedRunning, 1)
+}
+
+// TestHandleJob_MalformedRunnerNameSurfacesAsLogNotError locks in
+// the listener-contract surface for #283: a runner name that
+// doesn't match the orchestrator's NamePrefix (corrupt payload,
+// out-of-band registration) must not propagate as an error from
+// the handler — the listener treats handler errors as session
+// failures and reconnects, which would amplify the impact of a
+// single bad delivery into repeated reconnects.
+func TestHandleJob_MalformedRunnerNameSurfacesAsLogNotError(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, pool, stubProvForScaler{}, log, metrics)
+
+	for _, runner := range []string{
+		"",                 // empty
+		"unrelated-runner", // wrong prefix
+		"gh-runner-test-",  // prefix only, no vmid
+		"gh-runner-test-NaN",
+	} {
+		require.NoError(t, s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+			RunnerName: runner, RunnerID: 1,
+		}), "malformed RunnerName %q must NOT propagate as handler error — issue #283", runner)
+		require.NoError(t, s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{
+			RunnerName: runner, RunnerID: 1,
+		}), "malformed RunnerName %q must NOT propagate as handler error — issue #283", runner)
+	}
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	require.Empty(t, pool.markedRunning, "malformed runner name must not dispatch MarkRunning")
+	require.Empty(t, pool.markedCompleted, "malformed runner name must not dispatch MarkCompleted")
+}
