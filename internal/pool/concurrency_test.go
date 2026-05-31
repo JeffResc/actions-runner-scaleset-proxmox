@@ -2,7 +2,9 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -455,4 +457,270 @@ func TestDrain_ReleasesDestroySemTokensOnTimeout(t *testing.T) {
 	require.True(t, mgr.destroySem.TryAcquire(8),
 		"destroySem still holds tokens after drain — workers leaked their slots on the ctx-cancel path")
 	mgr.destroySem.Release(8)
+}
+
+// TestAcquire_NoDoubleAssignmentOnHeadOfQueueCollision pins
+// the canonical double-assignment hazard described in issue #285:
+// when N callers race to Acquire from a Hot pool containing
+// fewer rows than callers, AcquireHotInProfile's "count busy +
+// CAS to Assigned" must happen inside ONE write txn so no two
+// callers walk away with the same VMID. The previous stress
+// test seeded N random VMIDs and so did not target this collision
+// shape; this test seeds exactly K Hot rows and fires N >> K
+// concurrent Acquires to maximise head-of-queue contention.
+func TestAcquire_NoDoubleAssignmentOnHeadOfQueueCollision(t *testing.T) {
+	t.Parallel()
+	const (
+		hotSeeded  = 8
+		acquirers  = 200
+		maxRunners = hotSeeded // cap equals seeded count: every slot must land somewhere
+	)
+	st := newTestStore(t)
+	seedHot(t, st, hotSeeded)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		HotSize:              hotSeeded,
+		MaxConcurrentRunners: maxRunners,
+	})
+
+	var (
+		wg          sync.WaitGroup
+		startGate   sync.WaitGroup
+		mu          sync.Mutex
+		acquiredIDs = map[int]int64{} // VMID → JobID of the winning Acquire
+		duplicates  []int
+	)
+	startGate.Add(1)
+
+	for i := range acquirers {
+		wg.Add(1)
+		go func(jobID int64) {
+			defer wg.Done()
+			startGate.Wait()
+			got, err := mgr.Acquire(context.Background(), jobID, 0)
+			if err != nil {
+				return // ErrAtCapacity / ErrNoneAvailable both fine
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if prev, ok := acquiredIDs[got.VMID]; ok {
+				duplicates = append(duplicates, got.VMID)
+				t.Errorf("VMID %d double-assigned: jobs %d and %d", got.VMID, prev, jobID)
+			}
+			acquiredIDs[got.VMID] = jobID
+		}(int64(1000 + i))
+	}
+	startGate.Done()
+	wg.Wait()
+
+	require.Empty(t, duplicates, "no VMID may be assigned to more than one job (issue #285)")
+	require.LessOrEqual(t, len(acquiredIDs), hotSeeded,
+		"the number of Acquire winners must not exceed the seeded Hot count")
+}
+
+// TestAcquire_GlobalCapNeverOverCommitted pins the
+// "no over-commit under contention" invariant for the
+// AcquireHotInProfile cap check (issue #286). Seeds Hot rows
+// equal to MaxConcurrentRunners and fires N >> cap concurrent
+// Acquires — the busy-count + CAS must happen inside one write
+// txn so no burst lands more winners than the cap allows.
+func TestAcquire_GlobalCapNeverOverCommitted(t *testing.T) {
+	t.Parallel()
+	const (
+		hotSeeded  = 8
+		maxRunners = 8 // cap == seeded; every slot must land somewhere
+		acquirers  = 200
+	)
+	st := newTestStore(t)
+	seedHot(t, st, hotSeeded)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		HotSize:              hotSeeded,
+		MaxConcurrentRunners: maxRunners,
+	})
+
+	var (
+		wg        sync.WaitGroup
+		startGate sync.WaitGroup
+		winners   atomic.Int32
+	)
+	startGate.Add(1)
+
+	for i := range acquirers {
+		wg.Add(1)
+		go func(jobID int64) {
+			defer wg.Done()
+			startGate.Wait()
+			got, err := mgr.Acquire(context.Background(), jobID, 0)
+			if err == nil && got != nil {
+				winners.Add(1)
+			}
+		}(int64(2000 + i))
+	}
+	startGate.Done()
+	wg.Wait()
+
+	got := int(winners.Load())
+	require.Equal(t, maxRunners, got,
+		"AcquireHotInProfile must enforce the global cap inside one txn — over-commit under burst is the canonical memdb-isolation bug (issue #286)")
+}
+
+// TestAcquire_PerProfileCapNeverOverCommitted exercises the
+// per-profile branch of AcquireHotInProfile (the second
+// countBusy call): under burst contention, the per-profile
+// cap must hold even when the global cap is permissive.
+// Without the in-txn re-count, two callers' read-then-write
+// could each claim slot K+1 of a K-cap profile (issue #286).
+func TestAcquire_PerProfileCapNeverOverCommitted(t *testing.T) {
+	t.Parallel()
+	const (
+		seededPerProfile = 4
+		maxBusyProfile   = 4
+		acquirers        = 200
+	)
+	st := newTestStore(t)
+	// Seed the "gpu" profile with HotSize == maxBusy so the
+	// only ceiling under test is the per-profile cap.
+	const targetProfile = "gpu"
+	for i := range seededPerProfile {
+		require.NoError(t, st.Insert(&store.VM{
+			VMID:     90000 + i,
+			Node:     "pve1",
+			Name:     "gpu-hot",
+			Profile:  targetProfile,
+			PoolKind: store.PoolKindHot,
+			State:    store.StateHot,
+		}))
+	}
+	mgr := newTestManager(t, st, &fakeProv{}, Config{
+		HotSize:              seededPerProfile,
+		MaxConcurrentRunners: 1000, // global cap permissive; profile cap is what's under test
+		Profiles: []ProfileSettings{{
+			Name:                 targetProfile,
+			HotSize:              seededPerProfile,
+			MaxConcurrentRunners: maxBusyProfile,
+		}},
+	})
+
+	var (
+		wg        sync.WaitGroup
+		startGate sync.WaitGroup
+		winners   atomic.Int32
+	)
+	startGate.Add(1)
+	for i := range acquirers {
+		wg.Add(1)
+		go func(jobID int64) {
+			defer wg.Done()
+			startGate.Wait()
+			got, err := mgr.AcquireForProfile(context.Background(), jobID, targetProfile, maxBusyProfile)
+			if err == nil && got != nil {
+				winners.Add(1)
+			}
+		}(int64(3000 + i))
+	}
+	startGate.Done()
+	wg.Wait()
+
+	got := int(winners.Load())
+	require.Equal(t, maxBusyProfile, got,
+		"AcquireHotInProfile must enforce the per-profile cap inside one txn — count + CAS happening across txns would allow over-commit under burst (issue #286)")
+}
+
+// TestMarkCompletedRacesAcquire_NoStateCorruption pins the
+// MarkCompleted vs Acquire contention scenario from issue #285:
+// a JobCompleted event arrives for VMID X while concurrent
+// Acquire calls are mid-flight. The store's state-transition
+// matrix must keep every VMID in exactly one of {Assigned,
+// Running, Draining, Destroying, Destroyed} at observation time,
+// never two — the bug class where a Destroying row is also
+// reachable from Acquire.
+func TestMarkCompletedRacesAcquire_NoStateCorruption(t *testing.T) {
+	t.Parallel()
+	const (
+		hotSeeded  = 16
+		runningIDs = 8
+		acquirers  = 100
+		maxRunners = hotSeeded + runningIDs
+	)
+	st := newTestStore(t)
+	seedHot(t, st, hotSeeded)
+	// Seed runningIDs rows in StateRunning so MarkCompleted has work.
+	for i := range runningIDs {
+		require.NoError(t, st.Insert(&store.VM{
+			VMID:     70000 + i,
+			Node:     "pve1",
+			Name:     "running",
+			Profile:  defaultProfileName,
+			PoolKind: store.PoolKindHot,
+			State:    store.StateRunning,
+		}))
+	}
+	mgr := newTestManager(t, st, &fakeProv{destroyHang: false}, Config{
+		HotSize:              hotSeeded,
+		MaxConcurrentRunners: maxRunners,
+		DrainTimeout:         100 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- mgr.Run(ctx) }()
+
+	var (
+		wg          sync.WaitGroup
+		startGate   sync.WaitGroup
+		mu          sync.Mutex
+		acquiredIDs = map[int]int64{}
+		duplicates  []int
+	)
+	startGate.Add(1)
+
+	// Acquire racers.
+	for i := range acquirers {
+		wg.Add(1)
+		go func(jobID int64) {
+			defer wg.Done()
+			startGate.Wait()
+			got, err := mgr.Acquire(context.Background(), jobID, 0)
+			if err != nil || got == nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if prev, ok := acquiredIDs[got.VMID]; ok {
+				duplicates = append(duplicates, got.VMID)
+				t.Errorf("VMID %d double-assigned during Acquire/MarkCompleted race: jobs %d and %d",
+					got.VMID, prev, jobID)
+			}
+			acquiredIDs[got.VMID] = jobID
+		}(int64(4000 + i))
+	}
+	// MarkCompleted racers.
+	for i := range runningIDs {
+		wg.Add(1)
+		go func(vmid int) {
+			defer wg.Done()
+			startGate.Wait()
+			require.NoError(t, mgr.MarkCompleted(context.Background(), vmid))
+		}(70000 + i)
+	}
+	startGate.Done()
+	wg.Wait()
+	cancel()
+	<-runDone
+
+	require.Empty(t, duplicates,
+		"MarkCompleted concurrent with Acquire must not produce a double-assigned VMID (issue #285)")
+	// Every Running row should now be Draining or Destroying — never
+	// re-acquired as Hot.
+	for i := range runningIDs {
+		row, err := st.Get(70000 + i)
+		if errors.Is(err, store.ErrNotFound) {
+			continue // already destroyed
+		}
+		require.NoError(t, err)
+		require.NotEqual(t, store.StateHot, row.State,
+			"VMID %d transitioned back to Hot after MarkCompleted — state machine broken", row.VMID)
+		require.NotEqual(t, store.StateAssigned, row.State,
+			"VMID %d transitioned back to Assigned after MarkCompleted — would double-assign on next Acquire", row.VMID)
+	}
 }

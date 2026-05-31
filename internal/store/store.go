@@ -477,6 +477,37 @@ func (s *Store) AcquireHot(jobID int64, maxConcurrent, maxBusy int) (*VM, error)
 	return s.AcquireHotInProfile("", jobID, maxConcurrent, maxBusy)
 }
 
+// countBusy counts rows in StateAssigned + StateRunning inside the
+// supplied transaction. Empty profile == fleet-wide count via the
+// "state" index; a non-empty profile uses the "profile_state"
+// composite index. Callers MUST pass the active write txn so the
+// count and any subsequent CAS share one snapshot — that's the
+// invariant Acquire relies on to avoid over-commit.
+func countBusy(txn *memdb.Txn, profile string) (int, error) {
+	busy := 0
+	for _, st := range []State{StateAssigned, StateRunning} {
+		var (
+			it  memdb.ResultIterator
+			err error
+		)
+		if profile == "" {
+			it, err = txn.Get(tableVM, "state", string(st))
+		} else {
+			it, err = txn.Get(tableVM, "profile_state", profile, string(st))
+		}
+		if err != nil {
+			if profile == "" {
+				return 0, fmt.Errorf("store: acquire: count %s: %w", st, err)
+			}
+			return 0, fmt.Errorf("store: acquire: count %s/%s: %w", profile, st, err)
+		}
+		for raw := it.Next(); raw != nil; raw = it.Next() {
+			busy++
+		}
+	}
+	return busy, nil
+}
+
 // AcquireHotInProfile atomically claims the oldest Hot VM in the given
 // profile by transitioning it to Assigned, but only if the
 // orchestrator-wide busy count (Assigned + Running) is strictly less
@@ -501,15 +532,9 @@ func (s *Store) AcquireHotInProfile(profile string, jobID int64, maxConcurrent, 
 
 	// Orchestrator-wide busy count — caps fleet-wide concurrent runners
 	// across every profile.
-	globalBusy := 0
-	for _, st := range []State{StateAssigned, StateRunning} {
-		it, err := txn.Get(tableVM, "state", string(st))
-		if err != nil {
-			return nil, fmt.Errorf("store: acquire: count %s: %w", st, err)
-		}
-		for raw := it.Next(); raw != nil; raw = it.Next() {
-			globalBusy++
-		}
+	globalBusy, err := countBusy(txn, "")
+	if err != nil {
+		return nil, err
 	}
 	if globalBusy >= maxConcurrent {
 		return nil, ErrAtCapacity
@@ -520,15 +545,9 @@ func (s *Store) AcquireHotInProfile(profile string, jobID int64, maxConcurrent, 
 	if maxBusy > 0 {
 		busy := globalBusy
 		if profile != "" {
-			busy = 0
-			for _, st := range []State{StateAssigned, StateRunning} {
-				it, err := txn.Get(tableVM, "profile_state", profile, string(st))
-				if err != nil {
-					return nil, fmt.Errorf("store: acquire: count %s/%s: %w", profile, st, err)
-				}
-				for raw := it.Next(); raw != nil; raw = it.Next() {
-					busy++
-				}
+			busy, err = countBusy(txn, profile)
+			if err != nil {
+				return nil, err
 			}
 		}
 		if busy >= maxBusy {
@@ -539,7 +558,6 @@ func (s *Store) AcquireHotInProfile(profile string, jobID int64, maxConcurrent, 
 	// Pick the oldest Hot row by CreatedAt — same policy the manager
 	// applied previously, just inside the same txn now.
 	var it memdb.ResultIterator
-	var err error
 	if profile == "" {
 		it, err = txn.Get(tableVM, "state", string(StateHot))
 	} else {
