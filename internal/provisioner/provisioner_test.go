@@ -1135,7 +1135,7 @@ func TestBuildLibCloneOptions_LinkedClone(t *testing.T) {
 	}, "pve1")
 	require.Equal(t, 10042, got.NewID)
 	require.Equal(t, "gh-runner-10042", got.Name)
-	require.Equal(t, uint8(0), got.Full)
+	require.Equal(t, proxmox.IntOrBool(false), got.Full)
 	require.Empty(t, got.Target, "linked clones must not set Target")
 	require.Empty(t, got.Storage, "linked clones must not set Storage")
 }
@@ -1152,7 +1152,7 @@ func TestBuildLibCloneOptions_FullCloneCrossNode(t *testing.T) {
 		Node:    "pve2",
 		Storage: "fast-storage",
 	}, "pve1")
-	require.Equal(t, uint8(1), got.Full)
+	require.Equal(t, proxmox.IntOrBool(true), got.Full)
 	require.Equal(t, "pve2", got.Target)
 	require.Equal(t, "fast-storage", got.Storage)
 }
