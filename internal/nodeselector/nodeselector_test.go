@@ -346,3 +346,91 @@ func TestNewAffinity_RejectsEmptyNodeUniverse(t *testing.T) {
 	_, err = NewAffinity(rr, []AffinityRule{{}}, nil)
 	require.Error(t, err)
 }
+
+// ---------------------------------------------------------------------------
+// Stress: all-nodes-down, flapping availability, uneven distribution (#293)
+// ---------------------------------------------------------------------------
+
+// TestRoundRobin_AllNodesDownErrorsCleanly pins #293's
+// all-nodes-unavailable case for the round-robin selector: when
+// every member of the cluster is in the caller's Avoid list, the
+// selector must return an error rather than hang or arbitrarily
+// pick one. (issue #293)
+func TestRoundRobin_AllNodesDownErrorsCleanly(t *testing.T) {
+	t.Parallel()
+	s, err := NewRoundRobin([]string{"pve1", "pve2", "pve3", "pve4"})
+	require.NoError(t, err)
+	_, err = s.Select(context.Background(), Hint{Avoid: []string{"pve1", "pve2", "pve3", "pve4"}})
+	require.Error(t, err,
+		"round_robin with every node avoided must surface a clear error, not hang or arbitrarily pick (issue #293)")
+}
+
+// TestLeastLoaded_AllNodesDownErrorsCleanly pins #293 for the
+// least-loaded selector. Same contract — every reachable node
+// excluded by Avoid must yield a clear error.
+func TestLeastLoaded_AllNodesDownErrorsCleanly(t *testing.T) {
+	t.Parallel()
+	f := &fakeFetcher{scores: map[string]float64{"a": 0.1, "b": 0.2, "c": 0.3}}
+	l := newLeastLoadedFromFetcher(f, 30*time.Second)
+	_, err := l.Select(context.Background(), Hint{Avoid: []string{"a", "b", "c"}})
+	require.Error(t, err,
+		"least_loaded with every node avoided must surface a clear error (issue #293)")
+}
+
+// TestLeastLoaded_FlappingFetchFallsBackToLastFresh covers #293's
+// flapping-availability scenario at the selector layer: when the
+// underlying Proxmox node-listing call starts failing, the
+// selector must NOT immediately fail every Select — it must serve
+// from the last-known-good cache so a transient Proxmox blip does
+// not stall clone scheduling. A second tick that succeeds again
+// resumes normal selection.
+func TestLeastLoaded_FlappingFetchFallsBackToLastFresh(t *testing.T) {
+	t.Parallel()
+	f := &fakeFetcher{scores: map[string]float64{"a": 0.1, "b": 0.5}}
+	l := newLeastLoadedFromFetcher(f, 50*time.Millisecond)
+
+	// Seed lastFresh with a successful fetch.
+	got, err := l.Select(context.Background(), Hint{})
+	require.NoError(t, err)
+	require.Equal(t, "a", got)
+
+	// Wait for cache TTL to expire, then induce a fetch failure.
+	time.Sleep(100 * time.Millisecond)
+	f.err = errors.New("transient proxmox blip")
+	got, err = l.Select(context.Background(), Hint{})
+	require.NoError(t, err, "flapping Proxmox listing must fall back to last-fresh, not fail the Select (issue #293)")
+	require.Equal(t, "a", got)
+
+	// Recovery: fetch starts working again, Select returns to live data.
+	f.err = nil
+	f.scores = map[string]float64{"a": 0.9, "b": 0.1}
+	time.Sleep(100 * time.Millisecond)
+	got, err = l.Select(context.Background(), Hint{})
+	require.NoError(t, err)
+	require.Equal(t, "b", got, "post-recovery Select must use the new fresh data, not the stale fallback")
+}
+
+// TestLeastLoaded_UnevenDistributionSpreadsAccordingToLoad
+// pins #293's load-spreading contract: when one node is at 100%
+// CPU and another at 0%, repeated Select calls (with Avoid
+// reflecting the previously-selected node) must pick the cold
+// node, not the hot one. The selector's job is to spread, not
+// always return the first reachable node.
+func TestLeastLoaded_UnevenDistributionSpreadsAccordingToLoad(t *testing.T) {
+	t.Parallel()
+	// Skewed: pve-hot is 99% loaded, pve-cold is 1%. The selector
+	// must consistently prefer pve-cold across many Selects.
+	f := &fakeFetcher{scores: map[string]float64{
+		"pve-hot":  0.99,
+		"pve-cold": 0.01,
+	}}
+	l := newLeastLoadedFromFetcher(f, 30*time.Second)
+
+	const N = 50
+	for range N {
+		got, err := l.Select(context.Background(), Hint{})
+		require.NoError(t, err)
+		require.Equal(t, "pve-cold", got,
+			"least_loaded must NOT spread to the 99%%-loaded node — load-aware selection is the whole point (issue #293)")
+	}
+}
