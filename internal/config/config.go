@@ -1319,6 +1319,21 @@ func (c *Config) ApplyDefaults() {
 	}
 }
 
+// validateGitHubURLs enforces the shared config_url / config_base_url
+// rules across both the PAT and App auth blocks (issue #214). Both
+// blocks have the same per-scope routing semantics for GHES so the
+// checks are identical apart from the field-name prefix.
+func validateGitHubURLs(prefix, configURL, configBaseURL string, numScalesets int) error {
+	if configURL != "" && configBaseURL != "" {
+		return fmt.Errorf("%s: config_url and config_base_url are mutually exclusive — set one or neither", prefix)
+	}
+	if configURL != "" && numScalesets > 1 {
+		return fmt.Errorf("%s.config_url is incompatible with multi-scaleset (%d scalesets declared); use %s.config_base_url so each scaleset's scope produces the right per-scope URL",
+			prefix, numScalesets, prefix)
+	}
+	return nil
+}
+
 // Resolve enforces cross-field invariants and parses duration strings
 // into [time.Duration]. Call before [Validate].
 //
@@ -1331,21 +1346,8 @@ func (c *Config) Resolve() error {
 		if c.GitHub.PAT.Token == "" {
 			return errors.New("github.pat.token: required (set via yaml or SCALESET_GITHUB_PAT_TOKEN)")
 		}
-		// Mutual exclusion: config_url is the full URL (single-
-		// scope override); config_base_url is the scheme+host
-		// (per-scope URL is joined at runtime). Setting both is
-		// ambiguous.
-		if c.GitHub.PAT.ConfigURL != "" && c.GitHub.PAT.ConfigBaseURL != "" {
-			return errors.New("github.pat: config_url and config_base_url are mutually exclusive — set one or neither")
-		}
-		// Multi-scaleset GHES deployments must use config_base_url,
-		// not config_url. config_url is a full URL with the org/repo
-		// baked in, so every per-scaleset client would handshake
-		// against the same scope — the wrong one for all but one of
-		// the scalesets (issue #214).
-		if c.GitHub.PAT.ConfigURL != "" && len(c.Scalesets) > 1 {
-			return fmt.Errorf("github.pat.config_url is incompatible with multi-scaleset (%d scalesets declared); use github.pat.config_base_url so each scaleset's scope produces the right per-scope URL",
-				len(c.Scalesets))
+		if err := validateGitHubURLs("github.pat", c.GitHub.PAT.ConfigURL, c.GitHub.PAT.ConfigBaseURL, len(c.Scalesets)); err != nil {
+			return err
 		}
 	}
 	// GitHub App: exactly one of client_id / app_id.
@@ -1358,15 +1360,8 @@ func (c *Config) Resolve() error {
 		case !hasClient && !hasAppID:
 			return errors.New("github.app: set exactly one of client_id or app_id (both are empty)")
 		}
-		// Mutual exclusion + multi-scaleset rule, mirroring the PAT
-		// side. App auth gets the same per-scope routing semantics
-		// for GHES (issue #214 follow-up).
-		if c.GitHub.App.ConfigURL != "" && c.GitHub.App.ConfigBaseURL != "" {
-			return errors.New("github.app: config_url and config_base_url are mutually exclusive — set one or neither")
-		}
-		if c.GitHub.App.ConfigURL != "" && len(c.Scalesets) > 1 {
-			return fmt.Errorf("github.app.config_url is incompatible with multi-scaleset (%d scalesets declared); use github.app.config_base_url so each scaleset's scope produces the right per-scope URL",
-				len(c.Scalesets))
+		if err := validateGitHubURLs("github.app", c.GitHub.App.ConfigURL, c.GitHub.App.ConfigBaseURL, len(c.Scalesets)); err != nil {
+			return err
 		}
 	}
 	// GitHub scope: with N > 1 scalesets the legacy github.scope
@@ -1385,6 +1380,13 @@ func (c *Config) Resolve() error {
 	// Proxmox API token secret — always required.
 	if c.Proxmox.Auth.TokenSecret == "" {
 		return errors.New("proxmox.auth.token_secret: required (set via yaml or SCALESET_PROXMOX_AUTH_TOKEN_SECRET)")
+	}
+	// Proxmox NIC bridge alphabet check — same regex as
+	// validateProfileNetworks applies to the global net0 bridge
+	// (issue #284). VLANTag is already bounded by the struct tag;
+	// MTU has no field on the global ProxmoxNetwork.
+	if err := validateNIC("proxmox.network", c.Proxmox.Network.Bridge, c.Proxmox.Network.VLANTag, 0); err != nil {
+		return err
 	}
 	// Admin API shared secret — optional at config-load (the admin API
 	// itself refuses to start with an empty secret when HTTPAddr is
@@ -1672,6 +1674,33 @@ func (c *Config) validateScalesetVMIDRanges() error {
 	return nil
 }
 
+// nicBridgeAllowed matches the bridge-identifier alphabet Proxmox
+// accepts. Rejecting characters outside this set prevents an
+// operator YAML value like `bridge: "vmbr0,firewall=1"` from
+// silently injecting additional comma-separated net<idx> segments
+// when the orchestrator stamps the value into Proxmox's NIC config
+// (issue #284). The same alphabet is reused for any future
+// scalar-but-injectable NIC fields.
+var nicBridgeAllowed = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// validateNIC enforces the VLAN/MTU range invariants plus the
+// Bridge alphabet check shared between the main profile NIC and
+// each ExtraNIC. Empty bridge is allowed for the main NIC (it
+// inherits the global proxmox.network.bridge); callers that
+// require a non-empty bridge must check separately.
+func validateNIC(prefix, bridge string, vlanTag, mtu int) error {
+	if bridge != "" && !nicBridgeAllowed.MatchString(bridge) {
+		return fmt.Errorf("%s.bridge must match %s (got %q)", prefix, nicBridgeAllowed.String(), bridge)
+	}
+	if vlanTag < 0 || vlanTag > 4094 {
+		return fmt.Errorf("%s.vlan_tag must be in [0, 4094]", prefix)
+	}
+	if mtu < 0 || mtu > 9216 {
+		return fmt.Errorf("%s.mtu must be in [0, 9216]", prefix)
+	}
+	return nil
+}
+
 // validateProfileNetworks enforces internal consistency on each
 // profile's optional network block: an IPAM backend of "static"
 // must declare a non-empty pool, and IP entries must parse. The
@@ -1688,21 +1717,16 @@ func (c *Config) validateProfileNetworks() error {
 			if p.Network == nil {
 				continue
 			}
-			if p.Network.VLANTag < 0 || p.Network.VLANTag > 4094 {
-				return fmt.Errorf("%s: network.vlan_tag must be in [0, 4094]", prefix)
-			}
-			if p.Network.MTU < 0 || p.Network.MTU > 9216 {
-				return fmt.Errorf("%s: network.mtu must be in [0, 9216]", prefix)
+			if err := validateNIC(prefix+".network", p.Network.Bridge, p.Network.VLANTag, p.Network.MTU); err != nil {
+				return err
 			}
 			for j, nic := range p.Network.ExtraNICs {
+				nicPrefix := fmt.Sprintf("%s.network.extra_nics[%d]", prefix, j)
 				if nic.Bridge == "" {
-					return fmt.Errorf("%s: network.extra_nics[%d].bridge is required", prefix, j)
+					return fmt.Errorf("%s.bridge is required", nicPrefix)
 				}
-				if nic.VLANTag < 0 || nic.VLANTag > 4094 {
-					return fmt.Errorf("%s: network.extra_nics[%d].vlan_tag must be in [0, 4094]", prefix, j)
-				}
-				if nic.MTU < 0 || nic.MTU > 9216 {
-					return fmt.Errorf("%s: network.extra_nics[%d].mtu must be in [0, 9216]", prefix, j)
+				if err := validateNIC(nicPrefix, nic.Bridge, nic.VLANTag, nic.MTU); err != nil {
+					return err
 				}
 			}
 			if p.Network.IPAM == nil {

@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -2206,4 +2207,142 @@ pool:
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "config_url")
 	require.Contains(t, err.Error(), "multi-scaleset")
+}
+
+// ---------------------------------------------------------------------------
+// NIC bridge alphabet (issue #284)
+// ---------------------------------------------------------------------------
+
+// TestProxmoxNetwork_RejectsBridgeWithCommaOrEquals locks in the
+// alphabet check on proxmox.network.bridge. Without it, a value
+// like "vmbr0,firewall=1" silently injects extra NIC attributes
+// when encodeNIC concatenates the field into Proxmox's net<idx>
+// config (issue #284).
+func TestProxmoxNetwork_RejectsBridgeWithCommaOrEquals(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	for name, bridge := range map[string]string{
+		"comma":      "vmbr0,firewall=1",
+		"equals":     "vmbr0=evil",
+		"whitespace": "vmbr0 vmbr1",
+		"newline":    "vmbr0\nbridge=other",
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := strings.Replace(validPATYAML,
+				"  network:  { bridge: vmbr0 }",
+				`  network:  { bridge: "`+bridge+`" }`, 1)
+			_, err := config.Parse([]byte(bad))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "proxmox.network.bridge")
+		})
+	}
+}
+
+// TestProfileNetwork_RejectsBridgeWithComma covers the per-profile
+// network override path (#284). Same alphabet, same failure mode.
+func TestProfileNetwork_RejectsBridgeWithComma(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	bad := strings.Replace(validProfileYAML,
+		"    template_vmid: 9100",
+		`    template_vmid: 9100
+    network:
+      bridge: "vmbr1,model=e1000,firewall=1"`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bridge")
+}
+
+// TestProfileNetwork_RejectsExtraNICBridgeWithComma covers the
+// extra-NIC path (#284). Same alphabet on every NIC bridge.
+func TestProfileNetwork_RejectsExtraNICBridgeWithComma(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	bad := strings.Replace(validProfileYAML,
+		"    template_vmid: 9100",
+		`    template_vmid: 9100
+    network:
+      bridge: vmbr1
+      extra_nics:
+        - bridge: "vmbr-storage,firewall=1"`, 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "extra_nics")
+	require.Contains(t, err.Error(), "bridge")
+}
+
+// TestProxmoxNetwork_AcceptsCanonicalBridgeNames covers the happy
+// path for the alphabet check: real-world bridge identifiers
+// (vmbr0, vmbr-storage, br_dmz, br.42) must still parse.
+func TestProxmoxNetwork_AcceptsCanonicalBridgeNames(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	for _, bridge := range []string{"vmbr0", "vmbr-storage", "br_dmz", "br.42", "VMBR0"} {
+		t.Run(bridge, func(t *testing.T) {
+			good := strings.Replace(validPATYAML,
+				"  network:  { bridge: vmbr0 }",
+				"  network:  { bridge: "+bridge+" }", 1)
+			_, err := config.Parse([]byte(good))
+			require.NoError(t, err)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Required-but-zero / runtime reload (issue #291)
+// ---------------------------------------------------------------------------
+
+// TestParse_ExplicitZeroPoolDurationsRejected locks in that an
+// operator writing `pool.power_poll_interval: 0s` (literal zero)
+// is rejected even though the Go zero value of time.Duration is
+// also 0. ApplyDefaults only substitutes when the field is
+// *unset*; an explicit 0 surfaces through to Resolve and must
+// fail loudly rather than degrade into a busy-loop. (issue #291)
+func TestParse_ExplicitZeroPoolDurationsRejected(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	for field, msg := range map[string]string{
+		"power_poll_interval":  "pool.power_poll_interval must be positive",
+		"vmid_reuse_cooldown":  "pool.vmid_reuse_cooldown must be positive",
+		"orphan_grace":         "pool.orphan_grace must be positive",
+		"clone_inflight_grace": "pool.clone_inflight_grace must be positive",
+	} {
+		t.Run(field, func(t *testing.T) {
+			bad := strings.Replace(validPATYAML,
+				"  hot_size: 2",
+				"  "+field+": 0s\n  hot_size: 2", 1)
+			_, err := config.Parse([]byte(bad))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), msg)
+		})
+	}
+}
+
+// TestParse_RejectsZeroMaxConcurrentInMultiScaleset confirms a
+// multi-scaleset entry with `max_concurrent_runners: 0` is rejected
+// at Parse time — the field's "required,gt=0" tag prevents a
+// no-op scaleset that consumes orchestration cycles but never
+// provisions a runner. (issue #291)
+func TestParse_RejectsZeroMaxConcurrentInMultiScaleset(t *testing.T) {
+	bad := strings.Replace(validMultiScalesetYAML,
+		"max_concurrent_runners: 10", "max_concurrent_runners: 0", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, strings.ToLower(err.Error()), "max_concurrent_runners")
+}
+
+// TestParse_DoesNotSupportRuntimeReload documents the current
+// behaviour: the Config type has no live-reload API, so adding
+// or removing a scaleset requires a full process restart. The
+// test exists so a future commit that adds reload semantics has
+// to explicitly delete it. (issue #291)
+//
+// The signal is structural: there is no Config.Reload, no
+// fsnotify import in this package, and Parse always returns a
+// freshly-constructed value. Asserting "no such method" via
+// reflection keeps the contract explicit.
+func TestParse_DoesNotSupportRuntimeReload(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	v := reflect.ValueOf(cfg)
+	for _, name := range []string{"Reload", "Watch", "Refresh"} {
+		require.False(t, v.MethodByName(name).IsValid(),
+			"Config exposes a %s method — runtime reload appears to be implemented; update or delete this test", name)
+	}
 }
