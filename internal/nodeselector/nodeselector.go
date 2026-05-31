@@ -347,6 +347,26 @@ func NewAffinity(underlying Selector, rules []AffinityRule, allNodes []string) (
 // balancer ran out of nodes for some other reason".
 var ErrAffinityRequireUnsatisfiable = errors.New("nodeselector: affinity require=true unsatisfiable")
 
+// eligibleFrom returns the set of candidate nodes minus any node
+// listed in excluded (anti-affinity) or avoid (caller-supplied
+// Hint.Avoid translated to a set). Extracted from
+// affinityWrapper.Select so the three call sites (prefer_nodes
+// branch, no-prefer-nodes branch, soft-pin fallback) share one
+// loop. No behaviour change.
+func eligibleFrom(candidates []string, excluded, avoid map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(candidates))
+	for _, n := range candidates {
+		if _, ex := excluded[n]; ex {
+			continue
+		}
+		if _, av := avoid[n]; av {
+			continue
+		}
+		out[n] = struct{}{}
+	}
+	return out
+}
+
 func (a *affinityWrapper) Select(ctx context.Context, hint Hint) (string, error) {
 	rule := a.matchingRule(hint.Profile)
 	if rule == nil {
@@ -373,30 +393,11 @@ func (a *affinityWrapper) Select(ctx context.Context, hint Hint) (string, error)
 		preExistingAvoid[n] = struct{}{}
 	}
 
-	eligible := make(map[string]struct{})
+	var eligible map[string]struct{}
 	if len(rule.PreferNodes) > 0 {
-		// prefer_nodes scopes the candidate set.
-		for _, n := range rule.PreferNodes {
-			if _, ex := excluded[n]; ex {
-				continue
-			}
-			if _, av := preExistingAvoid[n]; av {
-				continue
-			}
-			eligible[n] = struct{}{}
-		}
+		eligible = eligibleFrom(rule.PreferNodes, excluded, preExistingAvoid)
 	} else {
-		// No prefer_nodes — eligibility is the full universe
-		// minus exclusions.
-		for _, n := range a.allNodes {
-			if _, ex := excluded[n]; ex {
-				continue
-			}
-			if _, av := preExistingAvoid[n]; av {
-				continue
-			}
-			eligible[n] = struct{}{}
-		}
+		eligible = eligibleFrom(a.allNodes, excluded, preExistingAvoid)
 	}
 
 	if len(eligible) == 0 {
@@ -404,17 +405,9 @@ func (a *affinityWrapper) Select(ctx context.Context, hint Hint) (string, error)
 			return "", fmt.Errorf("%w: profile %q has no eligible preferred node (anti_affinity_with=%q removed %d, avoid=%d)",
 				ErrAffinityRequireUnsatisfiable, hint.Profile, rule.AntiAffinityWith.Profile, len(excluded), len(hint.Avoid))
 		}
-		// Soft pin: fall back to the full universe minus
-		// exclusions and Avoid.
-		for _, n := range a.allNodes {
-			if _, ex := excluded[n]; ex {
-				continue
-			}
-			if _, av := preExistingAvoid[n]; av {
-				continue
-			}
-			eligible[n] = struct{}{}
-		}
+		// Soft pin: fall back to the full universe minus exclusions
+		// and Avoid.
+		eligible = eligibleFrom(a.allNodes, excluded, preExistingAvoid)
 		if len(eligible) == 0 {
 			return "", errors.New("nodeselector: affinity rules left no eligible node")
 		}
