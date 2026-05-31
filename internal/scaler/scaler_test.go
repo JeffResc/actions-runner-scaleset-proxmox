@@ -1113,3 +1113,188 @@ func TestHandleJob_MalformedRunnerNameSurfacesAsLogNotError(t *testing.T) {
 	require.Empty(t, pool.markedRunning, "malformed runner name must not dispatch MarkRunning")
 	require.Empty(t, pool.markedCompleted, "malformed runner name must not dispatch MarkCompleted")
 }
+
+// stressQuotaCounter is a stress-test counter that hits a real
+// sync.Mutex on every read. Used to verify the scaler's quota
+// recording path doesn't induce lock starvation under burst load.
+type stressQuotaCounter struct {
+	mu        sync.Mutex
+	orgCalls  int
+	repoCalls int
+}
+
+func (s *stressQuotaCounter) CountByOrg(_ string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.orgCalls++
+	return 1, nil
+}
+
+func (s *stressQuotaCounter) CountByRepo(_ string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.repoCalls++
+	return 1, nil
+}
+
+// TestQuota_BurstAcrossManyReposNoDeadlock pins #288: 1500 jobs
+// across many (org, repo) tuples fire HandleJobStarted in
+// parallel. The quota recording path must complete every
+// dispatch (no deadlock, no lock starvation, no overflow) and
+// the QuotaCounter must observe every job's lookup.
+//
+// The "no over-commit" invariant from the issue is structural,
+// not enforced today: quota_throttled_total is observational
+// (the scaler emits the metric, but does not refuse the job).
+// What's testable today is that the burst completes cleanly.
+func TestQuota_BurstAcrossManyReposNoDeadlock(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 100, DefaultPerOrg: 1000})
+	require.NoError(t, err)
+	s.SetQuotas(qr)
+	counter := &stressQuotaCounter{}
+	s.SetQuotaCounter(counter)
+
+	const N = 1500
+	var (
+		wg   sync.WaitGroup
+		gate sync.WaitGroup
+	)
+	gate.Add(1)
+	for i := range N {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			gate.Wait()
+			org := "shared-org"
+			repo := fmt.Sprintf("repo-%d", idx)
+			err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+				JobMessageBase: scaleset.JobMessageBase{
+					OwnerName:      org,
+					RepositoryName: repo,
+				},
+				RunnerName: fmt.Sprintf("gh-runner-test-%d", 10000+idx),
+				RunnerID:   10000 + idx,
+			})
+			require.NoError(t, err, "burst job %d must dispatch cleanly under contention (issue #288)", idx)
+		}(i)
+	}
+	gate.Done()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("1500-job burst did not complete within 30s — possible lock starvation in the quota recording path (issue #288)")
+	}
+
+	// Per-repo lookups fire for every job since DefaultPerRepo wins
+	// over DefaultPerOrg precedence. Counter must have seen every
+	// invocation.
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	require.Equal(t, N, counter.repoCalls,
+		"every burst job must reach the quota counter — observed %d of %d (issue #288)", counter.repoCalls, N)
+}
+
+// TestQuotaResolver_ConcurrentResolveIsSafe pins #288 paragraph 1
+// at the resolver layer: the Resolver is read-only after New, so
+// concurrent Resolve calls across many (org, repo) tuples must
+// produce consistent results without data races. Race-detector
+// covers no-data-race.
+func TestQuotaResolver_ConcurrentResolveIsSafe(t *testing.T) {
+	t.Parallel()
+	qr, err := quotas.New(quotas.Config{
+		DefaultPerRepo: 10,
+		DefaultPerOrg:  100,
+		Overrides: []quotas.Override{
+			{Repo: "shared-org/heavy", MaxConcurrent: 50},
+			{Org: "vip-org", MaxConcurrent: 200},
+		},
+	})
+	require.NoError(t, err)
+
+	const N = 2000
+	var (
+		wg   sync.WaitGroup
+		gate sync.WaitGroup
+	)
+	gate.Add(1)
+	for i := range N {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			gate.Wait()
+			switch idx % 4 {
+			case 0:
+				got := qr.Resolve("shared-org", "shared-org/heavy")
+				require.Equal(t, 50, got.Cap)
+				require.Equal(t, quotas.ScopeRepo, got.Scope)
+			case 1:
+				got := qr.Resolve("vip-org", "")
+				require.Equal(t, 200, got.Cap)
+				require.Equal(t, quotas.ScopeOrg, got.Scope)
+			case 2:
+				got := qr.Resolve("misc-org", fmt.Sprintf("misc-org/repo-%d", idx))
+				require.Equal(t, 10, got.Cap, "default_per_repo applies")
+				require.Equal(t, quotas.ScopeRepo, got.Scope)
+			case 3:
+				got := qr.Resolve("misc-org", "")
+				require.Equal(t, 100, got.Cap, "default_per_org applies")
+				require.Equal(t, quotas.ScopeOrg, got.Scope)
+			}
+		}(i)
+	}
+	gate.Done()
+	wg.Wait()
+}
+
+// TestPriorityMatcher_ConcurrentClassifyIsSafe pins the
+// classification-ordering side of #288: the priority Matcher's
+// Classify must return the same class for the same JobInfo
+// regardless of how many goroutines are calling concurrently.
+// Race-detector covers no-data-race.
+func TestPriorityMatcher_ConcurrentClassifyIsSafe(t *testing.T) {
+	t.Parallel()
+	m, err := priority.New([]priority.Class{
+		{Name: "platinum", Match: priority.Match{Org: "vip-org"}},
+		{Name: "gold", Match: priority.Match{Org: "shared-org", Repo: "shared-org/heavy"}},
+		{Name: "default", Match: priority.Match{}}, // wildcard
+	})
+	require.NoError(t, err)
+
+	const N = 2000
+	var (
+		wg   sync.WaitGroup
+		gate sync.WaitGroup
+	)
+	gate.Add(1)
+	for i := range N {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			gate.Wait()
+			switch idx % 3 {
+			case 0:
+				got := m.Classify(priority.JobInfo{Org: "vip-org"})
+				require.Equal(t, "platinum", got.Name)
+			case 1:
+				got := m.Classify(priority.JobInfo{Org: "shared-org", Repo: "shared-org/heavy"})
+				require.Equal(t, "gold", got.Name)
+			case 2:
+				got := m.Classify(priority.JobInfo{Org: "unknown"})
+				require.Equal(t, "default", got.Name)
+			}
+		}(i)
+	}
+	gate.Done()
+	wg.Wait()
+}
