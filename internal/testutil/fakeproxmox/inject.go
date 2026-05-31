@@ -102,3 +102,24 @@ func (s *store) matchFaultLocked(kind FaultKind, vmid int) (Fault, bool) {
 	}
 	return Fault{}, false
 }
+
+// consumeFaultLocked decrements the Count of the first matching
+// fault (kind, vmid). When Count reaches 0 the fault is removed
+// so subsequent requests resume normal handler behaviour. Used by
+// count-bounded faults like FaultStatus500Spam to model "the
+// next N requests fail then recover." Caller must hold s.mu.
+func (s *store) consumeFaultLocked(kind FaultKind, vmid int) {
+	for i, f := range s.faults {
+		if f.Kind != kind {
+			continue
+		}
+		if f.VMID != 0 && f.VMID != vmid {
+			continue
+		}
+		s.faults[i].Count--
+		if s.faults[i].Count <= 0 {
+			s.faults = append(s.faults[:i], s.faults[i+1:]...)
+		}
+		return
+	}
+}

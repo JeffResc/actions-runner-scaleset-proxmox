@@ -466,6 +466,16 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.mu.Lock()
 	defer s.store.mu.Unlock()
+	// FaultStatus500Spam: when a matching fault is registered for
+	// this VMID (or VMID=0 wildcard), reply 500 and consume one
+	// count. Used by partial-failure e2e scenarios that need the
+	// "clone succeeded, start failed" cascade (issue #287).
+	if f, ok := s.store.matchFaultLocked(FaultStatus500Spam, vmid); ok && f.Count > 0 {
+		s.store.consumeFaultLocked(FaultStatus500Spam, vmid)
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("VM %d start failed (injected: FaultStatus500Spam)", vmid))
+		return
+	}
 	v, ok := s.store.findVMLocked(vmid)
 	if !ok {
 		writeError(w, http.StatusInternalServerError,
