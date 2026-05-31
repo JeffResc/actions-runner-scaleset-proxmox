@@ -596,10 +596,10 @@ func buildLibCloneOptions(opts CloneOptions, templateNodeName string) *proxmox.V
 		Name:  opts.Name,
 	}
 	if opts.Linked {
-		cloneOpts.Full = 0
+		cloneOpts.Full = proxmox.IntOrBool(false)
 		return cloneOpts
 	}
-	cloneOpts.Full = 1
+	cloneOpts.Full = proxmox.IntOrBool(true)
 	if opts.Node != "" && opts.Node != templateNodeName {
 		cloneOpts.Target = opts.Node
 	}
