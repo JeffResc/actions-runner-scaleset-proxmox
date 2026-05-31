@@ -189,41 +189,7 @@ func NewRaftCluster(t testing.TB, adminAddrs []string) *RaftCluster {
 func Start(t testing.TB, opts Options) *Harness {
 	t.Helper()
 	multi := len(opts.Scalesets) > 0
-	if multi {
-		// Validate mutual exclusivity loudly so a test that mixes
-		// the singular + plural shapes doesn't get a half-applied
-		// config silently.
-		if opts.ScaleSetName != "" || opts.Org != "" || opts.HotSize != 0 || opts.WarmSize != 0 || opts.MaxConcurrentRunners != 0 {
-			panic("e2e: Options.Scalesets and the singular ScaleSetName/Org/HotSize/WarmSize/MaxConcurrentRunners fields are mutually exclusive")
-		}
-		// Auto-fill per-scaleset defaults so callers can declare
-		// only what differs (e.g. a distinct HotSize).
-		for i := range opts.Scalesets {
-			ss := &opts.Scalesets[i]
-			if ss.Name == "" {
-				ss.Name = fmt.Sprintf("scaleset-%d", i)
-			}
-			if ss.Org == "" {
-				ss.Org = fmt.Sprintf("org-%d", i)
-			}
-			if ss.MaxConcurrentRunners == 0 {
-				ss.MaxConcurrentRunners = 8
-			}
-		}
-	} else {
-		if opts.HotSize == 0 {
-			opts.HotSize = 2
-		}
-		if opts.MaxConcurrentRunners == 0 {
-			opts.MaxConcurrentRunners = 8
-		}
-		if opts.Org == "" {
-			opts.Org = "octocat"
-		}
-		if opts.ScaleSetName == "" {
-			opts.ScaleSetName = "test-scaleset"
-		}
-	}
+	opts = applyOptionDefaults(opts)
 
 	proxmox := opts.FakeProxmox
 	if proxmox == nil {
@@ -284,37 +250,21 @@ func Start(t testing.TB, opts Options) *Harness {
 		AdminAddr:            adminAddr,
 	}
 	if multi {
-		// Auto-partition the shared global VMID range (10000-10999
-		// per the harness's proxmox.vmid_range below) into
-		// disjoint per-scaleset slices. The config validator
-		// (issue #222) requires non-overlapping ranges so the
-		// per-scaleset pool.Manager allocators don't race on the
-		// same lowest-free ID. e2e tests get this for free
-		// without having to specify ranges.
 		const (
 			rangeMin = 10000
 			rangeMax = 10999
 		)
-		span := (rangeMax - rangeMin + 1) / len(opts.Scalesets)
+		spans := partitionVMIDRange(len(opts.Scalesets), rangeMin, rangeMax)
 		cv.Scalesets = make([]scalesetCfg, 0, len(opts.Scalesets))
 		for i, ss := range opts.Scalesets {
-			min := rangeMin + i*span
-			max := min + span - 1
-			if i == len(opts.Scalesets)-1 {
-				// Sweep any rounding remainder into the last
-				// scaleset so the union is exactly the global
-				// range — keeps the assertion "VMID in [10000,
-				// 11000)" intact in the two-scaleset scenarios.
-				max = rangeMax
-			}
 			cv.Scalesets = append(cv.Scalesets, scalesetCfg{
 				Name:                 ss.Name,
 				Org:                  ss.Org,
 				HotSize:              ss.HotSize,
 				WarmSize:             ss.WarmSize,
 				MaxConcurrentRunners: ss.MaxConcurrentRunners,
-				VMIDMin:              min,
-				VMIDMax:              max,
+				VMIDMin:              spans[i].min,
+				VMIDMax:              spans[i].max,
 			})
 		}
 	}
@@ -742,3 +692,70 @@ func labelSubset(want []string, got string) bool {
 func formatLabel(k, v string) string { return fmt.Sprintf(`%s="%s"`, k, v) }
 
 var _ = formatLabel // exported via callers in scenario tests
+
+// applyOptionDefaults fills in singular-vs-multi defaults so
+// Start can dispatch one cv := configValues{...} block instead
+// of a nested if/else. Extracted from Start for unit-testability
+// (no e2e ports / fakes required). Mutual-exclusion check is
+// loud — a test that mixes shapes still panics.
+func applyOptionDefaults(opts Options) Options {
+	if len(opts.Scalesets) > 0 {
+		if opts.ScaleSetName != "" || opts.Org != "" || opts.HotSize != 0 || opts.WarmSize != 0 || opts.MaxConcurrentRunners != 0 {
+			panic("e2e: Options.Scalesets and the singular ScaleSetName/Org/HotSize/WarmSize/MaxConcurrentRunners fields are mutually exclusive")
+		}
+		for i := range opts.Scalesets {
+			ss := &opts.Scalesets[i]
+			if ss.Name == "" {
+				ss.Name = fmt.Sprintf("scaleset-%d", i)
+			}
+			if ss.Org == "" {
+				ss.Org = fmt.Sprintf("org-%d", i)
+			}
+			if ss.MaxConcurrentRunners == 0 {
+				ss.MaxConcurrentRunners = 8
+			}
+		}
+		return opts
+	}
+	if opts.HotSize == 0 {
+		opts.HotSize = 2
+	}
+	if opts.MaxConcurrentRunners == 0 {
+		opts.MaxConcurrentRunners = 8
+	}
+	if opts.Org == "" {
+		opts.Org = "octocat"
+	}
+	if opts.ScaleSetName == "" {
+		opts.ScaleSetName = "test-scaleset"
+	}
+	return opts
+}
+
+// vmidSpan is one slice of the partitioned VMID range.
+type vmidSpan struct {
+	min, max int
+}
+
+// partitionVMIDRange slices [min, max] into n contiguous, disjoint
+// spans. Any rounding remainder is swept into the LAST span so the
+// union is exactly [min, max] — operators of the two-scaleset
+// scenarios rely on "VMID in [min, max]" remaining true. Extracted
+// from Start for direct unit coverage (the e2e scenarios exercise
+// this only transitively).
+func partitionVMIDRange(n, min, max int) []vmidSpan {
+	if n <= 0 {
+		return nil
+	}
+	span := (max - min + 1) / n
+	out := make([]vmidSpan, n)
+	for i := range n {
+		lo := min + i*span
+		hi := lo + span - 1
+		if i == n-1 {
+			hi = max
+		}
+		out[i] = vmidSpan{min: lo, max: hi}
+	}
+	return out
+}

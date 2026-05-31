@@ -137,68 +137,76 @@ func New(t testing.TB, opts Options) *Server {
 // shape into a deterministic ScaleSetOptions list with stable
 // defaults. Auto-assigns IDs / RunnerGroupIDs / Names when the
 // caller omitted them so two unnamed scalesets don't collide.
-func normaliseScalesetOptions(opts Options) []fakeRunnerScaleSet {
-	switch {
-	case len(opts.Scalesets) > 0:
-		if (opts.ScaleSet != ScaleSetOptions{}) {
-			panic("fakegithub: Options.ScaleSet and Options.Scalesets are mutually exclusive")
+// allocateID picks the next unused ID from a monotonic counter,
+// skipping any value already in seen. The caller is responsible
+// for inserting the returned ID into seen and advancing its own
+// nextID cursor. Extracted from normaliseScalesetOptions so the
+// allocator can be unit-tested independently and the multi-
+// scaleset branch's nesting drops one level.
+func allocateID(seen map[int]struct{}, nextID *int) int {
+	for {
+		if _, used := seen[*nextID]; !used {
+			id := *nextID
+			*nextID++
+			return id
 		}
-		out := make([]fakeRunnerScaleSet, 0, len(opts.Scalesets))
-		seenName := make(map[string]struct{}, len(opts.Scalesets))
-		seenID := make(map[int]struct{}, len(opts.Scalesets))
-		nextID := 42
-		for i, ss := range opts.Scalesets {
-			name := ss.Name
-			if name == "" {
+		*nextID++
+	}
+}
+
+// optsToList folds the singular ScaleSet form into the slice
+// form so the downstream loop can handle both shapes uniformly.
+// Singular-and-plural-set is rejected at the call site (it's
+// the only configuration ambiguity the helper cannot resolve).
+func optsToList(opts Options) []ScaleSetOptions {
+	if len(opts.Scalesets) > 0 {
+		return opts.Scalesets
+	}
+	return []ScaleSetOptions{opts.ScaleSet}
+}
+
+func normaliseScalesetOptions(opts Options) []fakeRunnerScaleSet {
+	if len(opts.Scalesets) > 0 && (opts.ScaleSet != ScaleSetOptions{}) {
+		panic("fakegithub: Options.ScaleSet and Options.Scalesets are mutually exclusive")
+	}
+	list := optsToList(opts)
+	out := make([]fakeRunnerScaleSet, 0, len(list))
+	seenName := make(map[string]struct{}, len(list))
+	seenID := make(map[int]struct{}, len(list))
+	nextID := 42
+	singular := len(opts.Scalesets) == 0
+	for i, ss := range list {
+		name := ss.Name
+		if name == "" {
+			if singular {
+				name = "test-scaleset"
+			} else {
 				name = fmt.Sprintf("test-scaleset-%d", i)
 			}
-			if _, dup := seenName[name]; dup {
-				panic(fmt.Sprintf("fakegithub: duplicate scaleset name %q in Options.Scalesets", name))
-			}
-			seenName[name] = struct{}{}
-			id := ss.ID
-			if id == 0 {
-				for {
-					if _, used := seenID[nextID]; !used {
-						id = nextID
-						break
-					}
-					nextID++
-				}
-				nextID++
-			}
-			if _, dup := seenID[id]; dup {
-				panic(fmt.Sprintf("fakegithub: duplicate scaleset id %d in Options.Scalesets", id))
-			}
-			seenID[id] = struct{}{}
-			rg := ss.RunnerGroupID
-			if rg == 0 {
-				rg = 1
-			}
-			out = append(out, fakeRunnerScaleSet{
-				ID:            id,
-				Name:          name,
-				RunnerGroupID: rg,
-			})
 		}
-		return out
-	default:
-		ss := opts.ScaleSet
-		if ss.ID == 0 {
-			ss.ID = 42
+		if _, dup := seenName[name]; dup {
+			panic(fmt.Sprintf("fakegithub: duplicate scaleset name %q in Options.Scalesets", name))
 		}
-		if ss.Name == "" {
-			ss.Name = "test-scaleset"
+		seenName[name] = struct{}{}
+		id := ss.ID
+		if id == 0 {
+			id = allocateID(seenID, &nextID)
 		}
-		if ss.RunnerGroupID == 0 {
-			ss.RunnerGroupID = 1
+		if _, dup := seenID[id]; dup {
+			panic(fmt.Sprintf("fakegithub: duplicate scaleset id %d in Options.Scalesets", id))
 		}
-		return []fakeRunnerScaleSet{{
-			ID:            ss.ID,
-			Name:          ss.Name,
-			RunnerGroupID: ss.RunnerGroupID,
-		}}
+		seenID[id] = struct{}{}
+		rg := ss.RunnerGroupID
+		if rg == 0 {
+			rg = 1
+		}
+		out = append(out, fakeRunnerScaleSet{
+			ID:            id,
+			Name:          name,
+			RunnerGroupID: rg,
+		})
 	}
+	return out
 }
 
 // ConfigURL returns a URL suitable for githubauth.PATConfig.ConfigURL.
