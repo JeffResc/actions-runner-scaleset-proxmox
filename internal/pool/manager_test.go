@@ -1201,7 +1201,7 @@ func TestAdopt_GitHubListFailure_FallsBackToPowerOnly(t *testing.T) {
 
 // TestAdopt_NilRunnerLister_OK: a nil lister is treated as "GitHub
 // unavailable" — same behavior as a lister returning an error. Allows
-// callers (e.g. dry-run mode) to skip GitHub wiring entirely.
+// callers to skip GitHub wiring entirely.
 func TestAdopt_NilRunnerLister_OK(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
