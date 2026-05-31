@@ -1,0 +1,18 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Bump all OpenTelemetry Go modules together. Their schema/semconv versions are coupled, so a piecemeal bump leaves the SDK and the app's semconv import on mismatched schema URLs and breaks resource.Merge.",
+      "groupName": "opentelemetry-go",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "go.opentelemetry.io/otel{/,}**"
+      ]
+    }
+  ]
+}
