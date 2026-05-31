@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -851,4 +853,148 @@ func TestStateTransitionTable_Completeness(t *testing.T) {
 	}
 	require.Len(t, stateTransitionTable, len(dbStates)*len(ghLabels),
 		"stateTransitionTable should hold exactly dbStates*ghLabels cells (no stale entries)")
+}
+
+// TestCleanupOrphanRunners_GraceWindowBoundary pins the exact
+// comparison the prune logic uses (issue #281). The code reads
+// `now.Sub(firstSeen) < orphanGrace`, so:
+//   - elapsed < orphanGrace  → still in grace, do not remove
+//   - elapsed == orphanGrace → REMOVE (boundary)
+//   - elapsed > orphanGrace  → REMOVE
+//
+// Without this test a future regression that flips ">" to ">="
+// (or vice versa) would silently change the reap moment by one
+// nanosecond / one full tick, depending on direction.
+func TestCleanupOrphanRunners_GraceWindowBoundary(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		elapsed  time.Duration
+		mustReap bool
+	}{
+		{"one_below_grace", orphanGrace - 1, false},
+		{"at_grace", orphanGrace, true},
+		{"one_past_grace", orphanGrace + 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var (
+				mu      sync.Mutex
+				removed []int64
+			)
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/octocat/test/actions/runners/1001", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodDelete {
+					http.Error(w, "method", http.StatusMethodNotAllowed)
+					return
+				}
+				mu.Lock()
+				removed = append(removed, 1001)
+				mu.Unlock()
+				w.WriteHeader(http.StatusNoContent)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			mgr := &fakeManager{rows: nil}
+			r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
+			require.NoError(t, err)
+			t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			r.now = func() time.Time { return t0 }
+
+			r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+				"gh-runner-test-1": {ID: 1001, Online: true, Busy: false},
+			})
+			_, ok := r.orphanFirstSeen["gh-runner-test-1"]
+			require.True(t, ok)
+
+			r.now = func() time.Time { return t0.Add(tc.elapsed) }
+			r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+				"gh-runner-test-1": {ID: 1001, Online: true, Busy: false},
+			})
+
+			mu.Lock()
+			defer mu.Unlock()
+			if tc.mustReap {
+				require.Contains(t, removed, int64(1001),
+					"elapsed=%v >= grace=%v must reap the orphan", tc.elapsed, orphanGrace)
+			} else {
+				require.NotContains(t, removed, int64(1001),
+					"elapsed=%v < grace=%v must NOT reap the orphan", tc.elapsed, orphanGrace)
+			}
+		})
+	}
+}
+
+// TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently
+// pins the multi-orphan invariant from #281: N orphans observed in
+// one tick must each tick down their own grace clock and reap
+// independently. A regression that shares a global firstSeen
+// timestamp across all orphans would reap them all in lock-step
+// at the first-orphan's grace expiry — silently destroying
+// runners that should have been protected by their own younger
+// grace window.
+func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *testing.T) {
+	t.Parallel()
+	mux := http.NewServeMux()
+	var (
+		removeMu sync.Mutex
+		removed  []int64
+	)
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/actions/runners/") {
+			parts := strings.Split(r.URL.Path, "/")
+			id, _ := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+			removeMu.Lock()
+			removed = append(removed, id)
+			removeMu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mgr := &fakeManager{rows: nil}
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
+	require.NoError(t, err)
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return t0 }
+
+	// Tick 1: orphan A observed.
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
+	})
+
+	// Tick 2: 20s later, orphan B observed too. A's grace started
+	// at t0; B's grace starts at t0+20s.
+	r.now = func() time.Time { return t0.Add(20 * time.Second) }
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
+		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
+	})
+
+	// Tick 3: t0+orphanGrace. A is exactly at its grace boundary → reap.
+	// B is at 20s in → still inside its own grace.
+	r.now = func() time.Time { return t0.Add(orphanGrace) }
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
+		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
+	})
+	removeMu.Lock()
+	require.Contains(t, removed, int64(1), "orphan A at its grace must be reaped")
+	require.NotContains(t, removed, int64(2),
+		"orphan B's grace clock must be independent — must NOT be reaped at A's expiry (issue #281)")
+	removeMu.Unlock()
+
+	// Tick 4: advance to t0 + 20s + orphanGrace. B is at its own
+	// boundary now → reap.
+	r.now = func() time.Time { return t0.Add(20*time.Second + orphanGrace) }
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
+	})
+	removeMu.Lock()
+	defer removeMu.Unlock()
+	require.Contains(t, removed, int64(2), "orphan B at its own grace boundary must be reaped")
 }

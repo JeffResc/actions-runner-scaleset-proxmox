@@ -1134,3 +1134,110 @@ func TestNamespacedRoutes_RouteToCorrectScaleset(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code,
 		"unknown scaleset name must 404, not 503 (which means leader transition)")
 }
+
+// TestHandleDestroyVM_DuplicateRequestIsIdempotentAtHandler locks
+// in #289: a replayed /admin/destroy/{vmid} (e.g. operator retries
+// after a network blip) must return 202 on every call. The handler
+// is stateless — it dispatches to pool.ForceDestroy on every call;
+// idempotency is enforced at the pool layer (state-machine guards
+// in PR #308). This test pins the HANDLER's contract: never error,
+// never short-circuit, never 409 — every duplicate is 202 Accepted.
+func TestHandleDestroyVM_DuplicateRequestIsIdempotentAtHandler(t *testing.T) {
+	t.Parallel()
+	s, fp := newTestServer(t, "topsecret")
+	h := chiHandler(s)
+
+	for i := range 5 {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/destroy/10042", nil)
+		r.Header.Set("Authorization", "Bearer topsecret")
+		h.ServeHTTP(w, r)
+		require.Equal(t, http.StatusAccepted, w.Code,
+			"duplicate /admin/destroy must return 202 on every call (attempt %d) — replay must not error", i+1)
+	}
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	// Handler dispatches every duplicate; pool-layer state machine
+	// makes the second+ dispatch a no-op. The handler must NEVER
+	// suppress the dispatch — that would mask a transient pool
+	// error on the first attempt.
+	require.Len(t, fp.forceDestroyed, 5,
+		"handler must dispatch every duplicate; idempotency lives at the pool layer (issue #289)")
+}
+
+// TestHandleDestroyVM_ConcurrentRequestsForSameVMIDAllSucceed pins
+// #289: two operators (or a stuck retry loop on the same operator)
+// firing /admin/destroy/{vmid} concurrently must all see 202. The
+// handler must not lock per-VMID, must not 409 on contention, and
+// the underlying pool-layer state machine guards against double-
+// destroying the actual VM.
+func TestHandleDestroyVM_ConcurrentRequestsForSameVMIDAllSucceed(t *testing.T) {
+	t.Parallel()
+	s, fp := newTestServer(t, "topsecret")
+	h := chiHandler(s)
+
+	const N = 32
+	var (
+		wg    sync.WaitGroup
+		gate  sync.WaitGroup
+		ok    sync.Mutex
+		codes []int
+	)
+	gate.Add(1)
+	for range N {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gate.Wait()
+			w := httptest.NewRecorder()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/destroy/10042", nil)
+			r.Header.Set("Authorization", "Bearer topsecret")
+			h.ServeHTTP(w, r)
+			ok.Lock()
+			codes = append(codes, w.Code)
+			ok.Unlock()
+		}()
+	}
+	gate.Done()
+	wg.Wait()
+
+	for i, c := range codes {
+		require.Equal(t, http.StatusAccepted, c,
+			"concurrent destroy request %d returned %d — handler must accept all duplicates (issue #289)", i, c)
+	}
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Len(t, fp.forceDestroyed, N)
+}
+
+// TestHandlePreemptVM_DuplicateRequestIsIdempotentAtHandler is the
+// preempt-side analogue of the destroy duplicate test (#289). Same
+// handler contract: every replay returns its protocol code; the
+// pool layer is authoritative on whether the row is actually
+// transitioned.
+func TestHandlePreemptVM_DuplicateRequestIsIdempotentAtHandler(t *testing.T) {
+	t.Parallel()
+	s, fp := newTestServer(t, "topsecret")
+	router := chi.NewRouter()
+	router.Use(s.realIP)
+	router.Use(s.leaderOrForward)
+	router.Use(s.requireBearerToken)
+	router.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
+
+	for i := range 5 {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/admin/preempt/10042", nil)
+		r.Header.Set("Authorization", "Bearer topsecret")
+		router.ServeHTTP(w, r)
+		// Preempt returns 202 on success — fakePool's default zero
+		// error means every dispatch succeeds.
+		require.NotEqual(t, http.StatusInternalServerError, w.Code,
+			"duplicate /admin/preempt must not surface as 500 (attempt %d) — issue #289", i+1)
+	}
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Len(t, fp.preempted, 5,
+		"handler must dispatch every duplicate preempt (issue #289)")
+}
