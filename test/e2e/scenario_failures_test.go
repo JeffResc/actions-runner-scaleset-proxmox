@@ -196,3 +196,56 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// TestE2E_PartialClone_StartFailureRecoversToHealthyPool pins
+// #287's canonical partial-failure cascade: the orchestrator's
+// Clone succeeds (Proxmox creates the VM record) but the Start
+// that follows returns 500. The reconcile loop must retry past
+// the failures, eventually clone a VM whose Start succeeds, and
+// the orphan-sweep path (orphan_grace=5s in the harness) must
+// destroy the stuck Stopped clones that never recovered.
+//
+// Drives FaultStatus500Spam with Count=8 so the first N start
+// calls fail and subsequent ones succeed. Asserts:
+//   - Hot pool eventually reaches HotSize (= retries succeeded).
+//   - The orchestrator-owned Stopped VMs left over from failed
+//     starts are eventually destroyed by the orphan sweep, NOT
+//     left as a permanent quota-consuming leak.
+func TestE2E_PartialClone_StartFailureRecoversToHealthyPool(t *testing.T) {
+	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+	proxmox.InjectFault(fakeproxmox.Fault{
+		Kind:  fakeproxmox.FaultStatus500Spam,
+		VMID:  0,
+		Count: 8,
+	})
+
+	h := Start(t, Options{
+		HotSize:              2,
+		MaxConcurrentRunners: 4,
+		FakeProxmox:          proxmox,
+	})
+
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "hot")) >= 2
+	}, 30*time.Second, 250*time.Millisecond,
+		"hot pool must converge to HotSize after the start-failure burst clears — issue #287")
+
+	// Now wait for the orphan-sweep to clean up the Stopped
+	// partial-clone leaks. orphan_grace is 5s in the harness; give
+	// generous headroom for the reconcile tick.
+	require.Eventually(t, func() bool {
+		for _, vm := range proxmox.Snapshot() {
+			if vm.VMID == 9000 {
+				continue // template
+			}
+			if vm.VMID < 10000 || vm.VMID >= 11000 {
+				continue
+			}
+			if !vm.Running {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, 500*time.Millisecond,
+		"orchestrator-owned Stopped VMs must be reaped by orphan-sweep — partial clone left running indefinitely is the canonical leak (issue #287)")
+}
