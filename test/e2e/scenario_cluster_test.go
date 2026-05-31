@@ -25,6 +25,7 @@ import (
 // rows. Confirming only one replica drives the pool is the
 // load-bearing assertion.
 func TestE2E_ClusterElectsSingleLeader(t *testing.T) {
+	t.Parallel()
 	// Shared infrastructure. Each instance constructs its own
 	// orchestrator but they all hit the same fakeproxmox /
 	// fakegithub.
@@ -119,6 +120,7 @@ func TestE2E_ClusterElectsSingleLeader(t *testing.T) {
 //  4. At no point does the live VM count exceed MaxConcurrentRunners
 //     (would imply both replicas drove the pool concurrently).
 func TestE2E_ClusterLeaderTakeover(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{Name: "takeover-set"},

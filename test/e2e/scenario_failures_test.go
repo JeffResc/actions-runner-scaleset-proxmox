@@ -27,6 +27,7 @@ import (
 //     scaleset_proxmox_api_errors_total{operation="destroy"} ticks
 //     up, and the orchestrator's pool catches up to HotSize again.
 func TestE2E_DestroyIdempotentOnVMNotFound(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{HotSize: 2, MaxConcurrentRunners: 4})
 
 	require.Eventually(t, func() bool {
@@ -77,6 +78,7 @@ func TestE2E_DestroyIdempotentOnVMNotFound(t *testing.T) {
 // pool reaching its target size — the fault transparently extends
 // each VM's boot window without forcing an outright failure.
 func TestE2E_GuestAgentTransientRetry(t *testing.T) {
+	t.Parallel()
 	// Start with the fake Proxmox pre-created so we can install the
 	// fault before app.Run launches.
 	fp := fakeproxmox.New(t, fakeproxmox.Options{
@@ -122,6 +124,7 @@ func TestE2E_GuestAgentTransientRetry(t *testing.T) {
 //     budget exhausted).
 //  4. The just-cloned VM must end up destroyed in the fake.
 func TestE2E_JITInjectPersistentFailureDestroysVM(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{
 		TaskDuration: 5 * time.Millisecond,
 	})
@@ -212,6 +215,7 @@ func itoa(n int) string {
 //     starts are eventually destroyed by the orphan sweep, NOT
 //     left as a permanent quota-consuming leak.
 func TestE2E_PartialClone_StartFailureRecoversToHealthyPool(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	proxmox.InjectFault(fakeproxmox.Fault{
 		Kind:  fakeproxmox.FaultStatus500Spam,

@@ -26,15 +26,21 @@ import (
 // boot. That's fine for this scenario — we're proving the absence
 // of materialised state, not testing boot semantics in dry-run mode.
 func TestE2E_DryRunMakesNoRealClones(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{
 		HotSize:              2,
 		MaxConcurrentRunners: 4,
 		DryRun:               true,
 	})
 
-	// Give the reconcile loop a few ticks worth of headroom to attempt
-	// clones it would normally have made.
-	time.Sleep(1 * time.Second)
+	// Wait until the reconcile loop has completed several passes -- proof
+	// it had ample opportunity to attempt the clones it would normally
+	// have made -- instead of sleeping a fixed worst-case. The reconcile
+	// histogram count is the canonical "loop ran" signal (issue #295).
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_reconcile_duration_seconds_count") >= 3
+	}, 10*time.Second, 50*time.Millisecond,
+		"reconcile loop should have completed several passes")
 
 	snap := h.Proxmox.Snapshot()
 	require.Len(t, snap, 1,
@@ -69,15 +75,21 @@ func TestE2E_DryRunMakesNoRealClones(t *testing.T) {
 // ListVMs) still pass through as the production code requires
 // for /readyz.
 func TestE2E_DryRunNoStateChangingProxmoxCalls(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{
 		HotSize:              2,
 		MaxConcurrentRunners: 4,
 		DryRun:               true,
 	})
 
-	// Let the reconciler tick a few times so any leaked write
-	// calls would have fired.
-	time.Sleep(1500 * time.Millisecond)
+	// Wait until the reconciler has completed several passes so any
+	// leaked write calls would have fired, instead of sleeping a fixed
+	// worst-case. The reconcile histogram count is the canonical "loop
+	// ran" signal (issue #295).
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_reconcile_duration_seconds_count") >= 3
+	}, 10*time.Second, 50*time.Millisecond,
+		"reconcile loop should have completed several passes")
 
 	writes := h.Proxmox.WriteCalls()
 	require.Empty(t, writes,
@@ -98,6 +110,7 @@ func TestE2E_DryRunNoStateChangingProxmoxCalls(t *testing.T) {
 // has been recorded — proof the loop ran, regardless of whether
 // any individual Clone synthetic succeeded downstream.
 func TestE2E_DryRunOrchestrationStillRuns(t *testing.T) {
+	t.Parallel()
 	h := Start(t, Options{
 		HotSize:              2,
 		MaxConcurrentRunners: 4,

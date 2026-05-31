@@ -58,6 +58,7 @@ func awaitAssignedVM(t testing.TB, h *Harness, scaleSetName string) (vmid int, n
 // that the unit tests in internal/scaler and internal/pool cover only
 // in isolation.
 func TestE2E_StandaloneJobLifecycle(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{Name: "lifecycle-set"},
@@ -153,6 +154,7 @@ func TestE2E_StandaloneJobLifecycle(t *testing.T) {
 // Followers must observe none of the listener traffic (single shared
 // fakegithub session ensures this is automatic — but we still assert it).
 func TestE2E_ClusterJobLifecycle(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{Name: "cluster-lifecycle-set"},
@@ -260,6 +262,7 @@ func TestE2E_ClusterJobLifecycle(t *testing.T) {
 // and busy" case that's structurally hard to verify without a
 // real-job-in-flight scenario.
 func TestE2E_ClusterTakeoverMidJob(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{Name: "takeover-job-set"},
@@ -402,6 +405,7 @@ func TestE2E_ClusterTakeoverMidJob(t *testing.T) {
 // within PowerPollInterval (100ms in the e2e config) and call
 // MarkCompleted, which queues the destroy.
 func TestE2E_StandalonePowerOffCompletes(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{Name: "poweroff-set"},
@@ -532,6 +536,7 @@ type assignedVM struct {
 // either extra clones above MaxConcurrentRunners or a missing
 // deregistration in the final assertion.
 func TestE2E_ConcurrentJobs(t *testing.T) {
+	t.Parallel()
 	const jobs = 3
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{

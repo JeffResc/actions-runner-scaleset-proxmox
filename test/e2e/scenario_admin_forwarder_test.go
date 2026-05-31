@@ -25,6 +25,7 @@ import (
 // (raft leadership → peer-map lookup → reverse proxy) against a live
 // orchestrator.
 func TestE2E_AdminForwarderRoutesFollowerToLeader(t *testing.T) {
+	t.Parallel()
 	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	gh := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{Name: "fwd-set"},
