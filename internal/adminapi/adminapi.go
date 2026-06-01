@@ -326,6 +326,44 @@ func (s *Server) canaryFor(r *http.Request) CanaryPromoter {
 	return fn()
 }
 
+// poolOrError resolves the pool for the request, writing the standard
+// error response when it can't: 404 when a namespaced {scaleset} route
+// named an unconfigured scaleset, 503 (+ Retry-After) when we passed the
+// leader gate but the pool is momentarily nil during an election
+// handover. Returns ok=false once an error response has been written.
+func (s *Server) poolOrError(w http.ResponseWriter, r *http.Request) (pool.Manager, bool) {
+	p := s.poolFor(r)
+	if p == nil {
+		if chi.URLParam(r, "scaleset") != "" {
+			http.Error(w, "scaleset not found", http.StatusNotFound)
+			return nil, false
+		}
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	return p, true
+}
+
+// parseVMIDAndPool collapses the common prefix of the per-VM admin
+// handlers: parse and validate the {vmid} path param (400 on a
+// non-positive / unparseable value), then resolve the pool via
+// poolOrError. Returns ok=false once any error response has been
+// written.
+func (s *Server) parseVMIDAndPool(w http.ResponseWriter, r *http.Request) (int, pool.Manager, bool) {
+	vmidStr := chi.URLParam(r, "vmid")
+	vmid, err := strconv.Atoi(vmidStr)
+	if err != nil || vmid <= 0 {
+		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
+		return 0, nil, false
+	}
+	p, ok := s.poolOrError(w, r)
+	if !ok {
+		return 0, nil, false
+	}
+	return vmid, p, true
+}
+
 // SetMetrics attaches the orchestrator's Prometheus metric set so
 // handlers (preempt currently; future ones can join) can emit
 // counters from operator-driven actions. Nil disables the metric
@@ -595,17 +633,8 @@ type stateResponse struct {
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
-	p := s.poolFor(r)
-	if p == nil {
-		// We passed the leader gate yet the pool is nil — race during
-		// election handover, or the namespaced URL named a scaleset
-		// that isn't configured.
-		if chi.URLParam(r, "scaleset") != "" {
-			http.Error(w, "scaleset not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+	p, ok := s.poolOrError(w, r)
+	if !ok {
 		return
 	}
 	stats, err := p.Stats(r.Context())
@@ -715,23 +744,11 @@ func (s *Server) handlePromoteTemplate(w http.ResponseWriter, r *http.Request) {
 // "manual" to_class records that this came from operator action
 // rather than an automatic priority decision.
 func (s *Server) handlePreemptVM(w http.ResponseWriter, r *http.Request) {
-	vmidStr := chi.URLParam(r, "vmid")
-	vmid, err := strconv.Atoi(vmidStr)
-	if err != nil || vmid <= 0 {
-		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
+	vmid, p, ok := s.parseVMIDAndPool(w, r)
+	if !ok {
 		return
 	}
-	p := s.poolFor(r)
-	if p == nil {
-		if chi.URLParam(r, "scaleset") != "" {
-			http.Error(w, "scaleset not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
-		return
-	}
-	err = p.Preempt(r.Context(), vmid, "admin preempt endpoint")
+	err := p.Preempt(r.Context(), vmid, "admin preempt endpoint")
 	if err != nil {
 		if errors.Is(err, pool.ErrPreemptRefused) {
 			http.Error(w, err.Error(), http.StatusConflict)
@@ -762,20 +779,8 @@ func (s *Server) handlePreemptVM(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
-	vmidStr := chi.URLParam(r, "vmid")
-	vmid, err := strconv.Atoi(vmidStr)
-	if err != nil || vmid <= 0 {
-		http.Error(w, fmt.Sprintf("invalid vmid %q", vmidStr), http.StatusBadRequest)
-		return
-	}
-	p := s.poolFor(r)
-	if p == nil {
-		if chi.URLParam(r, "scaleset") != "" {
-			http.Error(w, "scaleset not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "leader transition in progress", http.StatusServiceUnavailable)
+	vmid, p, ok := s.parseVMIDAndPool(w, r)
+	if !ok {
 		return
 	}
 	// ForceDestroy (not MarkCompleted): MarkCompleted only acts on

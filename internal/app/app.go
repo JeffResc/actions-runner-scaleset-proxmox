@@ -128,34 +128,9 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 
-	// Per-scaleset provisioners + per-scaleset state slots. Each
-	// scale set gets its own provisioner (own scaleSetName + own
-	// in-flight/destroyed trackers) and its own atomic.Pointer
-	// pair for pool.Manager / canary.Controller — populated when
-	// this replica is leader, cleared on deposal.
-	scStates := make(map[string]*scalesetState, len(cfg.Scalesets))
-	for _, s := range cfg.Scalesets {
-		vmPrefix := fmt.Sprintf("gh-runner-%s-", s.Name)
-		prov, err := provisioner.New(ctx, cfg.Proxmox, s.Name, vmPrefix, provisioner.Options{
-			CloneInflightTTL:     cfg.Pool.CloneInflightGrace.D(),
-			RecentlyDestroyedTTL: cfg.Pool.VMIDReuseCooldown.D() * 4,
-		}, log)
-		if err != nil {
-			return fmt.Errorf("init provisioner for scaleset %q: %w", s.Name, err)
-		}
-		scStates[s.Name] = &scalesetState{name: s.Name, prov: prov, vmPrefix: vmPrefix}
-	}
-
-	// Pick any scaleset's provisioner for the shared
-	// health-refresher ping and the admin-server construction.
-	// All provisioners hit the same Proxmox endpoint, so any
-	// liveness ping is representative; adminapi.New takes a
-	// provisioner only as a future-proofing hook (no handler
-	// reads from it today).
-	var sharedProv provisioner.Provisioner
-	for _, s := range cfg.Scalesets {
-		sharedProv = scStates[s.Name].prov
-		break
+	scStates, sharedProv, err := initScalesetStates(ctx, cfg, log)
+	if err != nil {
+		return err
 	}
 
 	sel, err := buildNodeSelector(cfg, sharedProv)
@@ -800,30 +775,53 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 	g, ctxg := errgroup.WithContext(leaderCtx)
 	g.Go(func() error { return mgr.Run(ctxg) })
 	if schedRunner != nil {
-		g.Go(func() error {
-			err := schedRunner.Run(ctxg)
-			if errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return err
-		})
+		g.Go(func() error { return runSwallowCancel(func() error { return schedRunner.Run(ctxg) }) })
 	}
-	g.Go(func() error {
-		err := rec.Run(ctxg)
-		if errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
-	})
+	g.Go(func() error { return runSwallowCancel(func() error { return rec.Run(ctxg) }) })
 	g.Go(func() error {
 		health.MarkScalesetListenerConnected(entry.Name)
-		err := lst.Run(ctxg, sc)
-		if errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
+		return runSwallowCancel(func() error { return lst.Run(ctxg, sc) })
 	})
 	return g.Wait()
+}
+
+// runSwallowCancel runs fn and treats context.Canceled as a clean exit
+// (nil) — the convention every per-scaleset worker shares on drain /
+// SIGTERM, so a graceful shutdown doesn't surface as an errgroup error.
+func runSwallowCancel(fn func() error) error {
+	if err := fn(); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+// initScalesetStates builds one provisioner + state slot per configured
+// scaleset (each gets its own scaleSetName + in-flight/destroyed
+// trackers and its own atomic.Pointer pair for pool.Manager /
+// canary.Controller, populated on leadership and cleared on deposal). It
+// also returns a "shared" provisioner — any one works for the
+// health-refresher ping and admin-server construction, since all
+// provisioners hit the same Proxmox endpoint and adminapi.New takes one
+// only as a future-proofing hook.
+func initScalesetStates(ctx context.Context, cfg *config.Config, log *slog.Logger) (map[string]*scalesetState, provisioner.Provisioner, error) {
+	scStates := make(map[string]*scalesetState, len(cfg.Scalesets))
+	for _, s := range cfg.Scalesets {
+		vmPrefix := fmt.Sprintf("gh-runner-%s-", s.Name)
+		prov, err := provisioner.New(ctx, cfg.Proxmox, s.Name, vmPrefix, provisioner.Options{
+			CloneInflightTTL:     cfg.Pool.CloneInflightGrace.D(),
+			RecentlyDestroyedTTL: cfg.Pool.VMIDReuseCooldown.D() * 4,
+		}, log)
+		if err != nil {
+			return nil, nil, fmt.Errorf("init provisioner for scaleset %q: %w", s.Name, err)
+		}
+		scStates[s.Name] = &scalesetState{name: s.Name, prov: prov, vmPrefix: vmPrefix}
+	}
+	var sharedProv provisioner.Provisioner
+	for _, s := range cfg.Scalesets {
+		sharedProv = scStates[s.Name].prov
+		break
+	}
+	return scStates, sharedProv, nil
 }
 
 // registerScalesetAccessors wires the admin API's namespaced

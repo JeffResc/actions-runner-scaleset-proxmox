@@ -601,33 +601,9 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 	for _, row := range rows {
 		known[row.Name] = struct{}{}
 	}
+	r.pruneOrphanTracking(known, runners, truncated)
+
 	now := r.now()
-	// Prune entries that are no longer orphaned. Two cases:
-	//   - matched to a DB row this tick: drop unconditionally.
-	//   - not in `runners` AND `runners` is non-empty AND the listing
-	//     was complete: drop, because GitHub authoritatively says the
-	//     runner is gone.
-	// We deliberately do NOT drop entries when `runners` is empty —
-	// that's almost always a transient state between jobs, and resetting
-	// the grace clock here is the bug this code path is guarding
-	// against. We ALSO skip absence-based pruning when the listing was
-	// truncated at the pagination cap: a runner on an un-fetched page
-	// looks "gone" from this partial view, and dropping its first-seen
-	// entry every tick resets the orphan-grace clock so a real orphan
-	// could evade the reaper indefinitely (#337). A genuinely-removed
-	// runner is pruned on the next tick whose listing is complete.
-	for name := range r.orphanFirstSeen {
-		if _, ok := known[name]; ok {
-			delete(r.orphanFirstSeen, name)
-			continue
-		}
-		if len(runners) == 0 || truncated {
-			continue
-		}
-		if _, ok := runners[name]; !ok {
-			delete(r.orphanFirstSeen, name)
-		}
-	}
 	for name, gr := range runners {
 		if _, ok := known[name]; ok {
 			continue
@@ -644,25 +620,65 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 		}
 		r.log.Info("reconcile: orphan github runner; removing",
 			"name", name, "runner_id", gr.ID, "orphan_age", now.Sub(firstSeen))
-		rmCtx, cancel := context.WithTimeout(ctx, cleanupTimeoutPerRunner)
-		var err error
-		if r.cfg.Scope.Org != "" {
-			_, err = r.gh.Actions.RemoveOrganizationRunner(rmCtx, r.cfg.Scope.Org, gr.ID)
-		} else {
-			owner, repo := splitRepo(r.cfg.Scope.Repo)
-			_, err = r.gh.Actions.RemoveRunner(rmCtx, owner, repo, gr.ID)
-		}
-		cancel()
-		if err != nil {
+		if err := r.removeRunner(ctx, gr.ID); err != nil {
 			r.log.Warn("reconcile: orphan runner removal failed", "name", name, "err", err)
-			if r.metrics != nil {
-				r.metrics.GitHubErrors.WithLabelValues(r.cfg.ScaleSetName, "remove_runner").Inc()
-			}
 			// Leave in tracking so the next tick retries.
 			continue
 		}
 		delete(r.orphanFirstSeen, name)
 	}
+}
+
+// pruneOrphanTracking drops r.orphanFirstSeen entries that are no longer
+// orphaned:
+//   - matched to a DB row this tick: drop unconditionally.
+//   - absent from a NON-empty, COMPLETE runner listing: drop, because
+//     GitHub authoritatively says the runner is gone.
+//
+// It deliberately does NOT drop entries when `runners` is empty (almost
+// always a transient state between jobs — resetting the grace clock here
+// is the bug this guards against) nor when the listing was truncated at
+// the pagination cap (a runner on an un-fetched page looks "gone" from
+// the partial view; dropping its entry every tick would reset the
+// grace clock so a real orphan could evade the reaper indefinitely,
+// #337). A genuinely-removed runner is pruned on the next complete tick.
+func (r *Reconciler) pruneOrphanTracking(known map[string]struct{}, runners map[string]pool.RunnerInfo, truncated bool) {
+	for name := range r.orphanFirstSeen {
+		if _, ok := known[name]; ok {
+			delete(r.orphanFirstSeen, name)
+			continue
+		}
+		if len(runners) == 0 || truncated {
+			continue
+		}
+		if _, ok := runners[name]; !ok {
+			delete(r.orphanFirstSeen, name)
+		}
+	}
+}
+
+// removeRunner deregisters one GitHub runner by ID, owning the per-call
+// timeout, the org-vs-repo scope dispatch, and the failure metric.
+// Returns nil on success (the caller drops its tracking entry) or the
+// error after recording github_errors (the caller leaves the entry for
+// a next-tick retry).
+func (r *Reconciler) removeRunner(ctx context.Context, id int64) error {
+	rmCtx, cancel := context.WithTimeout(ctx, cleanupTimeoutPerRunner)
+	defer cancel()
+	var err error
+	if r.cfg.Scope.Org != "" {
+		_, err = r.gh.Actions.RemoveOrganizationRunner(rmCtx, r.cfg.Scope.Org, id)
+	} else {
+		owner, repo := splitRepo(r.cfg.Scope.Repo)
+		_, err = r.gh.Actions.RemoveRunner(rmCtx, owner, repo, id)
+	}
+	if err != nil {
+		if r.metrics != nil {
+			r.metrics.GitHubErrors.WithLabelValues(r.cfg.ScaleSetName, "remove_runner").Inc()
+		}
+		return err
+	}
+	return nil
 }
 
 // sweepProxmoxOrphans finds VMs that Proxmox knows about (and that carry
