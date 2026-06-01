@@ -206,6 +206,20 @@ type manager struct {
 	bootSem    *semaphore.Weighted // concurrent Start/WaitReady ops
 	wg         sync.WaitGroup      // tracks in-flight async operations
 
+	// drainMu guards `draining` and serialises it against destroyAsync's
+	// wg.Add. The external producers of destroyAsync — the GitHub
+	// listener (MarkCompleted, Preempt) and the REST reconciler
+	// (ForceDestroy) — are sibling errgroup goroutines that unwind
+	// concurrently with drain() on shutdown. Without this gate one of
+	// them could call wg.Add(1) while drain()'s wg.Wait() is parked at
+	// counter 0, panicking with "WaitGroup misuse: Add called
+	// concurrently with Wait". drain() sets `draining` under this lock
+	// BEFORE it starts waiting, so every later destroyAsync sees it and
+	// skips the Add; the abandoned row self-heals via the orphan sweep
+	// on the next leader start.
+	drainMu  sync.Mutex
+	draining bool
+
 	// destroyQueue is the bounded backlog for destroyAsync. A single
 	// dispatcher goroutine reads from it, acquires destroySem, and
 	// spawns the actual destroy worker. The bound keeps a destroy
@@ -2012,7 +2026,22 @@ type destroyRequest struct {
 // m.wg is incremented up-front so drain() waits for queued-but-not-yet-
 // processed work in addition to in-flight destroys.
 func (m *manager) destroyAsync(vmid int, node, profile string) {
+	// Gate the wg.Add against drain(): once draining has begun, a new
+	// enqueue here would either race wg.Wait() (WaitGroup-misuse panic)
+	// or land after Wait returned and be silently dropped by the
+	// dispatcher (leaked VM). Skip it instead — the row is left in its
+	// transient state and the orphan sweep on the next leader start
+	// re-handles it. The Add happens under the lock so it strictly
+	// precedes the `draining = true` write that drain() makes before
+	// parking on wg.Wait().
+	m.drainMu.Lock()
+	if m.draining {
+		m.drainMu.Unlock()
+		m.log.Debug("destroy: draining; skipping enqueue, orphan sweep will re-handle", "vmid", vmid)
+		return
+	}
 	m.wg.Add(1)
+	m.drainMu.Unlock()
 	select {
 	case m.destroyQueue <- destroyRequest{vmid: vmid, node: node, profile: profile}:
 		if m.metrics != nil {
@@ -2244,6 +2273,14 @@ func (m *manager) allocateVMID(ctx context.Context) (int, error) {
 // or a post-cancel grace period elapses.
 func (m *manager) drain() {
 	m.log.Info("pool: draining")
+	// Mark draining BEFORE parking on wg.Wait() below. Under drainMu this
+	// strictly orders against destroyAsync's gated wg.Add: any external
+	// producer (listener/reconciler) that beats this write completed its
+	// Add already and is counted; any that loses sees draining=true and
+	// skips the Add entirely. Either way no Add races the wg.Wait().
+	m.drainMu.Lock()
+	m.draining = true
+	m.drainMu.Unlock()
 	// Always cancel the worker context on the way out, so any goroutine
 	// that spawns racing with drain (e.g. a late-arriving destroyAsync
 	// from a state-sweep that ran on the last reconcile tick) doesn't

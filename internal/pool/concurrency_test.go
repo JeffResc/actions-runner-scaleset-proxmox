@@ -459,6 +459,88 @@ func TestDrain_ReleasesDestroySemTokensOnTimeout(t *testing.T) {
 	mgr.destroySem.Release(8)
 }
 
+// TestDestroyAsync_SkippedAfterDrainBegins pins the #333 fix contract:
+// once drain() has begun, destroyAsync must NOT call wg.Add (which
+// would either race the parked wg.Wait — panicking with "WaitGroup
+// misuse" — or land after Wait returned and be silently dropped). The
+// enqueue is skipped entirely; the row self-heals via the orphan sweep.
+func TestDestroyAsync_SkippedAfterDrainBegins(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{DrainTimeout: 100 * time.Millisecond})
+
+	// Idle pool: wg is 0, so drain() returns promptly after marking
+	// draining=true and cancelling the worker ctx.
+	mgr.drain()
+
+	// A late external producer (listener/reconciler unwinding) calls in.
+	mgr.destroyAsync(12345, "pve1", defaultProfileName)
+
+	require.Zero(t, len(mgr.destroyQueue),
+		"destroyAsync must skip the enqueue once draining has begun")
+}
+
+// TestDrain_ConcurrentExternalProducersNoWaitGroupPanic stresses the
+// #333 race: the GitHub listener (MarkCompleted) keeps firing while the
+// manager shuts down and drain() parks on wg.Wait(). With the gate in
+// place no Add races the Wait, so Run returns cleanly; without it this
+// panics intermittently with "WaitGroup misuse: Add called concurrently
+// with Wait" (run under -race to maximise detection).
+func TestDrain_ConcurrentExternalProducersNoWaitGroupPanic(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+
+	const seeded = 64
+	for i := 0; i < seeded; i++ {
+		require.NoError(t, st.Insert(&store.VM{
+			VMID:     70000 + i,
+			Node:     "pve1",
+			Name:     "victim",
+			Profile:  defaultProfileName,
+			PoolKind: store.PoolKindHot,
+			State:    store.StateAssigned,
+		}))
+	}
+
+	mgr := newTestManager(t, st, fp, Config{DrainTimeout: time.Second})
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- mgr.Run(ctx) }()
+
+	// Hammer MarkCompleted (an external producer of destroyAsync) from
+	// several goroutines straight through the cancel(), so some calls
+	// land while drain() is parked on wg.Wait().
+	var producers sync.WaitGroup
+	stop := make(chan struct{})
+	for g := 0; g < 4; g++ {
+		producers.Add(1)
+		go func(base int) {
+			defer producers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					for i := 0; i < seeded; i++ {
+						_ = mgr.MarkCompleted(context.Background(), 70000+i)
+					}
+				}
+			}
+		}(g)
+	}
+
+	cancel() // trigger shutdown → drain() while producers still fire
+	select {
+	case err := <-runDone:
+		require.NoError(t, err, "Run must return cleanly without a WaitGroup-misuse panic")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after shutdown")
+	}
+	close(stop)
+	producers.Wait()
+}
+
 // TestAcquire_NoDoubleAssignmentOnHeadOfQueueCollision pins
 // the canonical double-assignment hazard described in issue #285:
 // when N callers race to Acquire from a Hot pool containing
