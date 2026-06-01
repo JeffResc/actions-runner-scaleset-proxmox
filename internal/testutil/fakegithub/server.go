@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -68,6 +69,13 @@ type Options struct {
 	// JIT mint counter; the orchestrator's per-scaleset workers route
 	// to the right entry via the URL {id} param.
 	Scalesets []ScaleSetOptions
+
+	// PageSize, when > 0, makes the runner-list endpoint paginate: each
+	// response returns at most PageSize runners and, when more remain,
+	// sets a GitHub-style `Link: ...; rel="next"` header so the
+	// reconciler's pagination loop follows it. Zero (the default)
+	// returns every runner in one page (back-compat).
+	PageSize int
 }
 
 // Server is the fake GitHub REST API. Construct with New; the embedded
@@ -78,6 +86,22 @@ type Server struct {
 	mu        sync.Mutex
 	runners   map[int64]Runner
 	deletions []int64
+
+	// pageSize mirrors Options.PageSize: 0 = single-page (back-compat).
+	pageSize int
+
+	// listFault, when count > 0, makes the next `count` runner-list
+	// calls return `status` (typically 429) with a Retry-After header,
+	// exercising the reconciler's rate-limit/5xx retry+backoff path.
+	// Each matched call decrements count.
+	listFault httpFault
+
+	// deleteFault, when count > 0, makes the next `count` runner-DELETE
+	// calls return `status` with a GitHub-shaped JSON error body —
+	// used to exercise the destroy path's OnRunnerOrphaned failure
+	// branch (a leaked GitHub registration). Each matched call
+	// decrements count.
+	deleteFault httpFault
 
 	// scalesets is the per-scaleset state, indexed by scaleset name
 	// (the operator-facing identifier). scalesetsByID is a parallel
@@ -119,6 +143,7 @@ func New(t testing.TB, opts Options) *Server {
 		scalesets:     make(map[string]*scalesetEntry, len(specs)),
 		scalesetsByID: make(map[int]*scalesetEntry, len(specs)),
 		adminToken:    mintAdminJWT(),
+		pageSize:      opts.PageSize,
 	}
 	for _, spec := range specs {
 		entry := &scalesetEntry{spec: spec, jitMintsByName: map[string]int{}}
@@ -285,16 +310,61 @@ func (s *Server) routes() http.Handler {
 	r := chi.NewRouter()
 
 	// List runners — both org and repo scopes return the same shape.
-	listHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	listHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+
+		// Injectable rate-limit / transient failure: exercise the
+		// reconciler's 429/5xx retry+backoff path.
+		if f, ok := s.takeListFaultLocked(); ok {
+			if f.retryAfter > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(f.retryAfter))
+			}
+			writeRateLimitHeaders(w, 5000, 0, 0)
+			writeGitHubError(w, f.status, "API rate limit exceeded")
+			return
+		}
+
+		// Always advertise production-shaped rate-limit headers on the
+		// success path so the reconciler sees realistic responses.
+		writeRateLimitHeaders(w, 5000, 4999, 0)
+
+		// Collect a sorted snapshot so pagination slices deterministically.
+		all := make([]Runner, 0, len(s.runners))
+		for _, r := range s.runners {
+			all = append(all, r)
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
+
+		// Pagination: default (pageSize == 0) returns everything in one
+		// page. Otherwise slice by the ?page= query param (1-based) and
+		// set a Link rel="next" header when more pages remain.
+		perPage := s.pageSize
+		pageItems := all
+		if perPage > 0 {
+			page := 1
+			if p, err := strconv.Atoi(req.URL.Query().Get("page")); err == nil && p > 0 {
+				page = p
+			}
+			start := (page - 1) * perPage
+			if start > len(all) {
+				start = len(all)
+			}
+			end := start + perPage
+			if end > len(all) {
+				end = len(all)
+			}
+			pageItems = all[start:end]
+			if end < len(all) {
+				w.Header().Set("Link", linkNextHeader(s.URL, req.URL.Path, page+1, perPage))
+			}
+		}
+
 		body := struct {
 			TotalCount int              `json:"total_count"`
 			Runners    []*github.Runner `json:"runners"`
 		}{TotalCount: len(s.runners)}
-		// Sorted iteration would be ideal for deterministic test output,
-		// but the reconciler doesn't rely on ordering — keep it simple.
-		for _, r := range s.runners {
+		for _, r := range pageItems {
 			id, name, status, busy := r.ID, r.Name, r.Status, r.Busy
 			body.Runners = append(body.Runners, &github.Runner{
 				ID:     &id,
@@ -313,13 +383,19 @@ func (s *Server) routes() http.Handler {
 		raw := chi.URLParam(req, "id")
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			http.Error(w, "bad id", http.StatusBadRequest)
+			writeGitHubError(w, http.StatusBadRequest, "invalid runner id")
 			return
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		// Injectable deregister failure (#327): drive the destroy
+		// path's OnRunnerOrphaned failure branch.
+		if f, ok := s.takeDeleteFaultLocked(); ok {
+			writeGitHubError(w, f.status, "runner deregistration failed")
+			return
+		}
 		if _, ok := s.runners[id]; !ok {
-			http.Error(w, fmt.Sprintf("runner %d not found", id), http.StatusNotFound)
+			writeGitHubError(w, http.StatusNotFound, fmt.Sprintf("runner %d not found", id))
 			return
 		}
 		delete(s.runners, id)

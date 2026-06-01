@@ -2415,6 +2415,42 @@ func TestDestroy_OnRunnerOrphanedErrorDoesNotBlockDestroy(t *testing.T) {
 	require.Error(t, err, "row must be deleted after destroy regardless of callback outcome")
 }
 
+// TestDestroy_ProvFailureEmitsMetricAndLeavesRowForRetry pins #327:
+// when prov.Destroy fails (flaky Proxmox during teardown), the failure
+// must be observable on proxmox_api_errors_total{operation="destroy"}
+// and the store row must survive so the reconcile loop re-queues it.
+// Pre-fix the failure was invisible (no metric) and easy to mistake for
+// a no-op.
+func TestDestroy_ProvFailureEmitsMetricAndLeavesRowForRetry(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{destroyErr: errors.New("proxmox unreachable")}
+
+	mgr := newTestManager(t, st, fp, Config{HotSize: 1, ScaleSetName: "test"})
+
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 10042, Node: "pve1", Name: "x",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot, State: store.StateHot,
+	}))
+	_, err := st.UpdateState(10042, store.StateHot, store.StateDestroying, nil)
+	require.NoError(t, err)
+
+	before := testutil.ToFloat64(mgr.metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1"))
+	mgr.destroy(context.Background(), 10042, "pve1")
+	after := testutil.ToFloat64(mgr.metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1"))
+
+	require.Equal(t, before+1, after,
+		"a failed prov.Destroy must increment proxmox_api_errors_total{operation=destroy}")
+
+	// The row survives so the next reconcile pass retries the destroy.
+	got, err := st.Get(10042)
+	require.NoError(t, err, "row must survive a failed destroy so it can be retried")
+	require.Equal(t, store.StateDestroying, got.State)
+
+	// And no spurious "destroyed" outcome was recorded.
+	destroyed := testutil.ToFloat64(mgr.metrics.VMsTotal.WithLabelValues("test", defaultProfileName, "destroyed"))
+	require.Equal(t, 0.0, destroyed, "a failed destroy must NOT count as a successful destroy")
+}
+
 // TestDestroy_OnRunnerOrphanedRunsEvenWhenParentCtxCancelled: a
 // force-drain cancels the worker ctx after prov.Destroy returns but
 // before OnRunnerOrphaned completes its GitHub round-trip. The fix

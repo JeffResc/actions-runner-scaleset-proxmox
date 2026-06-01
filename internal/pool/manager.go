@@ -2136,6 +2136,13 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	if err := m.prov.Destroy(dctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "destroy failed")
+		// Emit a metric so an abandoned destroy is observable. Without
+		// this the row survives, the VM may already be gone in Proxmox
+		// (→ orphan), the `destroyed` counter below never increments,
+		// and the failure is invisible to telemetry. The row is left in
+		// place so the reconcile loop's stuck-state sweep re-queues it
+		// on the next pass.
+		m.metrics.RecordProxmoxError(m.cfg.ScaleSetName, "destroy", node)
 		m.log.Warn("destroy: provisioner failed", "vmid", vmid, "err", err)
 		return
 	}
