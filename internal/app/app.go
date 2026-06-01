@@ -300,7 +300,7 @@ func Run(ctx context.Context, opts Options) error {
 		})
 	}
 
-	admin, err := adminapi.New(adminAPIConfig, defaultPoolFn, sharedProv, buildAdminGate(cfg, coord, adminClientTLS), func() {
+	admin, err := adminapi.New(adminAPIConfig, defaultPoolFn, sharedProv, buildAdminGate(cfg, coord, adminClientTLS, log), func() {
 		log.Warn("admin drain triggered; cancelling root context")
 		cancel()
 	}, log)
@@ -518,11 +518,11 @@ func (g *coordAdminGate) Forward(w http.ResponseWriter, r *http.Request) {
 // leader. When admin TLS is configured, the Forwarder dials the leader
 // over https with the same TLSConfig (so a private-CA mTLS bundle
 // applies on both ends).
-func buildAdminGate(cfg *config.Config, coord cluster.Coordinator, tlsClient *tls.Config) adminapi.LeaderGate {
+func buildAdminGate(cfg *config.Config, coord cluster.Coordinator, tlsClient *tls.Config, log *slog.Logger) adminapi.LeaderGate {
 	if cfg.Cluster.Mode == "standalone" {
 		return adminapi.AlwaysLeader{}
 	}
-	return &coordAdminGate{coord: coord, fwd: cluster.NewForwarder(coord, tlsClient)}
+	return &coordAdminGate{coord: coord, fwd: cluster.NewForwarder(coord, tlsClient, cluster.WithForwarderLogger(log))}
 }
 
 // buildNodeSelector translates config into a Selector. Pass the

@@ -45,19 +45,25 @@ func TestForwarder_NoLeader_Returns503WithRetryAfter(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "no leader")
 }
 
-// TestForwarder_CoordError_Returns503WithRetryAfter covers the
-// LeaderEndpoint-errors path: same 503 + Retry-After shape so the
-// caller can't distinguish "no leader yet" from "coordinator
-// transiently failed" — both are retryable.
-func TestForwarder_CoordError_Returns503WithRetryAfter(t *testing.T) {
+// TestForwarder_CoordError_Returns502WithErrorText covers the
+// LeaderEndpoint-errors path (#338): a genuine lookup error (e.g. a
+// peer-map misconfiguration) is NOT a transient election, so it must
+// surface as a distinct 502 with the error text — no Retry-After — so an
+// operator can tell it apart from the "no leader yet" 503 instead of
+// chasing a misleading retry signal.
+func TestForwarder_CoordError_Returns502WithErrorText(t *testing.T) {
 	t.Parallel()
 	f := NewForwarder(stubCoord{err: errors.New("raft store unavailable")}, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
 	f.ServeHTTP(rec, req)
 
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
-	require.Equal(t, "2", rec.Header().Get("Retry-After"))
+	require.Equal(t, http.StatusBadGateway, rec.Code,
+		"a real leader-lookup error must surface as 502, not a transient 503")
+	require.Empty(t, rec.Header().Get("Retry-After"),
+		"a config-bug error must NOT advertise Retry-After like a transient election")
+	require.Contains(t, rec.Body.String(), "raft store unavailable",
+		"the error text must be surfaced so the misconfiguration is debuggable")
 }
 
 // TestForwarder_LeaderUnreachable_Returns502 pins the distinction

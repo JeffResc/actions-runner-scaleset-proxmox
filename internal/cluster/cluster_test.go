@@ -803,7 +803,10 @@ func TestForwarder_LeaderUnreachableReturns502(t *testing.T) {
 	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
 }
 
-func TestForwarder_LookupErrorTreatedAsNoLeader(t *testing.T) {
+// TestForwarder_LookupErrorReturns502 pins #338: a genuine
+// LeaderEndpoint lookup error (a peer-map misconfiguration, not an
+// in-flight election) surfaces as 502, distinct from the no-leader 503.
+func TestForwarder_LookupErrorReturns502(t *testing.T) {
 	t.Parallel()
 
 	fwd := NewForwarder(&fakeCoord{err: errors.New("lookup failed")}, nil)
@@ -815,7 +818,8 @@ func TestForwarder_LookupErrorTreatedAsNoLeader(t *testing.T) {
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	require.Empty(t, resp.Header.Get("Retry-After"))
 }
 
 // TestForwarder_TLSDialsHTTPS: with a non-nil tlsClient, the Forwarder
