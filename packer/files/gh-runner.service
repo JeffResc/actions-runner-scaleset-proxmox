@@ -21,7 +21,10 @@ WorkingDirectory=/opt/actions-runner
 # the same command worked perfectly from a shell.
 EnvironmentFile=/opt/actions-runner/jitconfig.env
 
-ExecStart=/opt/actions-runner/run.sh --jitconfig ${JIT_CONFIG}
+# Quote the expansion: systemd word-splits an unquoted ${VAR}, which is
+# fragile (it works today only because the JIT blob is space-free base64)
+# and would pass no argument at all for an empty file.
+ExecStart=/opt/actions-runner/run.sh --jitconfig "${JIT_CONFIG}"
 
 # Regardless of the runner's exit code, power the VM off so the
 # orchestrator's destroy path doesn't have to wait on shutdown.

@@ -363,7 +363,12 @@ func runHealthRefresher(ctx context.Context, prov provisioner.Provisioner, healt
 	const interval = 15 * time.Second
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
-	if err := prov.Ping(ctx); err == nil {
+	if err := prov.Ping(ctx); err != nil {
+		// Log the initial probe failure at warn so a Proxmox-down start
+		// is visible immediately, instead of silence until the first
+		// refresher tick (~15s later).
+		log.Warn("proxmox health probe failed", "err", err)
+	} else {
 		health.MarkProxmoxOK()
 	}
 	for {
