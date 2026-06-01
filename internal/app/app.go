@@ -210,6 +210,7 @@ func Run(ctx context.Context, opts Options) error {
 			state := scStates[entry.Name]
 			g.Go(func() error {
 				return superviseScaleset(ctxg, entry, state, log,
+					scalesetRetryInitialBackoff, scalesetRetryMaxBackoff,
 					func(ctx context.Context, entry config.ScaleSetEntry, state *scalesetState) error {
 						return runOneScaleset(ctx, deps, entry, state)
 					})
@@ -853,26 +854,67 @@ func registerScalesetAccessors(admin *adminapi.Server, scStates map[string]*scal
 	}
 }
 
-// superviseScaleset wraps one per-scaleset worker so a panic or
-// returned error in scale set A does not poison scale set B.
-// On panic: log + recover. On error: log + return nil so the
-// outer errgroup keeps the siblings running. Sibling shutdown
-// still happens via ctx cancel on SIGTERM / drain / process-
-// wide failure.
+// superviseScaleset bounds (in time, not attempts) and retries one
+// per-scaleset worker so a panic or transient error in scale set A does
+// not poison scale set B — and, crucially, does not permanently disable
+// scale set A. A momentary GitHub/Proxmox blip during startup used to
+// log + return nil with no retry, which left that scaleset dead for the
+// life of the leader and (because /readyz is all-or-nothing) wedged the
+// whole pod at 503 until a manual restart.
+//
+// On panic or a non-context error we retry with capped exponential
+// backoff so the scaleset self-heals; once it gets far enough to call
+// MarkScalesetListenerConnected / MarkScalesetRecoveryDone, readiness
+// flips on its own. ctx cancellation (SIGTERM / drain / process-wide
+// failure) exits cleanly without retry. Always returns nil so the outer
+// errgroup keeps siblings running.
+// scalesetRetryInitialBackoff / scalesetRetryMaxBackoff are the
+// production restart-backoff schedule passed by the Run call site;
+// tests call superviseScaleset directly with tiny values.
+const (
+	scalesetRetryInitialBackoff = 1 * time.Second
+	scalesetRetryMaxBackoff     = 30 * time.Second
+)
+
 func superviseScaleset(ctx context.Context, entry config.ScaleSetEntry, state *scalesetState, log *slog.Logger,
+	initialBackoff, maxBackoff time.Duration,
+	run func(context.Context, config.ScaleSetEntry, *scalesetState) error) error {
+	backoff := initialBackoff
+	for attempt := 1; ; attempt++ {
+		err := runScalesetAttempt(ctx, entry, state, log, run)
+		if err == nil {
+			return nil // clean shutdown (run swallows ctx.Canceled → nil)
+		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			// Clean shutdown (SIGTERM / drain), not a worker failure to
+			// propagate — returning nil is intentional here.
+			return nil //nolint:nilerr // ctx cancellation is a clean exit, not an error to surface
+		}
+		log.Error("scaleset worker failed; retrying with backoff",
+			"scaleset", entry.Name, "attempt", attempt, "backoff", backoff, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// runScalesetAttempt runs one supervised attempt, converting a panic
+// into an error so the caller's retry loop treats it like any other
+// transient failure.
+func runScalesetAttempt(ctx context.Context, entry config.ScaleSetEntry, state *scalesetState, log *slog.Logger,
 	run func(context.Context, config.ScaleSetEntry, *scalesetState) error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("scaleset worker panicked", "scaleset", entry.Name, "panic", fmt.Sprintf("%v", r))
-			err = nil // sibling-isolated: never propagate
+			err = fmt.Errorf("scaleset %q panicked: %v", entry.Name, r)
 		}
 	}()
-	if err := run(ctx, entry, state); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			log.Error("scaleset worker failed; siblings unaffected", "scaleset", entry.Name, "err", err)
-		}
-	}
-	return nil
+	return run(ctx, entry, state)
 }
 
 // ensureScaleSetForEntry is the per-entry variant of the

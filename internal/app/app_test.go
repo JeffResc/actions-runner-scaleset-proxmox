@@ -118,34 +118,80 @@ func TestMergeLeaderPlaneErr(t *testing.T) {
 	})
 }
 
+// fast per-scaleset retry backoff so the retry path runs in
+// milliseconds in tests.
+const (
+	testRetryInitial = time.Millisecond
+	testRetryMax     = 5 * time.Millisecond
+)
+
 // TestSuperviseScaleset_PanicIsolated locks in the multi-scaleset
 // supervisor's failure-isolation contract (issue #1): a panic in
 // one scaleset's worker MUST NOT propagate to its siblings via
-// the outer errgroup. The supervisor recovers, logs, and returns
-// nil so the errgroup keeps the other scalesets running.
+// the outer errgroup. The supervisor recovers, logs, retries, and
+// (once the worker stops panicking) returns nil — proving a panic
+// neither poisons siblings nor permanently disables the scaleset.
 func TestSuperviseScaleset_PanicIsolated(t *testing.T) {
 	t.Parallel()
 	entry := config.ScaleSetEntry{Name: "panicky", Scope: config.GitHubScope{Org: "x"}}
 	state := &scalesetState{name: "panicky"}
-	got := superviseScaleset(t.Context(), entry, state, silentLogger(),
+	var calls int
+	got := superviseScaleset(t.Context(), entry, state, silentLogger(), testRetryInitial, testRetryMax,
 		func(context.Context, config.ScaleSetEntry, *scalesetState) error {
-			panic("simulated worker panic")
+			calls++
+			if calls == 1 {
+				panic("simulated worker panic")
+			}
+			return nil
 		})
 	require.NoError(t, got, "panicking worker must NOT propagate up; sibling scalesets keep running")
+	require.Equal(t, 2, calls, "a panicked worker must be retried, not permanently disabled (#334)")
 }
 
-// TestSuperviseScaleset_ErrorIsolated covers the same isolation
-// contract for returned errors: a non-canceled error from one
-// worker is logged and swallowed so siblings continue.
-func TestSuperviseScaleset_ErrorIsolated(t *testing.T) {
+// TestSuperviseScaleset_TransientErrorRetriesThenSucceeds pins the
+// #334 fix: a transient startup failure (GitHub/Proxmox blip) must be
+// retried, not log+return-nil-forever. The worker errors once then
+// succeeds; the supervisor retries and returns nil.
+func TestSuperviseScaleset_TransientErrorRetriesThenSucceeds(t *testing.T) {
 	t.Parallel()
-	entry := config.ScaleSetEntry{Name: "broken", Scope: config.GitHubScope{Org: "x"}}
-	state := &scalesetState{name: "broken"}
-	got := superviseScaleset(t.Context(), entry, state, silentLogger(),
+	entry := config.ScaleSetEntry{Name: "flaky", Scope: config.GitHubScope{Org: "x"}}
+	state := &scalesetState{name: "flaky"}
+	var calls int
+	got := superviseScaleset(t.Context(), entry, state, silentLogger(), testRetryInitial, testRetryMax,
 		func(context.Context, config.ScaleSetEntry, *scalesetState) error {
-			return errors.New("simulated worker error")
+			calls++
+			if calls < 3 {
+				return errors.New("simulated transient error")
+			}
+			return nil
 		})
 	require.NoError(t, got)
+	require.Equal(t, 3, calls, "transient errors must be retried until the worker recovers")
+}
+
+// TestSuperviseScaleset_PersistentFailureRetriesUntilCtxCanceled
+// proves the supervisor keeps retrying a persistently-failing worker
+// (rather than giving up after one error) and exits cleanly only when
+// the context is cancelled — the shutdown path.
+func TestSuperviseScaleset_PersistentFailureRetriesUntilCtxCanceled(t *testing.T) {
+	t.Parallel()
+	entry := config.ScaleSetEntry{Name: "wedged", Scope: config.GitHubScope{Org: "x"}}
+	state := &scalesetState{name: "wedged"}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var calls atomic.Int64
+	got := superviseScaleset(ctx, entry, state, silentLogger(), testRetryInitial, testRetryMax,
+		func(context.Context, config.ScaleSetEntry, *scalesetState) error {
+			// Cancel after a few attempts to end the otherwise-infinite
+			// retry loop; assert it really did retry more than once.
+			if calls.Add(1) >= 3 {
+				cancel()
+			}
+			return errors.New("permanently broken")
+		})
+	require.NoError(t, got)
+	require.GreaterOrEqual(t, calls.Load(), int64(3),
+		"a persistently-failing worker must be retried, not disabled after one failure (#334)")
 }
 
 // TestSuperviseScaleset_ContextCanceledQuiet matches the rest of
@@ -157,7 +203,7 @@ func TestSuperviseScaleset_ContextCanceledQuiet(t *testing.T) {
 	t.Parallel()
 	entry := config.ScaleSetEntry{Name: "draining", Scope: config.GitHubScope{Org: "x"}}
 	state := &scalesetState{name: "draining"}
-	got := superviseScaleset(t.Context(), entry, state, silentLogger(),
+	got := superviseScaleset(t.Context(), entry, state, silentLogger(), testRetryInitial, testRetryMax,
 		func(context.Context, config.ScaleSetEntry, *scalesetState) error {
 			return context.Canceled
 		})
