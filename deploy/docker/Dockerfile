@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.24
 
 # ---------- builder ----------
-FROM golang:1.26.3-alpine AS builder
+# Digest-pinned for reproducible, tamper-evident builds (tags are
+# mutable). Tag kept inline for readability; bump both together.
+FROM golang:1.26.3-alpine@sha256:91eda9776261207ea25fd06b5b7fed8d397dd2c0a283e77f2ab6e91bfa71079d AS builder
 WORKDIR /src
 RUN apk add --no-cache ca-certificates
 
@@ -25,7 +27,8 @@ RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
     -o /out/scaleset ./cmd/scaleset
 
 # ---------- runtime ----------
-FROM gcr.io/distroless/static-debian12:nonroot
+# Digest-pinned (see builder note). distroless, non-root, static, CGO off.
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639
 COPY --from=builder /out/scaleset /usr/local/bin/scaleset
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
