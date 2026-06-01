@@ -231,6 +231,65 @@ func TestParse_PoolSizesExceedMaxConcurrent(t *testing.T) {
 	require.Contains(t, err.Error(), "must not exceed")
 }
 
+// TestParse_RejectsAbsurdPoolSizes pins #336.3: an unbounded size could
+// sum to a negative number and bypass every "hot+warm > max" check. The
+// lte upper bound rejects it at field validation instead.
+func TestParse_RejectsAbsurdPoolSizes(t *testing.T) {
+	bad := strings.Replace(validPATYAML, "hot_size: 2", "hot_size: 2000000", 1)
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err, "a pool size above the sane upper bound must be rejected")
+}
+
+// TestParse_MultiScalesetWithGlobalPoolSizes pins #336.1: the legacy
+// global hot+warw check compares against c.ScaleSet.MaxConcurrentRunners,
+// which is only projected for a single scaleset. For N>1 it stayed 0, so
+// a perfectly valid multi-scaleset config with non-zero global pool sizes
+// used to fail spuriously ("hot+warm > 0"). The per-scaleset check still
+// applies; this must now Parse cleanly.
+func TestParse_MultiScalesetWithGlobalPoolSizes(t *testing.T) {
+	src := `
+github:
+  auth_mode: pat
+  pat:
+    token: testtoken
+scalesets:
+  - name: a
+    labels: [a]
+    max_concurrent_runners: 5
+    scope: { org: org-a }
+    vmid_range: { min: 10000, max: 14999 }
+  - name: b
+    labels: [b]
+    max_concurrent_runners: 5
+    scope: { org: org-b }
+    vmid_range: { min: 15000, max: 19999 }
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  auth:
+    token_id: scaleset@pve!automation
+    token_secret: testsecret
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage: { disk: local-lvm, snippets: local }
+  network: { bridge: vmbr0 }
+nodes:
+  strategy: single
+  single_node: pve1
+pool:
+  hot_size: 2
+  warm_size: 1
+  reconcile_interval: 5s
+  vm_max_age: 12h
+  drain_timeout: 15m
+  boot_max_attempts: 3
+`
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	cfg, err := config.Parse([]byte(src))
+	require.NoError(t, err, "a valid N>1 config with non-zero global pool sizes must not fail the legacy single-scaleset check")
+	require.Len(t, cfg.Scalesets, 2)
+}
+
 func TestParse_ProxmoxEndpointScheme(t *testing.T) {
 	cases := []struct {
 		name      string

@@ -95,6 +95,21 @@ func TestNewStatic_RejectsEmptyPool(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestNewStatic_RejectsDuplicateIPs pins #336: a duplicated entry would
+// silently halve effective capacity (the `used` map is keyed by IP) and
+// later surface as a confusing "pool exhausted" instead of a clear
+// config error.
+func TestNewStatic_RejectsDuplicateIPs(t *testing.T) {
+	t.Parallel()
+	_, err := ipam.NewStatic([]string{"10.0.0.10/24", "10.0.0.10/24"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate")
+
+	// A pool with all-distinct IPs is still accepted.
+	_, err = ipam.NewStatic([]string{"10.0.0.10/24", "10.0.0.11/24"})
+	require.NoError(t, err)
+}
+
 // TestStatic_ConcurrentAllocateRelease drives Allocate / Release
 // from many goroutines simultaneously. Before the sync.Mutex was
 // added, this triggered Go's "fatal error: concurrent map writes"
