@@ -78,13 +78,23 @@ type Static struct {
 // NewStatic builds a Static allocator from a slice of IPs. The
 // slice is defensively copied. Empty slices are rejected — an
 // empty pool would deadlock the clone path the first time
-// Allocate is called.
+// Allocate is called. Duplicate entries are rejected too: because
+// `used` is keyed by IP string, a duplicate would silently halve the
+// effective capacity and later surface as a confusing "pool exhausted"
+// rather than a clear config error.
 func NewStatic(pool []string) (*Static, error) {
 	if len(pool) == 0 {
 		return nil, errors.New("ipam: static pool must be non-empty")
 	}
 	cp := make([]string, len(pool))
 	copy(cp, pool)
+	seen := make(map[string]struct{}, len(cp))
+	for _, ip := range cp {
+		if _, dup := seen[ip]; dup {
+			return nil, fmt.Errorf("ipam: static pool contains duplicate IP %q", ip)
+		}
+		seen[ip] = struct{}{}
+	}
 	return &Static{
 		pool: cp,
 		in:   make(map[int]string, len(cp)),

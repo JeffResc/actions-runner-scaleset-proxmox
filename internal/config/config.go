@@ -347,7 +347,7 @@ type ScaleSetConfig struct {
 	Name                 string   `yaml:"name"`
 	Labels               []string `yaml:"labels"`
 	RunnerGroup          string   `yaml:"runner_group"`
-	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"gte=0"`
+	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"gte=0,lte=1000000"`
 }
 
 // ScaleSetEntry is one scale set within a multi-scaleset config
@@ -362,7 +362,7 @@ type ScaleSetEntry struct {
 	Name                 string   `yaml:"name" validate:"required"`
 	Labels               []string `yaml:"labels"`
 	RunnerGroup          string   `yaml:"runner_group"`
-	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"required,gt=0"`
+	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"required,gt=0,lte=1000000"`
 
 	// Scope is the GitHub registration target for this scale
 	// set. Exactly one of Scope.Org or Scope.Repo must be set;
@@ -521,9 +521,9 @@ type AffinityMatch struct {
 // when set, caps the sum of per-profile MaxConcurrentRunners so an
 // operator can put a fleet-wide ceiling above the per-profile arithmetic.
 type PoolConfig struct {
-	HotSize           int      `yaml:"hot_size" validate:"gte=0"`
-	WarmSize          int      `yaml:"warm_size" validate:"gte=0"`
-	GlobalMax         int      `yaml:"global_max" validate:"gte=0"`
+	HotSize           int      `yaml:"hot_size" validate:"gte=0,lte=1000000"`
+	WarmSize          int      `yaml:"warm_size" validate:"gte=0,lte=1000000"`
+	GlobalMax         int      `yaml:"global_max" validate:"gte=0,lte=1000000"`
 	ReconcileInterval Duration `yaml:"reconcile_interval"`
 	VMMaxAge          Duration `yaml:"vm_max_age"`
 	DrainTimeout      Duration `yaml:"drain_timeout"`
@@ -605,9 +605,9 @@ type ProfileConfig struct {
 	// (e.g. a gpu profile that wants no hot pool, only warm). The
 	// effective values are resolved into the matching *_effective
 	// helpers below at ApplyDefaults time.
-	HotSize              *int `yaml:"hot_size,omitempty" validate:"omitempty,gte=0"`
-	WarmSize             *int `yaml:"warm_size,omitempty" validate:"omitempty,gte=0"`
-	MaxConcurrentRunners *int `yaml:"max_concurrent_runners,omitempty" validate:"omitempty,gte=0"`
+	HotSize              *int `yaml:"hot_size,omitempty" validate:"omitempty,gte=0,lte=1000000"`
+	WarmSize             *int `yaml:"warm_size,omitempty" validate:"omitempty,gte=0,lte=1000000"`
+	MaxConcurrentRunners *int `yaml:"max_concurrent_runners,omitempty" validate:"omitempty,gte=0,lte=1000000"`
 
 	// BootMaxAttempts / VMMaxAge are per-profile recycle/poison knobs.
 	// Nil/empty inherits the global pool defaults. BootMaxAttempts must
@@ -692,8 +692,8 @@ type ScheduleConfig struct {
 	// sizes for Duration. Both must be >= 0; the
 	// hot+warm <= max_concurrent_runners invariant is enforced
 	// against the profile's MaxConcurrentRunners at load time.
-	HotSize  int `yaml:"hot_size" validate:"gte=0"`
-	WarmSize int `yaml:"warm_size" validate:"gte=0"`
+	HotSize  int `yaml:"hot_size" validate:"gte=0,lte=1000000"`
+	WarmSize int `yaml:"warm_size" validate:"gte=0,lte=1000000"`
 
 	// Location and CronSchedule are populated by Resolve.
 	// CronSchedule is the parsed cron expression — exposed so
@@ -1514,7 +1514,13 @@ func (c *Config) Validate() error {
 	if err := v.Struct(c); err != nil {
 		return err
 	}
-	if c.Pool.HotSize+c.Pool.WarmSize > c.ScaleSet.MaxConcurrentRunners {
+	// Only meaningful for a single scaleset: c.ScaleSet is projected from
+	// Scalesets[0] only when len(Scalesets)==1, so for N>1 its
+	// MaxConcurrentRunners stays 0 and this check would degrade to
+	// "hot+warm > 0". The authoritative per-scaleset check in
+	// validateScalesets covers every entry (including the projected
+	// singular one); guard this legacy check to the single-scaleset case.
+	if len(c.Scalesets) == 1 && c.Pool.HotSize+c.Pool.WarmSize > c.ScaleSet.MaxConcurrentRunners {
 		return fmt.Errorf("pool.hot_size+pool.warm_size (%d) must not exceed scaleset.max_concurrent_runners (%d)",
 			c.Pool.HotSize+c.Pool.WarmSize, c.ScaleSet.MaxConcurrentRunners)
 	}
