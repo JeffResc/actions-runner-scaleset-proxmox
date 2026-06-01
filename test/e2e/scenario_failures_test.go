@@ -66,6 +66,16 @@ func TestE2E_DestroyIdempotentOnVMNotFound(t *testing.T) {
 		formatLabel("operation", "destroy"), formatLabel("node", "pve1"))
 	require.Equal(t, 0.0, got,
 		"VMNotFound on destroy must be idempotent — saw %v errors recorded", got)
+
+	// Classification (not just count): a "VM not found" response must be
+	// classified as the idempotent SUCCESS path, so the pool refilled via
+	// a clean clone — NOT a failure cascade that churns through a
+	// failed-clone replacement. Asserting clone-failed stayed 0
+	// distinguishes "ErrVMNotFound → success" from "real error → failure"
+	// rather than only that the destroy counter didn't move.
+	cloneFailed := h.MetricValue(t, "scaleset_vms_total", formatLabel("outcome", "clone-failed"))
+	require.Equal(t, 0.0, cloneFailed,
+		"VMNotFound-on-destroy must classify as idempotent success, not trigger a failed-clone replacement (saw %v)", cloneFailed)
 }
 
 // TestE2E_GuestAgentTransientRetry asserts the orchestrator retries
