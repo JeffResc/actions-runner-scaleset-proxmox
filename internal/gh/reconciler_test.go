@@ -559,7 +559,7 @@ func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T
 	// Tick 1: runner A observed without a DB row → tracked.
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
-	})
+	}, false)
 	first, ok := r.orphanFirstSeen["gh-runner-test-1"]
 	require.True(t, ok, "orphan must be tracked after first observation")
 	require.Equal(t, t0, first)
@@ -567,14 +567,14 @@ func TestCleanupOrphanRunners_PreservesGraceAcrossEmptyRunnerWindow(t *testing.T
 	// Tick 2: runners list comes back empty (transient). The bug: the
 	// previous implementation wiped orphanFirstSeen entirely here.
 	r.now = func() time.Time { return t0.Add(10 * time.Second) }
-	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{})
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{}, false)
 
 	// Tick 3: runner A observed again. Its grace clock must still be
 	// anchored at t0, not restarted to t0+20s.
 	r.now = func() time.Time { return t0.Add(20 * time.Second) }
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
-	})
+	}, false)
 	preserved, ok := r.orphanFirstSeen["gh-runner-test-1"]
 	require.True(t, ok, "orphan tracking must survive an empty-runners tick")
 	require.Equal(t, t0, preserved,
@@ -621,7 +621,7 @@ func TestCleanupOrphanRunners_PerCallTimeout(t *testing.T) {
 	start := time.Now()
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
-	})
+	}, false)
 	elapsed := time.Since(start)
 
 	// Must return within timeout + slack — not block on the upstream.
@@ -905,14 +905,14 @@ func TestCleanupOrphanRunners_GraceWindowBoundary(t *testing.T) {
 
 			r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 				"gh-runner-test-1": {ID: 1001, Online: true, Busy: false},
-			})
+			}, false)
 			_, ok := r.orphanFirstSeen["gh-runner-test-1"]
 			require.True(t, ok)
 
 			r.now = func() time.Time { return t0.Add(tc.elapsed) }
 			r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 				"gh-runner-test-1": {ID: 1001, Online: true, Busy: false},
-			})
+			}, false)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -965,7 +965,7 @@ func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *te
 	// Tick 1: orphan A observed.
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
-	})
+	}, false)
 
 	// Tick 2: 20s later, orphan B observed too. A's grace started
 	// at t0; B's grace starts at t0+20s.
@@ -973,7 +973,7 @@ func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *te
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
 		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
-	})
+	}, false)
 
 	// Tick 3: t0+orphanGrace. A is exactly at its grace boundary → reap.
 	// B is at 20s in → still inside its own grace.
@@ -981,7 +981,7 @@ func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *te
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
 		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
-	})
+	}, false)
 	removeMu.Lock()
 	require.Contains(t, removed, int64(1), "orphan A at its grace must be reaped")
 	require.NotContains(t, removed, int64(2),
@@ -993,7 +993,7 @@ func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *te
 	r.now = func() time.Time { return t0.Add(20*time.Second + orphanGrace) }
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
-	})
+	}, false)
 	removeMu.Lock()
 	defer removeMu.Unlock()
 	require.Contains(t, removed, int64(2), "orphan B at its own grace boundary must be reaped")

@@ -238,7 +238,7 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "gh.Reconciler.Tick")
 	defer span.End()
 
-	runners, err := r.listOurRunners(ctx)
+	runners, truncated, err := r.listOurRunners(ctx)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "list runners failed")
@@ -257,7 +257,7 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 	)
 
 	r.applyMatrix(ctx, rows, runners)
-	r.cleanupOrphanRunners(ctx, rows, runners)
+	r.cleanupOrphanRunners(ctx, rows, runners, truncated)
 
 	if r.prov != nil {
 		r.sweepProxmoxOrphans(ctx, rows)
@@ -266,11 +266,13 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 }
 
 // listOurRunners returns every runner on the scope whose name matches
-// our prefix, keyed by runner name. Delegates to ListRunnersByPrefix
-// so the leader's one-shot Adopt pass and this reconcile loop share a
-// single implementation (pagination cap, prefix filter, scope dispatch).
-func (r *Reconciler) listOurRunners(ctx context.Context) (map[string]pool.RunnerInfo, error) {
-	return ListRunnersByPrefix(ctx, r.gh, r.cfg.Scope, r.cfg.RunnerNamePrefix, r.log)
+// our prefix, keyed by runner name, plus whether the listing was
+// truncated at the pagination cap. Delegates to the truncation-aware
+// core so the leader's one-shot Adopt pass and this reconcile loop share
+// a single implementation (pagination cap, prefix filter, scope
+// dispatch).
+func (r *Reconciler) listOurRunners(ctx context.Context) (map[string]pool.RunnerInfo, bool, error) {
+	return listRunnersByPrefix(ctx, r.gh, r.cfg.Scope, r.cfg.RunnerNamePrefix, r.log)
 }
 
 // ListRunnersByPrefix returns every runner on the scope whose name
@@ -288,13 +290,27 @@ func (r *Reconciler) listOurRunners(ctx context.Context) (map[string]pool.Runner
 // *Reconciler — its result is wrapped by NewRunnerLister into a
 // pool.RunnerLister suitable for pool.Config.RunnerLister.
 func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubauth.Scope, prefix string, log *slog.Logger) (map[string]pool.RunnerInfo, error) {
+	out, _, err := listRunnersByPrefix(ctx, gh, scope, prefix, log)
+	return out, err
+}
+
+// listRunnersByPrefix is the truncation-aware core of ListRunnersByPrefix.
+// It additionally reports whether the listing was cut short at the
+// maxListPages cap. Callers that make delete-or-keep decisions from a
+// runner's ABSENCE (the orphan sweep) must not act on a truncated view:
+// a runner living on an un-fetched page looks "gone" and would have its
+// orphan-grace tracking reset every tick, so it could evade the reaper
+// indefinitely. The Adopt/RunnerLister callers don't care — absence on a
+// truncated page just defers that runner's adoption to a later pass — so
+// the exported wrapper drops the flag.
+func listRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubauth.Scope, prefix string, log *slog.Logger) (out map[string]pool.RunnerInfo, truncated bool, err error) {
 	const maxListPages = 50
-	out := make(map[string]pool.RunnerInfo)
+	out = make(map[string]pool.RunnerInfo)
 	opt := &github.ListRunnersOptions{ListOptions: github.ListOptions{PerPage: 100}}
 	for page := 0; page < maxListPages; page++ {
 		runnersPage, resp, err := listRunnersPageWithRetry(ctx, gh, scope, opt, log)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		for _, gr := range runnersPage.Runners {
 			name := gr.GetName()
@@ -308,7 +324,7 @@ func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 			}
 		}
 		if resp == nil || resp.NextPage == 0 {
-			return out, nil
+			return out, false, nil
 		}
 		opt.Page = resp.NextPage
 	}
@@ -316,7 +332,7 @@ func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 		log.Warn("ListRunnersByPrefix: hit max-pages cap; deferring rest to next call",
 			"max_pages", maxListPages, "matched", len(out))
 	}
-	return out, nil
+	return out, true, nil
 }
 
 // listRunnersPage fetches one page of runners from the API endpoint
@@ -580,7 +596,7 @@ func (r *Reconciler) promoteToRunning(ctx context.Context, row pool.RowSnapshot,
 //
 // State for the grace logic lives in r.orphanFirstSeen, which is pruned
 // here as runners reappear matched to rows.
-func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo) {
+func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo, truncated bool) {
 	known := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
 		known[row.Name] = struct{}{}
@@ -588,19 +604,24 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 	now := r.now()
 	// Prune entries that are no longer orphaned. Two cases:
 	//   - matched to a DB row this tick: drop unconditionally.
-	//   - not in `runners` AND `runners` is non-empty: drop, because
-	//     GitHub authoritatively says the runner is gone.
+	//   - not in `runners` AND `runners` is non-empty AND the listing
+	//     was complete: drop, because GitHub authoritatively says the
+	//     runner is gone.
 	// We deliberately do NOT drop entries when `runners` is empty —
 	// that's almost always a transient state between jobs, and resetting
 	// the grace clock here is the bug this code path is guarding
-	// against. Entries left behind by a genuinely-removed runner will
-	// be pruned on the next tick that returns a non-empty list.
+	// against. We ALSO skip absence-based pruning when the listing was
+	// truncated at the pagination cap: a runner on an un-fetched page
+	// looks "gone" from this partial view, and dropping its first-seen
+	// entry every tick resets the orphan-grace clock so a real orphan
+	// could evade the reaper indefinitely (#337). A genuinely-removed
+	// runner is pruned on the next tick whose listing is complete.
 	for name := range r.orphanFirstSeen {
 		if _, ok := known[name]; ok {
 			delete(r.orphanFirstSeen, name)
 			continue
 		}
-		if len(runners) == 0 {
+		if len(runners) == 0 || truncated {
 			continue
 		}
 		if _, ok := runners[name]; !ok {
