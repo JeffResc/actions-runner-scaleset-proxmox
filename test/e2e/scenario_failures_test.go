@@ -183,6 +183,40 @@ func TestE2E_JITInjectPersistentFailureDestroysVM(t *testing.T) {
 		"the inject-failed VM was never destroyed; pool will leak")
 }
 
+// TestE2E_CloneTaskFailureIsClassified pins #331 end-to-end: a Proxmox
+// clone task that *completes with a failure exit status* (e.g.
+// storage-full mid-copy) must be classified as a failed clone, not
+// silently treated as success. go-proxmox's WaitFor returns nil the
+// moment the task leaves "running" and ignores IsFailed/ExitStatus, so
+// without the awaitTask helper the orchestrator would admit a broken VM
+// to the pool and never record a clone failure.
+//
+// Drives the new FaultTaskFails (#326) on every qmclone task. Asserts
+// the clone-failed outcome metric ticks up — pre-fix it stays at 0
+// because the failed-but-completed task is mistaken for success.
+func TestE2E_CloneTaskFailureIsClassified(t *testing.T) {
+	t.Parallel()
+	proxmox := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+	proxmox.InjectFault(fakeproxmox.Fault{
+		Kind:     fakeproxmox.FaultTaskFails,
+		VMID:     0, // every VM
+		TaskType: "qmclone",
+	})
+
+	h := Start(t, Options{HotSize: 2, MaxConcurrentRunners: 4, FakeProxmox: proxmox})
+
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_vms_total", formatLabel("outcome", "clone-failed")) >= 1
+	}, 20*time.Second, 200*time.Millisecond,
+		"a clone task that completes with a failure exitstatus must be classified as clone-failed (#331)")
+
+	// The broken clones must never be admitted to the hot pool.
+	require.Never(t, func() bool {
+		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "hot")) >= 1
+	}, 2*time.Second, 250*time.Millisecond,
+		"a failed clone must never reach the hot pool")
+}
+
 // itoa wraps strconv.Itoa for a slightly less noisy call site in the
 // scenarios above.
 func itoa(n int) string {

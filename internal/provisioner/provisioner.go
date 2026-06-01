@@ -256,7 +256,7 @@ type Options struct {
 // vmNamePrefix is used during ListOwnedVMs as a belt-and-suspenders
 // fallback to detect orphans whose tag-apply step failed mid-clone (the
 // canonical "Proxmox clone returned but the orchestrator crashed before
-// applying our owner tag" failure mode). The go-proxmox library v0.5.1
+// applying our owner tag" failure mode). The go-proxmox library v0.7.0
 // doesn't support tags-at-clone-time, so we can't make clone+tag fully
 // atomic — name-prefix + VMID-range matching plugs the gap.
 //
@@ -501,7 +501,7 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("issue clone: %w", err)
 	}
-	if err := task.WaitFor(ctx, 600); err != nil {
+	if err := awaitTask(ctx, task, 600); err != nil {
 		return nil, fmt.Errorf("await clone task: %w", err)
 	}
 
@@ -542,7 +542,7 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		if err != nil {
 			return nil, fmt.Errorf("resize disk: %w", err)
 		}
-		if err := task.WaitFor(ctx, 120); err != nil {
+		if err := awaitTask(ctx, task, 120); err != nil {
 			return nil, fmt.Errorf("await resize disk: %w", err)
 		}
 	}
@@ -694,7 +694,7 @@ func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) e
 		}
 		return fmt.Errorf("start vm: %w", err)
 	}
-	if err := task.WaitFor(ctx, 300); err != nil {
+	if err := awaitTask(ctx, task, 300); err != nil {
 		return fmt.Errorf("await start: %w", err)
 	}
 	return nil
@@ -721,8 +721,17 @@ func (p *pmox) stopInternal(ctx context.Context, pVM *proxmox.VirtualMachine) er
 	// Best-effort graceful shutdown.
 	task, err := pVM.Shutdown(ctx)
 	if err == nil {
-		if err := task.WaitFor(ctx, 60); err == nil {
+		werr := awaitTask(ctx, task, 60)
+		if werr == nil {
 			return nil
+		}
+		// On drain/SIGTERM the graceful WaitFor returns context.Canceled.
+		// Don't mask that as a "graceful shutdown timed out → hard stop"
+		// fallback: the hard Stop below would run against the same
+		// already-cancelled ctx and surface a misleading error. Surface
+		// the cancellation to the caller instead.
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		p.log.Warn("graceful shutdown timed out; falling back to hard stop", "vmid", pVM.VMID, "node", pVM.Node)
 	}
@@ -730,7 +739,7 @@ func (p *pmox) stopInternal(ctx context.Context, pVM *proxmox.VirtualMachine) er
 	if err != nil {
 		return fmt.Errorf("hard stop: %w", classifyProxmoxError(err))
 	}
-	if err := task.WaitFor(ctx, 60); err != nil {
+	if err := awaitTask(ctx, task, 60); err != nil {
 		return fmt.Errorf("await hard stop: %w", classifyProxmoxError(err))
 	}
 	return nil
@@ -758,7 +767,7 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		}
 		return fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
 	}
-	if err := task.WaitFor(ctx, 120); err != nil {
+	if err := awaitTask(ctx, task, 120); err != nil {
 		// Mid-task 404 → idempotent success (VM disappeared while we
 		// were tearing it down — common with another orchestrator).
 		classified := classifyProxmoxError(err)
@@ -954,6 +963,28 @@ var proxmoxErrorClassifiers = []errorClassifier{
 	classifyTypedError,
 	classifyByHTTPStatus,
 	classifyByMessage,
+}
+
+// awaitTask waits for a Proxmox task to leave the running state and then
+// inspects its terminal result. go-proxmox v0.7.0's Task.Wait/WaitFor
+// returns nil the moment the task stops running — it never looks at
+// IsFailed/ExitStatus — so a task that *completed with a failure*
+// (storage-full clone, locked-VM destroy, failed start) would otherwise
+// be reported as success. Ping (called inside Wait) populates IsFailed
+// and ExitStatus, so we can check them once WaitFor returns. Use this in
+// place of a bare task.WaitFor for every state-changing task.
+func awaitTask(ctx context.Context, t *proxmox.Task, seconds int) error {
+	if err := t.WaitFor(ctx, seconds); err != nil {
+		return err
+	}
+	if t.IsFailed || (t.ExitStatus != "" && t.ExitStatus != "OK") {
+		status := t.ExitStatus
+		if status == "" {
+			status = "unknown failure"
+		}
+		return fmt.Errorf("proxmox task %s failed: %s", t.UPID, status)
+	}
+	return nil
 }
 
 // classifyProxmoxError wraps err with our typed sentinels when the
