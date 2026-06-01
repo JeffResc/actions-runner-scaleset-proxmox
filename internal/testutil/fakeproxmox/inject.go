@@ -41,6 +41,15 @@ const (
 	// orchestrator-side task timeouts.
 	FaultTaskNeverCompletes
 
+	// FaultTaskFails makes the matched task complete (after its normal
+	// duration) with a failure exit status — status "stopped",
+	// exitstatus "TASK ERROR: ...". Real Proxmox produces failed-but-
+	// completed tasks constantly (clone fails mid-copy, start fails on a
+	// full node, qmdestroy on a locked VM). Used to exercise the
+	// orchestrator's task-poll → failure-classification path for failed
+	// (not hung) tasks. VMID matches the VM the task operates on.
+	FaultTaskFails
+
 	// FaultTagApplyDelay delays the tag-stamping PUT /config response
 	// by Duration, exposing the window between Clone returning and
 	// tags landing.
@@ -63,12 +72,16 @@ const (
 //   - Count is consumed by FaultStatus500Spam (each spam decrements).
 //   - Duration is consumed by FaultGuestAgentNotReady and
 //     FaultTagApplyDelay.
+//   - TaskType, when set on a FaultTaskFails, restricts the fault to
+//     tasks of that type (e.g. "qmclone", "qmstart", "qmdestroy"); an
+//     empty TaskType fails every task type for the matched VMID.
 type Fault struct {
 	Kind     FaultKind
 	VMID     int
 	Path     string
 	Count    int
 	Duration time.Duration
+	TaskType string
 }
 
 // InjectFault registers a fault. Multiple faults can be active

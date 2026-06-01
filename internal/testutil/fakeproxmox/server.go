@@ -527,6 +527,16 @@ func (s *Server) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	if s.store.taskCompletedLocked(t) {
 		status = "stopped"
 		exit = "OK"
+		// FaultTaskFails: the task completes (per its normal duration)
+		// but with a failure exit status, modelling real Proxmox tasks
+		// that finish with "TASK ERROR: ...". Matched by the affected
+		// VMID (taskRecord.ID) and, optionally, the task type. This
+		// drives the orchestrator's failure-classification path for
+		// failed (not hung) tasks.
+		taskVMID, _ := strconv.Atoi(t.ID)
+		if f, ok := s.store.matchFaultLocked(FaultTaskFails, taskVMID); ok && (f.TaskType == "" || f.TaskType == t.Type) {
+			exit = "TASK ERROR: injected " + t.Type + " failure"
+		}
 	}
 	writeData(w, map[string]any{
 		"upid":       t.UPID,

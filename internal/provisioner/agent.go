@@ -109,7 +109,7 @@ const agentFileWriteMaxBytes = 60 * 1024
 // equivalent command worked from an interactive shell.
 //
 // The Proxmox guest-agent endpoint is reached directly because
-// luthermonson/go-proxmox v0.5.1 does not expose a typed wrapper for it.
+// luthermonson/go-proxmox v0.7.0 does not expose a typed wrapper for it.
 // We use the library's authenticated Client.Post so token rotation and
 // transport configuration still go through the library.
 func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) error {
