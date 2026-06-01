@@ -383,21 +383,27 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		return 0, nil
 	}
 
-	// Pre-acquire serially: Acquire is cheap (single store write
-	// transaction), and serialising it surfaces pool exhaustion fast so
-	// we don't spin up worker goroutines for VMs we'll never get.
-	// Pass maxBusy=count so the store refuses an Acquire that would
-	// push total busy past the listener's requested count — guards
-	// against the race where another goroutine bumps busy between our
-	// Stats read above and this loop, which would otherwise let us
-	// over-acquire (bounded by MaxConcurrentRunners but still wasteful).
+	vms := s.preAcquireVMs(ctx, need, count)
+	if len(vms) == 0 {
+		return 0, nil
+	}
+	return s.provisionAcquired(ctx, vms), nil
+}
+
+// preAcquireVMs serially claims up to `need` Hot VMs from the pool,
+// passing maxBusy=count so the store refuses an Acquire that would push
+// total busy past the listener's requested count. Acquire is cheap (a
+// single store write txn), and serialising it surfaces pool exhaustion
+// fast — we don't spin up worker goroutines for VMs we'll never get.
+// Expected back-pressure (ErrNoneAvailable / ErrAtCapacity) stops the
+// loop quietly; refill is already signalled.
+func (s *Scaler) preAcquireVMs(ctx context.Context, need, count int) []*pool.VM {
 	vms := make([]*pool.VM, 0, need)
 	for range need {
 		const jobID int64 = 0 // not yet known; JobStarted callback updates
 		vmObj, err := s.pool.Acquire(ctx, jobID, count)
 		if err != nil {
 			if errors.Is(err, pool.ErrNoneAvailable) || errors.Is(err, pool.ErrAtCapacity) {
-				// Expected back-pressure; refill is already signalled.
 				break
 			}
 			s.log.Error("acquire failed", "err", err)
@@ -405,15 +411,17 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		}
 		vms = append(vms, vmObj)
 	}
-	if len(vms) == 0 {
-		return 0, nil
-	}
+	return vms
+}
 
-	// Provision each acquired VM in parallel, bounded by the semaphore.
-	// Errors during per-runner provisioning are LOGGED but NEVER
-	// returned to the listener — returning an error would terminate the
-	// scaleset listener loop and crash the orchestrator. Individual
-	// failures are recoverable on the next listener message.
+// provisionAcquired provisions each acquired VM in parallel, bounded by
+// the provisioning semaphore, and returns the count successfully
+// delivered. Per-runner provisioning errors are LOGGED but NEVER
+// returned: surfacing one would terminate the scaleset listener loop and
+// crash the orchestrator, and individual failures are recoverable on the
+// next listener message. A mid-burst ctx cancellation releases the
+// not-yet-started VMs back to the pool.
+func (s *Scaler) provisionAcquired(ctx context.Context, vms []*pool.VM) int {
 	var (
 		delivered atomic.Int32
 		wg        sync.WaitGroup
@@ -422,7 +430,6 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	for _, vmObj := range vms {
 		vmObj := vmObj
 		if err := sem.Acquire(ctx, 1); err != nil {
-			// ctx cancelled mid-burst — release the rest back to the pool.
 			if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
 				s.log.Warn("mark completed failed during cancel", "vmid", vmObj.VMID, "err", mcErr)
 			}
@@ -438,7 +445,7 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		}()
 	}
 	wg.Wait()
-	return int(delivered.Load()), nil
+	return int(delivered.Load())
 }
 
 // provisionOne handles the per-runner GitHub-side mint + Proxmox-side

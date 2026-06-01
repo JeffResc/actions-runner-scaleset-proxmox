@@ -484,22 +484,23 @@ func (s *Store) AcquireHot(jobID int64, maxConcurrent, maxBusy int) (*VM, error)
 // count and any subsequent CAS share one snapshot — that's the
 // invariant Acquire relies on to avoid over-commit.
 func countBusy(txn *memdb.Txn, profile string) (int, error) {
+	// Pick the index, its prefix args, and the error-message scope once,
+	// so the per-state loop has a single Get call and a single error path
+	// instead of branching profile=="" in three places.
+	index := "state"
+	var prefix []any
+	scope := ""
+	if profile != "" {
+		index = "profile_state"
+		prefix = []any{profile}
+		scope = profile + "/"
+	}
 	busy := 0
 	for _, st := range []State{StateAssigned, StateRunning} {
-		var (
-			it  memdb.ResultIterator
-			err error
-		)
-		if profile == "" {
-			it, err = txn.Get(tableVM, "state", string(st))
-		} else {
-			it, err = txn.Get(tableVM, "profile_state", profile, string(st))
-		}
+		args := append(append([]any{}, prefix...), string(st))
+		it, err := txn.Get(tableVM, index, args...)
 		if err != nil {
-			if profile == "" {
-				return 0, fmt.Errorf("store: acquire: count %s: %w", st, err)
-			}
-			return 0, fmt.Errorf("store: acquire: count %s/%s: %w", profile, st, err)
+			return 0, fmt.Errorf("store: acquire: count %s%s: %w", scope, st, err)
 		}
 		for raw := it.Next(); raw != nil; raw = it.Next() {
 			busy++
