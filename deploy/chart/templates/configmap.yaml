@@ -1,8 +1,16 @@
 {{- /*
-The chart force-overrides cluster.mode to "kubernetes" so a values
-file copied from the standalone example still ends up doing leader
-election. Everything else from .Values.scalesetConfig is passed
-through verbatim — see ../../config.example.yaml for the schema.
+cluster.mode defaults to "standalone" (single replica, always leader)
+when the operator didn't set one — the binary only implements
+"standalone" and "raft", so the previous forced "kubernetes" made the
+default `helm install` fail config validation and crash-loop. An
+explicit scalesetConfig.cluster.mode (standalone or raft) is respected.
+Everything else from .Values.scalesetConfig is passed through verbatim —
+see ../../config.example.yaml for the schema.
+
+For HA via raft, set cluster.mode: raft with a full peer list and a
+persistent data_dir per replica; that needs stable network identities
+(a StatefulSet + headless Service), which this Deployment-based chart
+does not yet provide — track as a follow-up before raising replicaCount.
 
 Guardrail: secrets must flow through the Secret + canonical
 SCALESET_*-prefixed env vars (delivered to the pod by the
@@ -11,11 +19,13 @@ lands in this ConfigMap in clear). Reject any deployment that puts
 literal secret values in the YAML before they leak.
 */ -}}
 {{- $cfg := deepCopy .Values.scalesetConfig -}}
-{{- $cluster := dict "mode" "kubernetes" -}}
+{{- $cluster := dict -}}
 {{- if hasKey $cfg "cluster" -}}
-{{-   $cluster = merge $cluster (index $cfg "cluster") -}}
+{{-   $cluster = index $cfg "cluster" -}}
 {{- end -}}
-{{- $cluster := merge (dict "mode" "kubernetes") $cluster -}}
+{{- if not (hasKey $cluster "mode") -}}
+{{-   $_ := set $cluster "mode" "standalone" -}}
+{{- end -}}
 {{- $_ := set $cfg "cluster" $cluster -}}
 {{- if and (hasKey $cfg "proxmox") (hasKey $cfg.proxmox "auth") -}}
 {{-   if hasKey $cfg.proxmox.auth "token_secret" -}}

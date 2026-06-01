@@ -24,6 +24,15 @@ spec:
         # changes — otherwise an in-place ConfigMap update would only
         # take effect on the next unrelated rollout.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.secrets.existingSecret }}
+        # Roll pods when the chart-managed Secret changes too. Env-injected
+        # secret values are not refreshed in-place by the kubelet, so
+        # without this a rotated GitHub PAT / Proxmox token / admin secret
+        # would silently no-op until an unrelated rollout. Only emitted
+        # when the chart owns the Secret; with an existingSecret the
+        # operator owns rotation (use a reloader or roll manually).
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

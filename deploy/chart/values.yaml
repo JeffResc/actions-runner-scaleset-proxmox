@@ -10,11 +10,14 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
-# 2 replicas is the minimum that gives you HA. Scale higher only if
-# you have a strong reason — the in-memory go-memdb state is
-# leader-local and rebuilt on failover via pool.Manager.Recover, so
-# extra standbys add cost without serving more traffic.
-replicaCount: 2
+# 1 replica with the default cluster.mode: standalone — the binary
+# implements only "standalone" and "raft", and standalone is always
+# leader. HA needs cluster.mode: raft with a peer list + persistent
+# data_dir per replica, which requires stable network identities (a
+# StatefulSet + headless Service) this Deployment-based chart does not
+# yet provide. Do NOT raise replicaCount under standalone: every replica
+# would think it is leader and drive the pool independently.
+replicaCount: 1
 
 nameOverride: ""
 fullnameOverride: ""
@@ -133,7 +136,8 @@ secrets:
 
 # scalesetConfig is the FULL config.yaml content the orchestrator
 # reads. See ../../config.example.yaml for the schema. The chart
-# automatically sets cluster.mode = kubernetes; everything else is
+# defaults cluster.mode to "standalone" when you don't set one (set
+# cluster.mode: raft with a peer list for HA); everything else is
 # yours to define.
 scalesetConfig:
   github:
