@@ -886,7 +886,9 @@ func superviseScaleset(ctx context.Context, entry config.ScaleSetEntry, state *s
 			return nil // clean shutdown (run swallows ctx.Canceled → nil)
 		}
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-			return nil
+			// Clean shutdown (SIGTERM / drain), not a worker failure to
+			// propagate — returning nil is intentional here.
+			return nil //nolint:nilerr // ctx cancellation is a clean exit, not an error to surface
 		}
 		log.Error("scaleset worker failed; retrying with backoff",
 			"scaleset", entry.Name, "attempt", attempt, "backoff", backoff, "err", err)
