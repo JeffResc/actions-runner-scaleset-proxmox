@@ -26,7 +26,7 @@ require (
 	github.com/knadh/koanf/providers/file v1.2.1
 	github.com/knadh/koanf/providers/rawbytes v1.0.0
 	github.com/knadh/koanf/v2 v2.3.6
-	github.com/luthermonson/go-proxmox v0.7.1
+	github.com/luthermonson/go-proxmox v0.8.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/realclientip/realclientip-go v1.0.0
 	github.com/robfig/cron/v3 v3.0.1
