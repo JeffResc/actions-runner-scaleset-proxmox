@@ -7,7 +7,7 @@ description: |
   the pool, standbys are warm spares that take over on Lease expiry.
 type: application
 version: 0.1.0
-appVersion: "0.1.0"
+appVersion: 0.1.0
 keywords:
   - github-actions
   - proxmox
