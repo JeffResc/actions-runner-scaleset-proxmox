@@ -187,9 +187,9 @@ func (s *stubProv) ReadJITConfig(context.Context, *provisioner.VM) ([]byte, erro
 func (s *stubProv) PowerState(context.Context, *provisioner.VM) (string, error) {
 	return "running", nil
 }
-func (s *stubProv) Ping(context.Context) error                  { return nil }
-func (s *stubProv) TemplateNode() string                        { return "pve1" }
-func (s *stubProv) Client() *proxmox.Client                     { return nil }
+func (s *stubProv) Ping(context.Context) error { return nil }
+func (s *stubProv) TemplateNode() string       { return "pve1" }
+func (s *stubProv) Client() *proxmox.Client    { return nil }
 func (s *stubProv) SnapshotCreate(context.Context, *provisioner.VM, string) error {
 	return nil
 }
