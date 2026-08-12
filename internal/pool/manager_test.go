@@ -733,6 +733,25 @@ func TestComputeCloneNeeds(t *testing.T) {
 			hotSize: 2, warmSize: 0, desired: 0, profileMax: 10,
 			wantHot: 0, wantWarm: 0,
 		},
+		{
+			// snapshot-rollback mode: a post-job recycle is seconds from
+			// re-entering the pool — cloning a hot replacement for it
+			// would grow the fleet and defeat the mode's purpose.
+			name:    "recycling counts toward hot available (no refill clone mid-rollback)",
+			stats:   Stats{Recycling: 1},
+			hotSize: 1, warmSize: 0, desired: 0, profileMax: 10,
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// snapshot-rollback mode: adopt-time mass recycle (leader
+			// restart with a stopped warm pool) puts every warm VM in
+			// Recycling; each will land back in Warm, so dispatching
+			// warm clones for them would double the warm pool.
+			name:    "recycling counts toward warm inflight (no double clone on restart)",
+			stats:   Stats{Recycling: 3},
+			hotSize: 0, warmSize: 3, desired: 0, profileMax: 10,
+			wantHot: 0, wantWarm: 0,
+		},
 	}
 	for _, c := range cases {
 		c := c
@@ -3158,4 +3177,92 @@ func TestAdopt_SnapshotRollbackFailureDestroysStoppedVM(t *testing.T) {
 		_, err := st.Get(30001)
 		return errors.Is(err, store.ErrNotFound)
 	}, 2*time.Second, 10*time.Millisecond, "unrollbackable adopted vm was never destroyed")
+}
+
+// TestAdopt_SnapshotRollbackDeregistersStaleRunner: a stopped VM found
+// at startup can still hold a GitHub runner registration (the previous
+// leader crashed after the job but before the deregister). Because a
+// recycled row keeps its name forever, the reconciler's orphan-runner
+// sweep will never reap that registration — so the adopt-time recycle
+// must thread the observed runner ID through to the rollback worker,
+// which deregisters it exactly like the normal recycle path.
+func TestAdopt_SnapshotRollbackDeregistersStaleRunner(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 30002, Node: "pve1", Name: "gh-runner-test-30002", Profile: defaultProfileName},
+		},
+		powerStateBy: map[int]string{30002: "stopped"},
+	}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+		RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+			// Offline registration left over from the crashed job.
+			return map[string]RunnerInfo{
+				"gh-runner-test-30002": {ID: 9999, Online: false},
+			}, nil
+		},
+	})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	require.Eventually(t, func() bool {
+		row, err := st.Get(30002)
+		return err == nil && row.State == store.StateWarm
+	}, 2*time.Second, 10*time.Millisecond, "adopted stopped vm never landed in warm")
+
+	row, err := st.Get(30002)
+	require.NoError(t, err)
+	require.Zero(t, row.RunnerID, "stale runner pairing must be cleared before the VM re-enters warm")
+	require.Equal(t, []int64{9999}, orphans.snapshot(),
+		"the stale GitHub registration must be deregistered during the adopt-time recycle")
+}
+
+// TestSweepStuckRows_RecyclingRowSelfHealsToDestroy is the in-process
+// crash-recovery backstop for the Recycling state: if the rollback
+// worker dies (panic, cancelled sem acquire, drain skip) the row would
+// otherwise pin its VMID forever. The fleet-wide stuck sweep must
+// route a stale Recycling row into the destroy path — and the destroy
+// must still deregister the GitHub runner the dead worker never got to.
+func TestSweepStuckRows_RecyclingRowSelfHealsToDestroy(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	old := time.Now().Add(-10 * time.Minute) // well past the 5m stuck grace
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 21010, Node: "pve1", Name: "gh-runner-test-21010",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRecycling, RunnerID: 8888,
+		CreatedAt: old, UpdatedAt: old, StateSince: old,
+	}))
+
+	fp := &fakeProv{}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+	})
+
+	mgr.sweepStuckRows()
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		destroyed := len(fp.destroys) == 1
+		fp.mu.Unlock()
+		if !destroyed {
+			return false
+		}
+		_, err := st.Get(21010)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "stuck recycling row was never destroyed")
+
+	require.Equal(t, []int64{8888}, orphans.snapshot(),
+		"destroying a wedged recycle must still deregister the GitHub runner")
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.rollbacks, "the sweep must destroy, not retry the rollback")
 }

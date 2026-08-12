@@ -2446,3 +2446,14 @@ func TestParse_RecycleModeRejectsUnknownValue(t *testing.T) {
 	require.Contains(t, err.Error(), "pool.recycle_mode")
 	require.Contains(t, err.Error(), `"rollback"`)
 }
+
+// TestParse_RecycleModeEnvOverride pins the koanf env mapping for the
+// new key: SCALESET_POOL_RECYCLE_MODE must override the yaml-side
+// default the same way every other pool.* key does.
+func TestParse_RecycleModeEnvOverride(t *testing.T) {
+	// No t.Parallel — t.Setenv forbids parallel tests.
+	setEnv(t, map[string]string{"SCALESET_POOL_RECYCLE_MODE": config.RecycleModeSnapshotRollback})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.Equal(t, config.RecycleModeSnapshotRollback, cfg.Pool.RecycleMode)
+}

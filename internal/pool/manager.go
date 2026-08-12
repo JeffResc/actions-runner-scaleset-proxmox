@@ -1080,6 +1080,18 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 	recycleOnAdopt := m.snapshotRecycle() && state == store.StateWarm
 	if recycleOnAdopt {
 		state = store.StateRecycling
+		// A stopped VM may still hold a GitHub runner registration
+		// (previous leader crashed after the job completed but before
+		// the deregister). The adoption matrix intentionally drops
+		// runner IDs on stopped VMs — in destroy mode the stale
+		// registration is reaped once the row is gone — but a recycled
+		// row keeps its name forever, so the orphan-runner sweep would
+		// never match it. Thread the observed registration through so
+		// the rollback worker deregisters it exactly like the normal
+		// recycle (and destroy) paths do.
+		if gr, ok := runners[pv.Name]; ok {
+			runnerID = gr.ID
+		}
 	}
 	row := &store.VM{
 		VMID:     pv.VMID,
@@ -1493,13 +1505,18 @@ func (m *manager) provisioningCounts(profile string) (hot, warm int, err error) 
 // are cloning concurrently, but only in the safe direction (we
 // under-dispatch this profile's needed clones for one tick).
 //
-// Recycling rows count toward available: in snapshot-rollback mode a
-// completed job's VM re-enters Warm within one rollback (seconds), so
-// dispatching a replacement clone for it would defeat the mode's whole
-// point and grow the fleet. If the rollback fails and falls back to
+// Recycling rows count toward BOTH the hot-available term and the
+// warm-inflight term: in snapshot-rollback mode a completed job's VM
+// re-enters Warm within one rollback (seconds), so dispatching a
+// replacement clone for it — on either side of the pool — would defeat
+// the mode's whole point and grow the fleet. The hot term stops a
+// post-job recycle from triggering an eager hot refill; the warm term
+// stops the adopt-time mass-recycle (every stopped VM found at leader
+// startup enters Recycling) from double-cloning the entire warm pool
+// before the rollbacks land. If a rollback fails and falls back to
 // destroy we under-dispatch for a tick — the safe direction, corrected
-// on the next pass. Destroy mode never produces Recycling rows, so the
-// term is inert there.
+// on the next pass. Destroy mode never produces Recycling rows, so
+// both terms are inert there.
 func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSize, desired, profileMax int) (needHot, needWarm int) {
 	available := stats.Available() + stats.Recycling + hotProv + inflight
 	busy := stats.Busy()
@@ -1528,7 +1545,7 @@ func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSi
 		needHot = 0
 	}
 
-	warmInflight := stats.LiveWarm() + warmProv
+	warmInflight := stats.LiveWarm() + warmProv + stats.Recycling
 	needWarm = warmSize - warmInflight
 	if needWarm < 0 {
 		needWarm = 0
