@@ -685,6 +685,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		MaxConcurrentRunners: entry.MaxConcurrentRunners,
 		ReconcileInterval:    cfg.Pool.ReconcileInterval.D(),
 		PowerPollInterval:    cfg.Pool.PowerPollInterval.D(),
+		RecycleMode:          cfg.Pool.RecycleMode,
 		VMMaxAge:             cfg.Pool.VMMaxAge.D(),
 		DrainTimeout:         cfg.Pool.DrainTimeout.D(),
 		BootMaxAttempts:      cfg.Pool.BootMaxAttempts,

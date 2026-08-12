@@ -19,9 +19,16 @@ const (
 	StateHot          State = "hot"
 	StateAssigned     State = "assigned"
 	StateRunning      State = "running"
-	StateDraining     State = "draining"
-	StateDestroying   State = "destroying"
-	StatePoison       State = "poison"
+	// StateRecycling is the transient state between a completed job
+	// and Warm in snapshot-rollback recycle mode: the rollback worker
+	// owns the row while it deregisters the GitHub runner and rolls
+	// the VM back to its post-clone snapshot. On success the row
+	// returns to Warm; on failure it falls through to the destroy
+	// path (Draining).
+	StateRecycling  State = "recycling"
+	StateDraining   State = "draining"
+	StateDestroying State = "destroying"
+	StatePoison     State = "poison"
 )
 
 // PoolKind is the pool budget a VM counts toward.
@@ -42,6 +49,7 @@ var AllStates = []State{
 	StateHot,
 	StateAssigned,
 	StateRunning,
+	StateRecycling,
 	StateDraining,
 	StateDestroying,
 	StatePoison,
@@ -82,6 +90,12 @@ type VM struct {
 	JobID        int64
 	RunnerID     int64
 	BootAttempts int
+	// RecycleCount is how many times this VM has been returned to the
+	// warm pool via a snapshot rollback (pool.recycle_mode:
+	// snapshot_rollback). Always 0 in destroy mode. CreatedAt is NOT
+	// reset on recycle, so vm_max_age still bounds the VM's total
+	// lifetime regardless of how often it was recycled.
+	RecycleCount int
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	StateSince   time.Time

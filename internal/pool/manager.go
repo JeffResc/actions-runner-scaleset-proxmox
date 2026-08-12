@@ -124,6 +124,16 @@ type Config struct {
 	// in-VM runner-hook. Zero falls back to a sane default (3s).
 	PowerPollInterval time.Duration
 
+	// RecycleMode selects the post-job VM lifecycle:
+	// config.RecycleModeDestroy (the default for the empty string) or
+	// config.RecycleModeSnapshotRollback. In snapshot-rollback mode
+	// every clone is snapshotted (recycleSnapshotName) post-clone
+	// pre-boot, and job completion rolls the VM back to that snapshot
+	// and returns it to the warm pool instead of destroying it. The
+	// vm_max_age sweep still full-destroys aged VMs so template
+	// updates land; any rollback failure falls back to destroy.
+	RecycleMode string
+
 	ScaleSetName string
 	VMNamePrefix string // e.g. "gh-runner-<scaleset>-"
 	VMIDRange    config.VMIDRange
@@ -312,6 +322,12 @@ func normaliseProfiles(cfg Config) []ProfileSettings {
 // list and doesn't take a new dependency on tags solely for a string
 // literal.
 const defaultProfileName = "default"
+
+// recycleSnapshotName is the Proxmox snapshot every clone gets in
+// snapshot-rollback recycle mode, taken right after Clone while the VM
+// is still stopped. The rollback worker restores this snapshot after
+// each job so the VM re-enters the warm pool with a pristine disk.
+const recycleSnapshotName = "scaleset-clean"
 
 // destroyQueueCap bounds the destroy dispatcher backlog. Chosen as 2x
 // the destroy semaphore cap so steady-state bursts have slack without
@@ -561,10 +577,17 @@ func statsFromRaw(raw map[store.State]int) Stats {
 		Hot:          raw[store.StateHot],
 		Assigned:     raw[store.StateAssigned],
 		Running:      raw[store.StateRunning],
+		Recycling:    raw[store.StateRecycling],
 		Draining:     raw[store.StateDraining],
 		Destroying:   raw[store.StateDestroying],
 		Poison:       raw[store.StatePoison],
 	}
+}
+
+// snapshotRecycle reports whether the manager runs in snapshot-rollback
+// recycle mode. The empty string is destroy mode (the config default).
+func (m *manager) snapshotRecycle() bool {
+	return m.cfg.RecycleMode == config.RecycleModeSnapshotRollback
 }
 
 // Acquire atomically transitions one Hot VM to Assigned. Selection
@@ -766,6 +789,7 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 		store.StateHot,
 		store.StateAssigned,
 		store.StateRunning,
+		store.StateRecycling,
 		store.StatePoison,
 	}
 	var node, profile string
@@ -830,6 +854,10 @@ func (m *manager) Preempt(_ context.Context, vmid int, reason string) error {
 // ListRows returns a snapshot of every non-terminal VM row for the
 // GitHub reconciler. Terminal rows (Draining, Destroying) are excluded
 // because the reconciler shouldn't second-guess in-flight destruction.
+// Recycling rows ARE included: the VM survives the recycle, so hiding
+// it would make the reconciler's Proxmox-orphan sweep start an orphan
+// clock against a healthy VM. The reconciler's transition table has
+// explicit noop cells for the recycling state.
 // snapshotExistingVMsForAffinity returns the live VM rows projected
 // down to the (Node, Profile) tuples the nodeselector's affinity
 // wrapper needs. Excludes terminal states (Draining, Destroying):
@@ -859,28 +887,32 @@ func (m *manager) ListRows(_ context.Context) ([]RowSnapshot, error) {
 	out := make([]RowSnapshot, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, RowSnapshot{
-			VMID:       r.VMID,
-			Node:       r.Node,
-			Name:       r.Name,
-			Profile:    r.Profile,
-			State:      string(r.State),
-			JobID:      r.JobID,
-			RunnerID:   r.RunnerID,
-			StateSince: r.StateSince,
-			CreatedAt:  r.CreatedAt,
+			VMID:         r.VMID,
+			Node:         r.Node,
+			Name:         r.Name,
+			Profile:      r.Profile,
+			State:        string(r.State),
+			JobID:        r.JobID,
+			RunnerID:     r.RunnerID,
+			RecycleCount: r.RecycleCount,
+			StateSince:   r.StateSince,
+			CreatedAt:    r.CreatedAt,
 		})
 	}
 	return out, nil
 }
 
 // MarkCompleted transitions a busy VM (Assigned or Running) → Draining
-// and kicks destruction in the background. Refuses to act on rows in
-// any other state — this prevents a stray runner-hook event from
-// destroying a Hot/Booting VM, and a race with ForceDestroy from
-// reverting an already-destroying row.
+// and kicks destruction in the background — or, in snapshot-rollback
+// recycle mode, → Recycling and kicks a snapshot rollback that returns
+// the VM to the warm pool. Refuses to act on rows in any other state —
+// this prevents a stray runner-hook event from destroying a Hot/Booting
+// VM, and a race with ForceDestroy from reverting an already-destroying
+// row.
 //
-// Idempotent: a row already in Draining/Destroying gets a no-op return
-// (the existing destroy goroutine handles cleanup).
+// Idempotent: a row already in Recycling/Draining/Destroying gets a
+// no-op return (the existing rollback/destroy goroutine handles
+// cleanup).
 func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 	target, err := m.store.Get(vmid)
 	if err != nil {
@@ -892,10 +924,10 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 	switch target.State {
 	case store.StateAssigned, store.StateRunning:
 		// proceed
-	case store.StateDraining, store.StateDestroying:
-		// Already on the way out — just signal a refill in case the
-		// previous destroy is mid-flight and the freed slot hasn't been
-		// announced yet.
+	case store.StateRecycling, store.StateDraining, store.StateDestroying:
+		// Already on the way out (or back to warm) — just signal a
+		// refill in case the previous rollback/destroy is mid-flight
+		// and the freed slot hasn't been announced yet.
 		m.SignalRefill()
 		return nil
 	case store.StateProvisioning,
@@ -907,6 +939,24 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 		// states is either a spoof or a wildly stale retry. Refuse.
 		m.log.Warn("mark completed: refused for non-busy row",
 			"vmid", vmid, "state", target.State)
+		return nil
+	}
+	if m.shouldRecycle(target) {
+		// CAS Assigned/Running → Recycling inside one txn so a
+		// concurrent ForceDestroy can't revert us; the rollback worker
+		// owns the row from here.
+		ok, err := m.store.UpdateStateIn(vmid,
+			[]store.State{store.StateAssigned, store.StateRunning},
+			store.StateRecycling,
+			func(v *store.VM) { v.StateSince = time.Now() },
+		)
+		if err != nil {
+			return fmt.Errorf("mark completed: %w", err)
+		}
+		if ok {
+			m.rollbackAsync(target.VMID, target.Node, target.Name, target.Profile)
+			m.SignalRefill()
+		}
 		return nil
 	}
 	// CAS Assigned/Running → Draining inside one txn so a concurrent
@@ -929,6 +979,26 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 	m.destroyAsync(target.VMID, target.Node, target.Profile)
 	m.SignalRefill()
 	return nil
+}
+
+// shouldRecycle decides whether a completed job's VM is rolled back to
+// its clean snapshot (true) or destroyed (false). Recycle only in
+// snapshot-rollback mode AND while the row is younger than the
+// profile's vm_max_age — an aged VM takes the full destroy path so a
+// fresh clone picks up template updates. VMMaxAge <= 0 disables the
+// age gate (matching recycleOldVMs' semantics for the sweep).
+func (m *manager) shouldRecycle(row *store.VM) bool {
+	if !m.snapshotRecycle() {
+		return false
+	}
+	maxAge := m.cfg.VMMaxAge
+	if ps := m.profileOf(row.Profile); ps != nil {
+		maxAge = ps.settings.VMMaxAge
+	}
+	if maxAge <= 0 {
+		return true
+	}
+	return time.Since(row.CreatedAt) < maxAge
 }
 
 // Recover reconciles the (empty) in-memory store against Proxmox reality
@@ -1001,6 +1071,16 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		}
 		profile = m.defaultProfile()
 	}
+	// Snapshot-rollback mode: a stopped VM found at startup may carry a
+	// dirty disk (the previous leader crashed mid-job or between the
+	// job and the rollback). Adopt it into Recycling and queue a
+	// rollback so it re-enters Warm clean; if the snapshot doesn't
+	// exist the rollback fails and the fallback destroys it —
+	// self-healing either way.
+	recycleOnAdopt := m.snapshotRecycle() && state == store.StateWarm
+	if recycleOnAdopt {
+		state = store.StateRecycling
+	}
 	row := &store.VM{
 		VMID:     pv.VMID,
 		Node:     pv.Node,
@@ -1020,6 +1100,9 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		"state", state, "pool_kind", kind, "runner_id", runnerID)
 	if m.metrics != nil {
 		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, profile, "adopted_"+string(state)).Inc()
+	}
+	if recycleOnAdopt {
+		m.rollbackAsync(pv.VMID, pv.Node, pv.Name, profile)
 	}
 }
 
@@ -1409,8 +1492,16 @@ func (m *manager) provisioningCounts(profile string) (hot, warm int, err error) 
 // it for a single profile's headroom over-counts when other profiles
 // are cloning concurrently, but only in the safe direction (we
 // under-dispatch this profile's needed clones for one tick).
+//
+// Recycling rows count toward available: in snapshot-rollback mode a
+// completed job's VM re-enters Warm within one rollback (seconds), so
+// dispatching a replacement clone for it would defeat the mode's whole
+// point and grow the fleet. If the rollback fails and falls back to
+// destroy we under-dispatch for a tick — the safe direction, corrected
+// on the next pass. Destroy mode never produces Recycling rows, so the
+// term is inert there.
 func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSize, desired, profileMax int) (needHot, needWarm int) {
-	available := stats.Available() + hotProv + inflight
+	available := stats.Available() + stats.Recycling + hotProv + inflight
 	busy := stats.Busy()
 
 	// Two reasons to clone a hot VM:
@@ -1518,11 +1609,14 @@ func (m *manager) recycleOldVMs(profile string, maxAge time.Duration) {
 // sweepStuckRows is the fleet-wide transient-state sweep extracted
 // from the old reconcileOnce so a single profile's loop can run it
 // without forcing N concurrent sweeps in multi-profile configs.
+// Recycling is included so a wedged snapshot rollback self-heals into
+// the destroy path instead of pinning the row (and its VMID) forever.
 func (m *manager) sweepStuckRows() {
 	const stuckGrace = 5 * time.Minute
 	stuckCutoff := time.Now().Add(-stuckGrace)
 	stuckCandidates, err := m.store.ListByState(
 		store.StateProvisioning, store.StateBooting,
+		store.StateRecycling,
 		store.StateDraining, store.StateDestroying,
 	)
 	if err != nil {
@@ -1672,13 +1766,19 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	defer prep.cancel()
 	defer prep.span.End()
 
+	// Snapshot-rollback mode clones NEVER auto-start: the clean
+	// snapshot must be taken while the VM is still stopped, before the
+	// runner's first boot dirties the disk. Hot fills start the VM
+	// explicitly below, after the snapshot lands.
+	cloneStartsVM := prep.poweredOn && !m.snapshotRecycle()
+
 	cloneStart := time.Now()
 	pv, err := m.prov.Clone(prep.ctx, provisioner.CloneOptions{
 		NewVMID:       prep.vmid,
 		Node:          prep.node,
 		Name:          prep.name,
 		Linked:        m.cfg.LinkedClones,
-		PoweredOn:     prep.poweredOn,
+		PoweredOn:     cloneStartsVM,
 		Profile:       prep.profileName,
 		TemplateVMID:  prep.templateVMID,
 		TemplateClass: prep.templateClass,
@@ -1702,6 +1802,19 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	// stable for failure-rate purposes).
 	if m.cfg.Canary != nil {
 		m.cfg.Canary.RecordClone(prep.profileName, canary.Template(prep.templateClass))
+	}
+
+	// Snapshot-rollback mode: take the clean snapshot now, after the
+	// owner tags / hardware overrides landed and while the VM is still
+	// stopped. A failure here is non-fatal — the VM can still serve a
+	// job; without the snapshot its first rollback fails and the
+	// fallback destroys it, which is exactly the destroy-mode
+	// lifecycle. Do NOT poison it.
+	if m.snapshotRecycle() {
+		if serr := m.prov.SnapshotCreate(prep.ctx, pv, recycleSnapshotName); serr != nil {
+			m.log.Warn("clone: snapshot create failed; vm will be destroyed after its first job",
+				"vmid", prep.vmid, "node", prep.node, "snapshot", recycleSnapshotName, "err", serr)
+		}
 	}
 
 	// Transition row to warm (if not powered on) or booting (if powered on).
@@ -1730,6 +1843,16 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	}
 
 	if prep.poweredOn {
+		if !cloneStartsVM {
+			// Snapshot mode deferred the power-on past the snapshot;
+			// start the VM now so runBootInline's WaitReady has a
+			// booting guest to poll.
+			if serr := m.prov.Start(prep.ctx, pv); serr != nil {
+				m.log.Warn("clone: start after snapshot failed", "vmid", prep.vmid, "err", serr)
+				m.markPoisonOrDestroy(updated)
+				return
+			}
+		}
 		m.runBootInline(prep.ctx, pv, updated)
 	}
 	m.SignalRefill()
@@ -2235,6 +2358,157 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 // still being short enough to not pin process shutdown. Tests may
 // override this.
 var orphanCleanupTimeout = 15 * time.Second
+
+// rollbackAsync spawns the snapshot-rollback worker for a Recycling
+// row. The worker shares destroySem with the destroy path — a rollback
+// is the same class of Proxmox mutation as a destroy, so the two
+// compete for one budget rather than multiplying the fleet-wide
+// parallelism. Spawn count is bounded by the busy-row population
+// (MaxConcurrentRunners), so no queue is needed.
+//
+// Mirrors destroyAsync's drain gate: once drain() has begun, a new
+// wg.Add would race wg.Wait. The skipped row stays in Recycling and the
+// next leader's adopt pass re-queues the rollback (stopped VM →
+// Recycling → rollbackAsync).
+func (m *manager) rollbackAsync(vmid int, node, name, profile string) {
+	m.drainMu.Lock()
+	if m.draining {
+		m.drainMu.Unlock()
+		m.log.Debug("rollback: draining; skipping enqueue, next adopt will re-handle", "vmid", vmid)
+		return
+	}
+	m.wg.Add(1)
+	m.drainMu.Unlock()
+	go func() {
+		defer m.wg.Done()
+		defer func() { m.logRecoveredPanic("rollbackWorker", vmid, recover()) }()
+		if err := m.destroySem.Acquire(m.workerCtx, 1); err != nil {
+			// Cancelled before a slot freed up — the row stays in
+			// Recycling; the stuck-state sweep / next adopt re-handles.
+			m.log.Debug("rollback: cancelled before sem acquired", "vmid", vmid, "err", err)
+			return
+		}
+		defer m.destroySem.Release(1)
+		m.rollback(m.workerCtx, vmid, node, name, profile)
+	}()
+}
+
+// rollback is the body of one snapshot-rollback recycle:
+//
+//  1. Capture + clear the row's runner/job pairing in one write txn,
+//     then deregister the GitHub runner (same detached-context,
+//     best-effort semantics as destroy's orphan cleanup).
+//  2. Roll the VM back to recycleSnapshotName. The VM powered itself
+//     off after the job, so rolling back a stopped VM lands on the
+//     stopped snapshot state.
+//  3. On success CAS Recycling → Warm (PoolKindWarm, RecycleCount+1,
+//     CreatedAt untouched so vm_max_age still bounds total lifetime).
+//     The VMID is never released and no reuse-cooldown entry is
+//     recorded — the VM never left Proxmox.
+//
+// Any rollback failure (snapshot missing, storage error, task failure)
+// falls back to the destroy path so the pool self-heals with a fresh
+// clone.
+func (m *manager) rollback(ctx context.Context, vmid int, node, name, profile string) {
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	rctx, span := tracer.Start(rctx, "pool.rollback", trace.WithAttributes(
+		attribute.Int("vm.id", vmid),
+		attribute.String("vm.node", node),
+	))
+	defer span.End()
+
+	// Clear the runner/job pairing and capture the runner id in the
+	// same write txn — mirrors destroy's DeleteAndReturn rationale: a
+	// separate read would race late SetRunnerID writes. Per-job
+	// metadata (org/repo/class) is cleared too so the recycled row
+	// re-enters Warm as anonymous as a fresh clone.
+	var runnerID int64
+	if _, err := m.store.Update(vmid, func(v *store.VM) {
+		runnerID = v.RunnerID
+		v.RunnerID = 0
+		v.JobID = 0
+		v.Org = ""
+		v.Repo = ""
+		v.PriorityClass = ""
+	}); err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			m.log.Warn("rollback: clear runner pairing failed", "vmid", vmid, "err", err)
+		}
+		// Row gone (concurrent ForceDestroy won) — nothing to recycle.
+		return
+	}
+
+	if runnerID != 0 && m.cfg.OnRunnerOrphaned != nil {
+		// Detached from rctx for the same reason destroy detaches: a
+		// drain cancellation mustn't abort the idempotent deregister
+		// and leak the GitHub registration.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), orphanCleanupTimeout)
+		err := m.cfg.OnRunnerOrphaned(cleanupCtx, runnerID) //nolint:contextcheck // deliberately detached; see comment above
+		cleanupCancel()
+		if err != nil {
+			m.log.Warn("rollback: runner deregister failed", "vmid", vmid, "runner_id", runnerID, "err", err)
+		} else {
+			m.log.Debug("rollback: deregistered github runner", "vmid", vmid, "runner_id", runnerID)
+		}
+	}
+
+	pv := &provisioner.VM{VMID: vmid, Node: node, Name: name, Profile: profile}
+	if err := m.prov.SnapshotRollback(rctx, pv, recycleSnapshotName); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "rollback failed")
+		m.log.Warn("rollback: snapshot rollback failed; falling back to destroy",
+			"vmid", vmid, "node", node, "snapshot", recycleSnapshotName, "err", err)
+		if m.metrics != nil {
+			m.metrics.RecycleFailures.WithLabelValues(m.cfg.ScaleSetName, metricsProfile(profile)).Inc()
+		}
+		m.fallbackDestroy(vmid, node, profile)
+		return
+	}
+
+	ok, err := m.store.UpdateState(vmid, store.StateRecycling, store.StateWarm, func(v *store.VM) {
+		v.PoolKind = store.PoolKindWarm
+		v.RecycleCount++
+		v.StateSince = time.Now()
+	})
+	if err != nil || !ok {
+		// The row moved under us (stuck-sweep or ForceDestroy took
+		// ownership) — whoever won drives the teardown; don't fight.
+		m.log.Warn("rollback: row left recycling before completion; leaving to current owner",
+			"vmid", vmid, "cas_applied", ok, "err", err)
+		return
+	}
+	if m.metrics != nil {
+		m.metrics.Recycles.WithLabelValues(m.cfg.ScaleSetName, metricsProfile(profile)).Inc()
+	}
+	m.log.Info("rollback: vm recycled to warm pool",
+		"vmid", vmid, "node", node, "snapshot", recycleSnapshotName)
+	m.SignalRefill()
+}
+
+// fallbackDestroy routes a failed rollback into the standard destroy
+// path: CAS the row out of Recycling into Draining (so a racing owner
+// isn't reverted) and queue the async destroy.
+func (m *manager) fallbackDestroy(vmid int, node, profile string) {
+	ok, err := m.store.UpdateState(vmid, store.StateRecycling, store.StateDraining, func(v *store.VM) {
+		v.StateSince = time.Now()
+	})
+	if err != nil || !ok {
+		m.log.Warn("rollback: fallback mark draining failed; sweep will re-handle",
+			"vmid", vmid, "cas_applied", ok, "err", err)
+		return
+	}
+	m.destroyAsync(vmid, node, profile)
+}
+
+// metricsProfile clamps an empty profile name to the default profile
+// label, matching the destroy path's labelling of profile-less rows.
+func metricsProfile(profile string) string {
+	if profile == "" {
+		return defaultProfileName
+	}
+	return profile
+}
 
 // allocateVMID returns the lowest VMID in the configured range that is
 // not already claimed by an existing row AND has not been destroyed

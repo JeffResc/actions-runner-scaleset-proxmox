@@ -102,6 +102,16 @@ type Metrics struct {
 	ScheduleActive       *prometheus.GaugeVec
 	Leader               prometheus.Gauge
 
+	// Recycles counts successful snapshot-rollback recycles — a VM
+	// returned to the warm pool instead of destroyed (pool.recycle_mode:
+	// snapshot_rollback). RecycleFailures counts rollbacks that failed
+	// and fell back to the destroy path; a sustained non-zero rate means
+	// the snapshot storage is misbehaving (or the operator switched a
+	// pool with pre-existing snapshotless VMs into snapshot_rollback —
+	// those self-heal via destroy after their first job).
+	Recycles        *prometheus.CounterVec
+	RecycleFailures *prometheus.CounterVec
+
 	// PoolDestroyBacklogFull counts destroy requests dropped because the
 	// pool's destroy dispatcher queue was at capacity. Each drop is
 	// recoverable — the next reconcile pass re-finds the row in a
@@ -308,6 +318,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
 		}),
+		Recycles: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "recycles_total",
+			Help: "VMs returned to the warm pool via snapshot rollback instead of destroyed (recycle_mode: snapshot_rollback).",
+		}, []string{"scaleset", "profile"}),
+		RecycleFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "recycle_failures_total",
+			Help: "Snapshot rollbacks that failed and fell back to the destroy path.",
+		}, []string{"scaleset", "profile"}),
 		PoolDestroyBacklogFull: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "pool_destroy_backlog_full_total",
 			Help: "Destroy requests dropped because the dispatcher queue was at capacity, by scaleset and profile.",
@@ -331,6 +349,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.ScheduleFires, m.ScheduleActive,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
 		m.PanicsRecovered,
+		m.Recycles, m.RecycleFailures,
 		m.Leader,
 	)
 	return m

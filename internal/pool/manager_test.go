@@ -91,11 +91,25 @@ type fakeProv struct {
 	// inFlightClones drives InFlightCloneCount.
 	inFlightClones int
 
+	// snapshotErr / rollbackErr inject failures into SnapshotCreate /
+	// SnapshotRollback so recycle-mode tests can drive the "snapshot
+	// failed at clone" and "rollback failed → destroy fallback" paths.
+	snapshotErr error
+	rollbackErr error
+
 	clones       []provisioner.CloneOptions
 	destroys     []int
 	starts       []int
 	injects      []int
+	snapshots    []snapshotCall // SnapshotCreate calls in order
+	rollbacks    []snapshotCall // SnapshotRollback calls in order
 	listOwnedRet []*provisioner.VM
+}
+
+// snapshotCall records one SnapshotCreate / SnapshotRollback invocation.
+type snapshotCall struct {
+	vmid int
+	name string
 }
 
 func (f *fakeProv) TemplateNode() string         { return "pve1" }
@@ -164,6 +178,22 @@ func (f *fakeProv) Destroy(ctx context.Context, v *provisioner.VM) error {
 
 func (f *fakeProv) WaitReady(_ context.Context, _ *provisioner.VM, _ time.Duration) error {
 	return f.waitErr
+}
+
+func (f *fakeProv) SnapshotCreate(_ context.Context, v *provisioner.VM, name string) error {
+	f.mu.Lock()
+	f.snapshots = append(f.snapshots, snapshotCall{vmid: v.VMID, name: name})
+	err := f.snapshotErr
+	f.mu.Unlock()
+	return err
+}
+
+func (f *fakeProv) SnapshotRollback(_ context.Context, v *provisioner.VM, name string) error {
+	f.mu.Lock()
+	f.rollbacks = append(f.rollbacks, snapshotCall{vmid: v.VMID, name: name})
+	err := f.rollbackErr
+	f.mu.Unlock()
+	return err
 }
 
 func (f *fakeProv) InjectJITConfig(_ context.Context, v *provisioner.VM, _ string) error {
@@ -1928,6 +1958,12 @@ func (p *panickyProv) ListOwnedVMs(ctx context.Context) ([]*provisioner.VM, erro
 func (p *panickyProv) PowerState(ctx context.Context, vm *provisioner.VM) (string, error) {
 	return p.inner.PowerState(ctx, vm)
 }
+func (p *panickyProv) SnapshotCreate(ctx context.Context, vm *provisioner.VM, name string) error {
+	return p.inner.SnapshotCreate(ctx, vm, name)
+}
+func (p *panickyProv) SnapshotRollback(ctx context.Context, vm *provisioner.VM, name string) error {
+	return p.inner.SnapshotRollback(ctx, vm, name)
+}
 func (p *panickyProv) Ping(ctx context.Context) error { return p.inner.Ping(ctx) }
 func (p *panickyProv) TemplateNode() string           { return p.inner.TemplateNode() }
 func (p *panickyProv) Client() *proxmox.Client        { return p.inner.Client() }
@@ -2828,4 +2864,298 @@ func TestSetTargetSizes_ClampsToMaxConcurrentRunners(t *testing.T) {
 	require.NoError(t, mgr.SetTargetSizes("cpu", 99, 99))
 	require.Equal(t, int32(5), ps.hotSize.Load())
 	require.Equal(t, int32(0), ps.warmSize.Load())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot-rollback recycle (recycle_mode: snapshot_rollback)
+// ---------------------------------------------------------------------------
+
+// orphanRecorder is a thread-safe OnRunnerOrphaned capture for the
+// recycle tests.
+type orphanRecorder struct {
+	mu  sync.Mutex
+	ids []int64
+}
+
+func (o *orphanRecorder) callback(_ context.Context, runnerID int64) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ids = append(o.ids, runnerID)
+	return nil
+}
+
+func (o *orphanRecorder) snapshot() []int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]int64(nil), o.ids...)
+}
+
+// seedRunningForRecycle inserts one Running row paired with a runner,
+// with an explicit CreatedAt so the tests can pin the vm_max_age gate
+// and the CreatedAt-is-preserved invariant.
+func seedRunningForRecycle(t *testing.T, st *store.Store, vmid int, createdAt time.Time) {
+	t.Helper()
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: vmid, Node: "pve1", Name: fmt.Sprintf("gh-runner-test-%d", vmid),
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning, JobID: 42, RunnerID: 7777,
+		Org: "acme", Repo: "acme/ci", CreatedAt: createdAt,
+	}))
+}
+
+// TestMarkCompleted_SnapshotRollbackRecyclesToWarm drives the happy
+// path: Running → Recycling → Warm with the runner deregistered, the
+// recycle counter bumped, CreatedAt untouched, and NO destroy — the
+// row (and its VMID) survives for the next job.
+func TestMarkCompleted_SnapshotRollbackRecyclesToWarm(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	created := time.Now().Add(-time.Minute)
+	seedRunningForRecycle(t, st, 21000, created)
+
+	fp := &fakeProv{}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		VMMaxAge:         time.Hour, // row is 1m old — well inside the recycle window
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+	})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21000))
+
+	require.Eventually(t, func() bool {
+		row, err := st.Get(21000)
+		return err == nil && row.State == store.StateWarm
+	}, 2*time.Second, 10*time.Millisecond, "row never returned to warm")
+
+	row, err := st.Get(21000)
+	require.NoError(t, err)
+	require.Equal(t, store.PoolKindWarm, row.PoolKind)
+	require.Equal(t, 1, row.RecycleCount)
+	require.Zero(t, row.RunnerID, "runner pairing must be cleared before the VM re-enters warm")
+	require.Zero(t, row.JobID)
+	require.Empty(t, row.Org)
+	require.True(t, row.CreatedAt.Equal(created), "CreatedAt must survive the recycle so vm_max_age still applies")
+
+	require.Equal(t, []int64{7777}, orphans.snapshot(), "the GitHub runner must be deregistered exactly like the destroy path")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Equal(t, []snapshotCall{{vmid: 21000, name: recycleSnapshotName}}, fp.rollbacks)
+	require.Empty(t, fp.destroys, "a successful recycle must not destroy the VM")
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(mgr.metrics.Recycles.WithLabelValues("test", defaultProfileName)))
+}
+
+// TestMarkCompleted_RollbackFailureFallsBackToDestroy: any rollback
+// error (missing snapshot, storage failure) must route the row into
+// the standard destroy path so the pool self-heals with a fresh clone.
+func TestMarkCompleted_RollbackFailureFallsBackToDestroy(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedRunningForRecycle(t, st, 21001, time.Now())
+
+	fp := &fakeProv{rollbackErr: errors.New("snapshot 'scaleset-clean' does not exist")}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		VMMaxAge:         time.Hour,
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+	})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21001))
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		destroyed := len(fp.destroys) == 1
+		fp.mu.Unlock()
+		if !destroyed {
+			return false
+		}
+		_, err := st.Get(21001)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "rollback failure never fell back to destroy")
+
+	// Deregistration happened once, on the rollback path; the destroy
+	// path saw RunnerID already cleared and must not double-fire.
+	require.Equal(t, []int64{7777}, orphans.snapshot())
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(mgr.metrics.RecycleFailures.WithLabelValues("test", defaultProfileName)))
+}
+
+// TestMarkCompleted_MaxAgeExceededDestroysNotRecycles: a row older
+// than the profile's vm_max_age takes the full destroy path even in
+// snapshot-rollback mode, so template updates land on the replacement
+// clone.
+func TestMarkCompleted_MaxAgeExceededDestroysNotRecycles(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedRunningForRecycle(t, st, 21002, time.Now().Add(-2*time.Hour))
+
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     0,
+		VMMaxAge:    time.Hour, // row is 2h old — past the recycle window
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21002))
+
+	require.Eventually(t, func() bool {
+		_, err := st.Get(21002)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "aged row was never destroyed")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.rollbacks, "aged rows must not be rolled back")
+	require.Equal(t, []int{21002}, fp.destroys)
+}
+
+// TestMarkCompleted_DestroyModeNeverRollsBack pins the default-mode
+// contract: without recycle_mode: snapshot_rollback, MarkCompleted
+// behaves exactly as before this feature (destroy, no rollback).
+func TestMarkCompleted_DestroyModeNeverRollsBack(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedRunningForRecycle(t, st, 21003, time.Now())
+
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 0, VMMaxAge: time.Hour})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21003))
+
+	require.Eventually(t, func() bool {
+		_, err := st.Get(21003)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.rollbacks)
+	require.Empty(t, fp.snapshots)
+}
+
+// TestRunClone_SnapshotRollbackSnapshotsBeforeBoot: in snapshot mode a
+// hot-fill clone must NOT auto-start inside Clone — the clean snapshot
+// is taken while the VM is stopped, and only then is the VM started
+// and promoted to Hot.
+func TestRunClone_SnapshotRollbackSnapshotsBeforeBoot(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     1,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		rows, err := st.ListByState(store.StateHot)
+		return err == nil && len(rows) == 1
+	}, 2*time.Second, 10*time.Millisecond, "clone never reached hot")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Len(t, fp.clones, 1)
+	require.False(t, fp.clones[0].PoweredOn, "snapshot mode must clone powered-off so the snapshot precedes first boot")
+	require.Equal(t, []snapshotCall{{vmid: fp.clones[0].NewVMID, name: recycleSnapshotName}}, fp.snapshots)
+	require.Equal(t, []int{fp.clones[0].NewVMID}, fp.starts, "hot fill must start the VM after the snapshot")
+}
+
+// TestRunClone_SnapshotFailureFallsBackToDestroyMode: a failed
+// SnapshotCreate must not poison or destroy the fresh clone — the VM
+// still serves a job; its first rollback fails and the destroy
+// fallback handles it then.
+func TestRunClone_SnapshotFailureFallsBackToDestroyMode(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{snapshotErr: errors.New("storage does not support snapshots")}
+	mgr := newTestManager(t, st, fp, Config{
+		WarmSize:    1,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		rows, err := st.ListByState(store.StateWarm)
+		return err == nil && len(rows) == 1
+	}, 2*time.Second, 10*time.Millisecond, "clone never reached warm despite the snapshot failure being non-fatal")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Len(t, fp.snapshots, 1)
+	require.Empty(t, fp.destroys)
+}
+
+// TestAdopt_SnapshotRollbackRollsBackStoppedVM: a stopped owned VM
+// found at startup may carry a dirty disk (crashed mid-job), so
+// adoption in snapshot mode routes it through Recycling → rollback →
+// Warm instead of trusting the disk.
+func TestAdopt_SnapshotRollbackRollsBackStoppedVM(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 30000, Node: "pve1", Name: "gh-runner-test-30000", Profile: defaultProfileName},
+		},
+		powerStateBy: map[int]string{30000: "stopped"},
+	}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     0,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	require.Eventually(t, func() bool {
+		row, err := st.Get(30000)
+		return err == nil && row.State == store.StateWarm
+	}, 2*time.Second, 10*time.Millisecond, "adopted stopped vm never landed in warm")
+
+	row, err := st.Get(30000)
+	require.NoError(t, err)
+	require.Equal(t, 1, row.RecycleCount)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Equal(t, []snapshotCall{{vmid: 30000, name: recycleSnapshotName}}, fp.rollbacks)
+	require.Empty(t, fp.destroys)
+}
+
+// TestAdopt_SnapshotRollbackFailureDestroysStoppedVM: adoption of a
+// stopped VM whose snapshot is missing (e.g. the operator flipped an
+// existing destroy-mode fleet to snapshot_rollback) must self-heal by
+// destroying it.
+func TestAdopt_SnapshotRollbackFailureDestroysStoppedVM(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 30001, Node: "pve1", Name: "gh-runner-test-30001", Profile: defaultProfileName},
+		},
+		powerStateBy: map[int]string{30001: "stopped"},
+		rollbackErr:  errors.New("snapshot 'scaleset-clean' does not exist"),
+	}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     0,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		destroyed := len(fp.destroys) == 1
+		fp.mu.Unlock()
+		if !destroyed {
+			return false
+		}
+		_, err := st.Get(30001)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "unrollbackable adopted vm was never destroyed")
 }

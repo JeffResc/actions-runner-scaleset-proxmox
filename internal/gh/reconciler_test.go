@@ -190,6 +190,12 @@ func (s *stubProv) PowerState(context.Context, *provisioner.VM) (string, error) 
 func (s *stubProv) Ping(context.Context) error                  { return nil }
 func (s *stubProv) TemplateNode() string                        { return "pve1" }
 func (s *stubProv) Client() *proxmox.Client                     { return nil }
+func (s *stubProv) SnapshotCreate(context.Context, *provisioner.VM, string) error {
+	return nil
+}
+func (s *stubProv) SnapshotRollback(context.Context, *provisioner.VM, string) error {
+	return nil
+}
 func (s *stubProv) IsRecentlyDestroyed(int, time.Duration) bool { return false }
 func (s *stubProv) InFlightCloneCount() int                     { return 0 }
 
@@ -839,7 +845,7 @@ func TestNew_RequiresNonNilDeps(t *testing.T) {
 // from a regression that drops a cell.
 func TestStateTransitionTable_Completeness(t *testing.T) {
 	t.Parallel()
-	dbStates := []string{"assigned", "running", "hot"}
+	dbStates := []string{"assigned", "running", "recycling", "hot"}
 	ghLabels := []string{"busy", "idle", "offline", "missing"}
 	for _, ds := range dbStates {
 		for _, gl := range ghLabels {
@@ -997,4 +1003,35 @@ func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *te
 	removeMu.Lock()
 	defer removeMu.Unlock()
 	require.Contains(t, removed, int64(2), "orphan B at its own grace boundary must be reaped")
+}
+
+// TestReconcile_RecyclingRowsLeftAlone: rows in the transient
+// "recycling" state (snapshot-rollback recycle in flight) belong to
+// the pool's rollback worker — the reconciler must not promote or
+// destroy them regardless of what the GitHub runner snapshot claims.
+// Every ghLabel cell is exercised: busy (rollback racing a stale busy
+// flag), idle, offline, and missing (worker already deregistered).
+func TestReconcile_RecyclingRowsLeftAlone(t *testing.T) {
+	t.Parallel()
+	srv := runnersServer(t, []fakeRunner{
+		{id: 300, name: "gh-runner-test-3001", status: "online", busy: true},
+		{id: 301, name: "gh-runner-test-3002", status: "online", busy: false},
+		{id: 302, name: "gh-runner-test-3003", status: "offline", busy: false},
+		// gh-runner-test-3004 deliberately missing from GitHub.
+	})
+	defer srv.Close()
+
+	since := time.Now().Add(-time.Hour) // far past every grace timer
+	mgr := &fakeManager{rows: []pool.RowSnapshot{
+		{VMID: 3001, Name: "gh-runner-test-3001", State: "recycling", StateSince: since},
+		{VMID: 3002, Name: "gh-runner-test-3002", State: "recycling", StateSince: since},
+		{VMID: 3003, Name: "gh-runner-test-3003", State: "recycling", StateSince: since},
+		{VMID: 3004, Name: "gh-runner-test-3004", State: "recycling", StateSince: since},
+	}}
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
+	require.NoError(t, err)
+	require.NoError(t, r.Tick(context.Background()))
+
+	require.Empty(t, mgr.promoteCalls, "recycling rows must never be promoted")
+	require.Empty(t, mgr.destroyCalls, "recycling rows must never be force-destroyed")
 }

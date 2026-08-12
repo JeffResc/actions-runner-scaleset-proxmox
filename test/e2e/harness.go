@@ -78,6 +78,11 @@ type Options struct {
 	// Defaults to "octocat". The fake accepts any value.
 	Org string
 
+	// RecycleMode, when non-empty, sets pool.recycle_mode in the
+	// generated config ("destroy" or "snapshot_rollback"). Empty
+	// omits the key so the orchestrator's default (destroy) applies.
+	RecycleMode string
+
 	// ScaleSetName is the runner-scale-set name (must match the fake's
 	// scale-set name; both default to "test-scaleset").
 	ScaleSetName string
@@ -243,6 +248,7 @@ func Start(t testing.TB, opts Options) *Harness {
 		HotSize:              opts.HotSize,
 		WarmSize:             opts.WarmSize,
 		MaxConcurrentRunners: opts.MaxConcurrentRunners,
+		RecycleMode:          opts.RecycleMode,
 		ObsAddr:              obsAddr,
 		AdminAddr:            adminAddr,
 	}
@@ -452,6 +458,7 @@ type configValues struct {
 	HotSize              int
 	WarmSize             int
 	MaxConcurrentRunners int
+	RecycleMode          string // empty omits pool.recycle_mode (default destroy)
 	ObsAddr              string
 	AdminAddr            string
 
@@ -568,6 +575,9 @@ pool:
   vmid_reuse_cooldown: 10m
   orphan_grace: 5s
   clone_inflight_grace: 1m
+{{- if .RecycleMode }}
+  recycle_mode: {{.RecycleMode}}
+{{- end }}
 observability:
   http_addr: "{{.ObsAddr}}"
   log_level: warn

@@ -203,6 +203,12 @@ func (stubProvForScaler) PowerState(context.Context, *provisioner.VM) (string, e
 func (stubProvForScaler) Ping(context.Context) error                  { return nil }
 func (stubProvForScaler) TemplateNode() string                        { return "pve1" }
 func (stubProvForScaler) Client() *proxmox.Client                     { return nil }
+func (stubProvForScaler) SnapshotCreate(context.Context, *provisioner.VM, string) error {
+	return nil
+}
+func (stubProvForScaler) SnapshotRollback(context.Context, *provisioner.VM, string) error {
+	return nil
+}
 func (stubProvForScaler) IsRecentlyDestroyed(int, time.Duration) bool { return false }
 func (stubProvForScaler) InFlightCloneCount() int                     { return 0 }
 

@@ -20,6 +20,14 @@ type vmRecord struct {
 	Running   bool
 	StartedAt time.Time // wall-clock start so guest-agent delay can be enforced
 	Config    map[string]any
+
+	// Snapshots holds the VM's snapshot names in creation order.
+	// SnapshotCreates / Rollbacks count the respective API calls so
+	// tests can assert "snapshotted exactly once, rolled back twice"
+	// without scraping the task table.
+	Snapshots       []string
+	SnapshotCreates int
+	Rollbacks       int
 }
 
 // taskRecord backs the asynchronous task model. Real Proxmox returns an
@@ -56,11 +64,14 @@ func (s *store) snapshot() []VMSnapshot {
 	out := make([]VMSnapshot, 0, len(s.vms))
 	for _, v := range s.vms {
 		out = append(out, VMSnapshot{
-			VMID:    v.VMID,
-			Node:    v.Node,
-			Name:    v.Name,
-			Tags:    v.Tags,
-			Running: v.Running,
+			VMID:            v.VMID,
+			Node:            v.Node,
+			Name:            v.Name,
+			Tags:            v.Tags,
+			Running:         v.Running,
+			Snapshots:       append([]string(nil), v.Snapshots...),
+			SnapshotCreates: v.SnapshotCreates,
+			Rollbacks:       v.Rollbacks,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].VMID < out[j].VMID })
@@ -69,13 +80,17 @@ func (s *store) snapshot() []VMSnapshot {
 
 // VMSnapshot is the externally observable view of one VM. Tags are kept
 // in semicolon-joined wire form so assertion code matches the
-// orchestrator's own format.
+// orchestrator's own format. Snapshots / SnapshotCreates / Rollbacks
+// expose the VM's Proxmox-snapshot bookkeeping for recycle-mode tests.
 type VMSnapshot struct {
-	VMID    int
-	Node    string
-	Name    string
-	Tags    string
-	Running bool
+	VMID            int
+	Node            string
+	Name            string
+	Tags            string
+	Running         bool
+	Snapshots       []string
+	SnapshotCreates int
+	Rollbacks       int
 }
 
 // seedVM inserts a VM directly into the store, bypassing the API. Tests
