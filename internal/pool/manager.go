@@ -1101,6 +1101,16 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		PoolKind: kind,
 		State:    state,
 		RunnerID: runnerID,
+		// Optimistic in recycle mode: an inherited VM was cloned by a
+		// recycle-mode leader, so the clone-time snapshot almost
+		// certainly exists — and BEFORE this field existed, adopted
+		// Recycling rows were credited unconditionally, so pessimism
+		// here would regress the adopt-time mass-recycle protection
+		// into double-cloning the warm pool at leader startup. If the
+		// optimism is wrong the row's first rollback fails, the
+		// destroy fallback fires, and the next reconcile tick sees
+		// the true deficit — the standard one-tick self-heal.
+		HasRecycleSnapshot: m.snapshotRecycle(),
 	}
 	if err := m.store.Insert(row); err != nil {
 		m.log.Warn("adopt: insert failed; skipping",
@@ -1437,8 +1447,32 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	hotSize := int(ps.hotSize.Load())
 	warmSize := int(ps.warmSize.Load())
 	desired := int(ps.desiredCount.Load())
-	needHot, needWarm := computeCloneNeeds(stats, m.prov.InFlightCloneCount(),
-		hotProv, warmProv, hotSize, warmSize, desired, ps.settings.MaxConcurrentRunners)
+	inflight := m.prov.InFlightCloneCount()
+	credit := m.profileReturningCredit(profile, ps.settings.VMMaxAge)
+	needHot, needWarm := computeCloneNeeds(stats, inflight,
+		hotProv, warmProv, hotSize, warmSize, desired, ps.settings.MaxConcurrentRunners, credit)
+
+	// Observability for the recycle-mode clone suppression: re-run the
+	// pure needs math without the Assigned/Running credit (the
+	// Recycling credit predates this mechanism and is kept in both
+	// runs) and count the clones the credit saved THIS PASS — the
+	// counter increments once per pass while suppression is active,
+	// so dashboards should read it as a rate. computeCloneNeeds is
+	// pure and the row set is bounded by MaxConcurrentRunners, so the
+	// second evaluation is effectively free.
+	if credit.busy > 0 {
+		baseHot, baseWarm := computeCloneNeeds(stats, inflight,
+			hotProv, warmProv, hotSize, warmSize, desired, ps.settings.MaxConcurrentRunners,
+			returningCredit{recycling: credit.recycling})
+		if suppressed := (baseHot - needHot) + (baseWarm - needWarm); suppressed > 0 {
+			if m.metrics != nil {
+				m.metrics.CloneSuppressed.WithLabelValues(m.cfg.ScaleSetName, profile).Add(float64(suppressed))
+			}
+			m.log.Debug("reconcile: suppressed replacement clones for returning vms",
+				"profile", profile, "suppressed", suppressed,
+				"returning_busy", credit.busy, "returning_recycling", credit.recycling)
+		}
+	}
 
 	// Promote warm -> hot first (cheap).
 	promoteCount := needHot
@@ -1493,6 +1527,24 @@ func (m *manager) provisioningCounts(profile string) (hot, warm int, err error) 
 	return hot, warm, nil
 }
 
+// returningCredit is the snapshot-rollback-mode "will return to the
+// pool shortly" credit computeCloneNeeds applies against the BASELINE
+// hot/warm top-up. profileReturningCredit computes it from live rows;
+// it is always the zero value in destroy mode, which makes every
+// credit term below inert there (destroy mode also never produces
+// Recycling rows, so stats.Recycling is simultaneously 0).
+type returningCredit struct {
+	// busy is the count of Assigned/Running rows that will re-enter
+	// the pool via snapshot rollback seconds after their job ends
+	// (they carry the recycle snapshot and are under the vm_max_age
+	// cutoff). Rows that will be destroyed instead — no snapshot, or
+	// over-age — are excluded so their real deficit is cloned for.
+	busy int
+	// recycling is the same filter applied to Recycling rows (the
+	// rollback is already in flight; Warm is seconds away).
+	recycling int
+}
+
 // computeCloneNeeds is the pure pool-sizing math: given the profile's
 // snapshot + sizing knobs, return how many fresh Hot and Warm VMs to
 // dispatch this tick. Pulled out as a free function so the clamp
@@ -1505,30 +1557,59 @@ func (m *manager) provisioningCounts(profile string) (hot, warm int, err error) 
 // are cloning concurrently, but only in the safe direction (we
 // under-dispatch this profile's needed clones for one tick).
 //
-// Recycling rows count toward BOTH the hot-available term and the
-// warm-inflight term: in snapshot-rollback mode a completed job's VM
-// re-enters Warm within one rollback (seconds), so dispatching a
-// replacement clone for it — on either side of the pool — would defeat
-// the mode's whole point and grow the fleet. The hot term stops a
-// post-job recycle from triggering an eager hot refill; the warm term
-// stops the adopt-time mass-recycle (every stopped VM found at leader
-// startup enters Recycling) from double-cloning the entire warm pool
-// before the rollbacks land. If a rollback fails and falls back to
-// destroy we under-dispatch for a tick — the safe direction, corrected
-// on the next pass. Destroy mode never produces Recycling rows, so
-// both terms are inert there.
-func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSize, desired, profileMax int) (needHot, needWarm int) {
-	available := stats.Available() + stats.Recycling + hotProv + inflight
+// Recycle-mode credit placement — why bursts still scale up:
+//
+// Demand-driven provisioning flows through the SAME needs computation
+// as the baseline top-up, via the `desired` term (the listener's
+// HandleDesiredRunnerCount calls SetDesiredCount before it tries to
+// Acquire, and Acquire itself never clones — it only CASes an existing
+// Hot row and signals a refill). So the ONLY place a credit can be
+// applied without dulling burst response is the needIdle term:
+//
+//   - needIdle (baseline top-up) subtracts credit.busy: an Assigned/
+//     Running VM that will roll back into the pool right after its job
+//     is, for steady-state sizing purposes, not really "consumed" —
+//     cloning a replacement for it would grow the fleet past hotSize
+//     the moment the rollback lands.
+//   - needBurst deliberately does NOT subtract credit.busy. desired
+//     counts the jobs those busy VMs are serving, and busy counts the
+//     VMs — the pair cancels out, so a busy-but-returning VM never
+//     hides pending demand. A second job arriving while the only VM is
+//     busy yields desired=2, busy=1, available=0 → needBurst=1 → a
+//     clone is dispatched exactly as in destroy mode. (Crediting busy
+//     inside needBurst would instead double-count the VM — once in
+//     busy's cancellation and once as a credit — and starve the burst.)
+//   - credit.recycling extends the pre-existing Recycling term: those
+//     rows' jobs are DONE (desired no longer counts them), so they are
+//     genuine near-term availability for both baseline and burst
+//     purposes, on the hot side and the warm side. Non-returning
+//     Recycling rows (rollback doomed to fail — no snapshot) are
+//     excluded by the credit filter and their deficit cloned for.
+//   - The profileMax room clamp keeps counting ALL Recycling rows
+//     (stats.Recycling), credited or not: even a rollback that is
+//     about to fall back to destroy is a live Proxmox VM occupying
+//     capacity until the destroy lands. Under-counting there could
+//     transiently overshoot the operator's concurrency cap; counting
+//     them only delays scale-up by a tick — the safe direction.
+//
+// If a credited VM never returns (rollback failure → destroy
+// fallback), the next tick's stats show the real deficit and the
+// clone is dispatched then — under-provisioning is bounded by one
+// reconcile pass, never permanent.
+func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSize, desired, profileMax int, credit returningCredit) (needHot, needWarm int) {
+	available := stats.Available() + credit.recycling + hotProv + inflight
 	busy := stats.Busy()
 
 	// Two reasons to clone a hot VM:
 	//   (a) Eager replacement: keep `available >= HotSize` so
 	//       consuming a hot VM (Assigned) immediately triggers a
-	//       refill clone.
+	//       refill clone — unless the consumed VM is credited as
+	//       returning (recycle mode), in which case the "refill" is
+	//       the rollback already scheduled to happen.
 	//   (b) Burst response: when GitHub's desiredCount exceeds the
 	//       current in-flight runner count, scale up immediately.
 	// Effective need is the larger of the two.
-	needIdle := hotSize - available
+	needIdle := hotSize - available - credit.busy
 	needBurst := desired - (available + busy)
 	needHot = needIdle
 	if needBurst > needHot {
@@ -1538,19 +1619,70 @@ func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSi
 		needHot = 0
 	}
 	// Cap by remaining room under this profile's MaxConcurrentRunners.
-	if room := profileMax - (available + busy); room < needHot {
+	// Uses the full stats.Recycling population (not the credit) — see
+	// the room-clamp note in the doc comment.
+	occupied := stats.Available() + stats.Recycling + hotProv + inflight + busy
+	if room := profileMax - occupied; room < needHot {
 		needHot = room
 	}
 	if needHot < 0 {
 		needHot = 0
 	}
 
-	warmInflight := stats.LiveWarm() + warmProv + stats.Recycling
+	warmInflight := stats.LiveWarm() + warmProv + credit.recycling + credit.busy
 	needWarm = warmSize - warmInflight
 	if needWarm < 0 {
 		needWarm = 0
 	}
 	return needHot, needWarm
+}
+
+// profileReturningCredit counts the profile's busy-side rows that will
+// return to the pool shortly and may therefore be credited against the
+// baseline hot/warm top-up. Always zero in destroy mode. A row is
+// credited only when BOTH hold:
+//
+//   - it carries the recycle snapshot (HasRecycleSnapshot) — a
+//     snapshot-create failure at clone time means the VM is destroyed
+//     after its job, exactly like destroy mode, so a replacement IS
+//     needed;
+//   - it is younger than maxAge (the same cutoff shouldRecycle and
+//     recycleOldVMs apply) — an over-age VM takes the full destroy
+//     path after its job so template updates land.
+//
+// A store list error degrades to zero credit: the reconciler may then
+// dispatch clones a returning VM would have covered — over-provisioning
+// for a tick, which shrinkHotPool/vm_max_age reclaims — rather than
+// silently under-provisioning on bad data.
+func (m *manager) profileReturningCredit(profile string, maxAge time.Duration) returningCredit {
+	if !m.snapshotRecycle() {
+		return returningCredit{}
+	}
+	rows, err := m.store.ListByProfileAndStates(profile,
+		store.StateAssigned, store.StateRunning, store.StateRecycling)
+	if err != nil {
+		m.log.Warn("reconcile: list returning rows failed; crediting none", "profile", profile, "err", err)
+		return returningCredit{}
+	}
+	var cutoff time.Time
+	if maxAge > 0 {
+		cutoff = time.Now().Add(-maxAge)
+	}
+	var credit returningCredit
+	for _, r := range rows {
+		if !r.HasRecycleSnapshot {
+			continue // will be destroyed after its job, not recycled
+		}
+		if maxAge > 0 && r.CreatedAt.Before(cutoff) {
+			continue // over vm_max_age: destroy path, same cutoff as recycleOldVMs
+		}
+		if r.State == store.StateRecycling {
+			credit.recycling++
+		} else {
+			credit.busy++
+		}
+	}
+	return credit
 }
 
 // shrinkHotPool destroys the oldest Hot rows when the current Hot
@@ -1826,11 +1958,18 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	// stopped. A failure here is non-fatal — the VM can still serve a
 	// job; without the snapshot its first rollback fails and the
 	// fallback destroys it, which is exactly the destroy-mode
-	// lifecycle. Do NOT poison it.
+	// lifecycle. Do NOT poison it. The outcome is persisted on the row
+	// (HasRecycleSnapshot) so the reconciler knows whether this VM
+	// returns to the pool after its job (credit it, skip the
+	// replacement clone) or is destroyed (clone a replacement as in
+	// destroy mode).
+	hasSnapshot := false
 	if m.snapshotRecycle() {
 		if serr := m.prov.SnapshotCreate(prep.ctx, pv, recycleSnapshotName); serr != nil {
 			m.log.Warn("clone: snapshot create failed; vm will be destroyed after its first job",
 				"vmid", prep.vmid, "node", prep.node, "snapshot", recycleSnapshotName, "err", serr)
+		} else {
+			hasSnapshot = true
 		}
 	}
 
@@ -1842,6 +1981,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	updated, err := m.store.Update(prep.vmid, func(v *store.VM) {
 		v.State = target
 		v.StateSince = time.Now()
+		v.HasRecycleSnapshot = hasSnapshot
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -2487,6 +2627,10 @@ func (m *manager) rollback(ctx context.Context, vmid int, node, name, profile st
 		v.PoolKind = store.PoolKindWarm
 		v.RecycleCount++
 		v.StateSince = time.Now()
+		// A successful rollback proves the snapshot exists — firm up
+		// rows adopted with an optimistic (or missing) flag so future
+		// reconcile passes credit them from observed fact.
+		v.HasRecycleSnapshot = true
 	})
 	if err != nil || !ok {
 		// The row moved under us (stuck-sweep or ForceDestroy took

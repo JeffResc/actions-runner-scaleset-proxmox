@@ -96,9 +96,21 @@ type VM struct {
 	// reset on recycle, so vm_max_age still bounds the VM's total
 	// lifetime regardless of how often it was recycled.
 	RecycleCount int
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	StateSince   time.Time
+	// HasRecycleSnapshot records whether the VM carries the
+	// "scaleset-clean" recycle snapshot (pool.recycle_mode:
+	// snapshot_rollback). Set true where the snapshot outcome is
+	// known: after a successful clone-time SnapshotCreate, after a
+	// successful rollback (which proves the snapshot exists), and
+	// optimistically on adoption in recycle mode (an inherited VM was
+	// cloned by a recycle-mode leader; if the optimism is wrong its
+	// next rollback fails and the destroy fallback self-heals). False
+	// means the VM will be destroyed — not recycled — after its job,
+	// so the reconciler must NOT credit it as "returning to the pool"
+	// when sizing replacement clones. Always false in destroy mode.
+	HasRecycleSnapshot bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	StateSince         time.Time
 }
 
 // Clone returns a deep copy. memdb stores by pointer; mutating a row read

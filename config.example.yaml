@@ -228,6 +228,18 @@ pool:
   #                       still forces a periodic full destroy +
   #                       re-clone so template updates land. Rollback
   #                       failures fall back to the destroy path.
+  #                       While a job runs, its VM counts as "returning
+  #                       shortly", so the reconciler suppresses the
+  #                       replacement clone destroy mode would dispatch
+  #                       (observable via scaleset_clone_suppressed_total)
+  #                       — the fleet stays at hot_size + warm_size
+  #                       instead of piling up excess warm VMs. Demand
+  #                       is unaffected: jobs beyond the busy VMs still
+  #                       clone immediately, up to max_concurrent_runners.
+  #                       VMs that will NOT return (snapshot creation
+  #                       failed, or past vm_max_age) still get their
+  #                       replacement cloned during the job, exactly
+  #                       like destroy mode.
   # Pool-level setting: applies to all profiles of the scaleset.
   recycle_mode: destroy
 
