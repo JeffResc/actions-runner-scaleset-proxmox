@@ -1566,11 +1566,19 @@ type returningCredit struct {
 // Hot row and signals a refill). So the ONLY place a credit can be
 // applied without dulling burst response is the needIdle term:
 //
-//   - needIdle (baseline top-up) subtracts credit.busy: an Assigned/
+//   - needIdle (baseline top-up) subtracts the credit: an Assigned/
 //     Running VM that will roll back into the pool right after its job
 //     is, for steady-state sizing purposes, not really "consumed" —
 //     cloning a replacement for it would grow the fleet past hotSize
-//     the moment the rollback lands.
+//     the moment the rollback lands. But every credited VM returns to
+//     the pool exactly ONCE (rollback lands in Warm; promotion covers
+//     hot deficits from there), so the combined credit is distributed
+//     hot-deficit-first with only the REMAINDER offsetting the warm
+//     top-up. Crediting the full amount against both sides would let a
+//     single returning VM suppress two replacement clones whenever hot
+//     and warm are short simultaneously (fleet below hotSize+warmSize —
+//     e.g. a warm VM reaped by vm_max_age mid-job), under-provisioning
+//     for the whole job duration instead of the one-tick bound below.
 //   - needBurst deliberately does NOT subtract credit.busy. desired
 //     counts the jobs those busy VMs are serving, and busy counts the
 //     VMs — the pair cancels out, so a busy-but-returning VM never
@@ -1581,8 +1589,10 @@ type returningCredit struct {
 //     busy's cancellation and once as a credit — and starve the burst.)
 //   - credit.recycling extends the pre-existing Recycling term: those
 //     rows' jobs are DONE (desired no longer counts them), so they are
-//     genuine near-term availability for both baseline and burst
-//     purposes, on the hot side and the warm side. Non-returning
+//     genuine near-term availability. For the burst term they count in
+//     full (each is seconds from acquirable); for the baseline top-up
+//     they join credit.busy in the single hot-first distribution above
+//     — a recycling row, too, lands in Warm only once. Non-returning
 //     Recycling rows (rollback doomed to fail — no snapshot) are
 //     excluded by the credit filter and their deficit cloned for.
 //   - The profileMax room clamp keeps counting ALL Recycling rows
@@ -1597,8 +1607,22 @@ type returningCredit struct {
 // clone is dispatched then — under-provisioning is bounded by one
 // reconcile pass, never permanent.
 func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSize, desired, profileMax int, credit returningCredit) (needHot, needWarm int) {
-	available := stats.Available() + credit.recycling + hotProv + inflight
+	base := stats.Available() + hotProv + inflight
 	busy := stats.Busy()
+
+	// Conservation of returning VMs: distribute the combined credit
+	// against the hot deficit first, and give only the remainder to the
+	// warm side — one returning VM covers one pool slot, never two.
+	// See the credit-placement doc comment above.
+	returning := credit.busy + credit.recycling
+	hotCredit := hotSize - base
+	if hotCredit > returning {
+		hotCredit = returning
+	}
+	if hotCredit < 0 {
+		hotCredit = 0
+	}
+	warmCredit := returning - hotCredit
 
 	// Two reasons to clone a hot VM:
 	//   (a) Eager replacement: keep `available >= HotSize` so
@@ -1609,8 +1633,8 @@ func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSi
 	//   (b) Burst response: when GitHub's desiredCount exceeds the
 	//       current in-flight runner count, scale up immediately.
 	// Effective need is the larger of the two.
-	needIdle := hotSize - available - credit.busy
-	needBurst := desired - (available + busy)
+	needIdle := hotSize - base - hotCredit
+	needBurst := desired - (base + credit.recycling + busy)
 	needHot = needIdle
 	if needBurst > needHot {
 		needHot = needBurst
@@ -1629,7 +1653,7 @@ func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSi
 		needHot = 0
 	}
 
-	warmInflight := stats.LiveWarm() + warmProv + credit.recycling + credit.busy
+	warmInflight := stats.LiveWarm() + warmProv + warmCredit
 	needWarm = warmSize - warmInflight
 	if needWarm < 0 {
 		needWarm = 0

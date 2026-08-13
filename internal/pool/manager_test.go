@@ -835,6 +835,47 @@ func TestComputeCloneNeeds(t *testing.T) {
 			wantHot: 0, wantWarm: 0,
 		},
 		{
+			// CONSERVATION: one returning VM covers ONE pool slot, never
+			// two. With the fleet below hotSize+warmSize (the warm VM was
+			// reaped mid-job) the credited busy VM offsets the hot
+			// deficit only — the warm deficit must still be cloned for,
+			// otherwise the pool runs a VM short for the whole job.
+			name:    "one returning vm cannot cover both a hot and a warm deficit",
+			stats:   Stats{Running: 1},
+			hotSize: 1, warmSize: 1, desired: 1, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 1,
+		},
+		{
+			// Conservation, recycling flavour: a lone credited Recycling
+			// row covers the hot deficit (rollback → Warm → promote), so
+			// the warm deficit still gets its clone.
+			name:    "one credited recycling row cannot cover both deficits",
+			stats:   Stats{Recycling: 1},
+			hotSize: 1, warmSize: 1, desired: 0, profileMax: 10,
+			credit:  returningCredit{recycling: 1},
+			wantHot: 0, wantWarm: 1,
+		},
+		{
+			// Conservation with enough returners: two credited busy VMs
+			// cover hot deficit 1 + warm deficit 1 — nothing cloned, the
+			// fleet total already equals hotSize+warmSize.
+			name:    "two returning vms cover one hot and one warm deficit",
+			stats:   Stats{Assigned: 1, Running: 1},
+			hotSize: 1, warmSize: 1, desired: 2, profileMax: 10,
+			credit:  returningCredit{busy: 2},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// Credit beyond the hot deficit spills to the warm side: hot
+			// is already full, so the credited busy VM offsets warm.
+			name:    "surplus credit flows from hot to warm",
+			stats:   Stats{Hot: 1, Running: 1},
+			hotSize: 1, warmSize: 1, desired: 1, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
 			// Full recycling population (credited or not) counts against
 			// profileMax room: a doomed-rollback VM is still a live
 			// Proxmox VM until its destroy lands, so scale-up waits a
