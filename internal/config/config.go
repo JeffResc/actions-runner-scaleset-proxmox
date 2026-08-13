@@ -417,6 +417,7 @@ type ProxmoxConfig struct {
 	Storage            ProxmoxStorage `yaml:"storage" validate:"required"`
 	Network            ProxmoxNetwork `yaml:"network" validate:"required"`
 	Clone              CloneConfig    `yaml:"clone"`
+	Firewall           FirewallConfig `yaml:"firewall"`
 }
 
 // ProxmoxAuth holds API token credentials. The secret must be supplied
@@ -461,6 +462,43 @@ func (c CloneConfig) LinkedOrDefault() bool {
 		return true
 	}
 	return *c.Linked
+}
+
+// FirewallConfig configures per-clone VM firewall application.
+//
+// Proxmox does NOT copy /etc/pve/firewall/<vmid>.fw on qm clone, so a
+// firewall configured on the template never reaches the clones — the
+// NIC's firewall=1 flag IS cloned (it lives in the VM config), but
+// without per-VM firewall options+rules the VM firewall stays disabled
+// and traffic flows unfiltered. When Enabled, the provisioner attaches
+// the named datacenter security group and enables the VM firewall on
+// every fresh clone, before the VM is ever started.
+//
+// The block is optional; when absent the zero value keeps today's
+// behaviour (no firewall API calls at all).
+type FirewallConfig struct {
+	// Enabled turns on per-clone firewall application. Default false.
+	Enabled bool `yaml:"enabled"`
+
+	// SecurityGroup names a pre-existing datacenter security group
+	// (Datacenter → Firewall → Security Group) that is attached to
+	// each clone as a group rule. Required when Enabled.
+	SecurityGroup string `yaml:"security_group"`
+
+	// DHCP sets the per-VM firewall "dhcp" option so the guest can
+	// still complete its DHCP handshake through the filter. *bool so
+	// "unset" (default true) is distinguishable from an explicit
+	// `dhcp: false`.
+	DHCP *bool `yaml:"dhcp,omitempty"`
+}
+
+// DHCPOrDefault returns true unless the user explicitly set
+// `dhcp: false`.
+func (f FirewallConfig) DHCPOrDefault() bool {
+	if f.DHCP == nil {
+		return true
+	}
+	return *f.DHCP
 }
 
 // NodesConfig selects the cluster placement strategy.
@@ -1527,6 +1565,13 @@ func (c *Config) Validate() error {
 	if c.Proxmox.TemplateVMID >= c.Proxmox.VMIDRange.Min && c.Proxmox.TemplateVMID <= c.Proxmox.VMIDRange.Max {
 		return fmt.Errorf("proxmox.template_vmid (%d) must be outside vmid_range [%d, %d]",
 			c.Proxmox.TemplateVMID, c.Proxmox.VMIDRange.Min, c.Proxmox.VMIDRange.Max)
+	}
+	// A firewall block that is enabled but names no security group would
+	// enable the VM firewall with an empty rule set — with PVE's default
+	// input policy DROP that bricks the runner's network, and with a
+	// permissive policy it sandboxes nothing. Reject it at load time.
+	if c.Proxmox.Firewall.Enabled && c.Proxmox.Firewall.SecurityGroup == "" {
+		return errors.New("proxmox.firewall.security_group is required when proxmox.firewall.enabled is true")
 	}
 	// The Proxmox API token is sent in a header on every request; require
 	// https:// so the credential never traverses the wire in cleartext.
