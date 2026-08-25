@@ -459,7 +459,7 @@ type configValues struct {
 	HotSize              int
 	WarmSize             int
 	MaxConcurrentRunners int
-	FirewallEnabled      bool   // emits the proxmox.firewall block when true
+	FirewallEnabled      bool // emits the proxmox.firewall block when true
 	ObsAddr              string
 	AdminAddr            string
 
