@@ -3,6 +3,10 @@
   "extends": [
     "config:recommended"
   ],
+  "postUpdateOptions": [
+    "gomodTidy",
+    "gomodUpdateImportPaths"
+  ],
   "packageRules": [
     {
       "description": "Bump all OpenTelemetry Go modules together. Their schema/semconv versions are coupled, so a piecemeal bump leaves the SDK and the app's semconv import on mismatched schema URLs and breaks resource.Merge.",
