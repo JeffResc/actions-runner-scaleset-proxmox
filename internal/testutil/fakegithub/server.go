@@ -39,7 +39,7 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/go-github/v88/github"
+	"github.com/google/go-github/v90/github"
 )
 
 // Runner is the test fixture's view of a GitHub Actions runner. It maps
