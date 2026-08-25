@@ -44,6 +44,13 @@ func TestE2E_FirewallAppliedToEveryClone(t *testing.T) {
 		if vm.VMID < 10000 || vm.VMID > 10999 {
 			continue // template / non-orchestrator VMs
 		}
+		if len(vm.FirewallRules) == 0 && !vm.EverStarted {
+			// A clone can be mid-provision when the snapshot is taken
+			// (e.g. recreated after an injected JIT failure) — its rules
+			// simply haven't been written yet. The ordering invariant
+			// below still catches any VM that boots without them.
+			continue
+		}
 		clones++
 		require.Equal(t, []fakeproxmox.FirewallRuleRecord{
 			{Type: "group", Action: "gh-runner", Enable: 1},
