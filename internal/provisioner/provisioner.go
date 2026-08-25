@@ -760,7 +760,9 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	if err := p.stopInternal(ctx, pVM); err != nil {
 		p.log.Warn("stop before destroy failed; proceeding to delete anyway", "vmid", vm.VMID, "err", err)
 	}
-	task, err := pVM.Delete(ctx)
+	// nil options = all delete defaults (go-proxmox v0.8.1 added the
+	// second arg; nil preserves the prior no-purge behavior).
+	task, err := pVM.Delete(ctx, nil)
 	if err != nil {
 		if isNotFound(err) {
 			return nil
