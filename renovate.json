@@ -7,6 +7,20 @@
     "gomodTidy",
     "gomodUpdateImportPaths"
   ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track tool versions pinned via `go install <module>/cmd/...@vX` in workflow run steps (e.g. deadcode), which no built-in manager parses. Needed so the go-toolchain group can keep deadcode in lockstep with the Go release.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "go install golang\\.org/x/tools/cmd/deadcode@(?<currentValue>v[\\d.]+)"
+      ],
+      "depNameTemplate": "golang.org/x/tools",
+      "datasourceTemplate": "go"
+    }
+  ],
   "packageRules": [
     {
       "description": "Bump all OpenTelemetry Go modules together. Their schema/semconv versions are coupled, so a piecemeal bump leaves the SDK and the app's semconv import on mismatched schema URLs and breaks resource.Merge.",
@@ -16,6 +30,16 @@
       ],
       "matchPackageNames": [
         "go.opentelemetry.io/otel{/,}**"
+      ]
+    },
+    {
+      "description": "Keep the Go toolchain and everything version-locked to it in one PR: the language version (go.mod directive + setup-go), the golang Docker image, golangci-lint, and the x/tools analyzers (deadcode). A Go bump that outpaces the tooling breaks CI — deadcode's SSA builder panics on new syntax and golangci-lint hits typecheck errors on the new stdlib. Grouping forces CI to validate the whole set together instead of merging them piecemeal.",
+      "groupName": "go-toolchain",
+      "matchDepNames": [
+        "go",
+        "golang",
+        "golangci/golangci-lint",
+        "golang.org/x/tools"
       ]
     }
   ]
