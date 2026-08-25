@@ -13,10 +13,10 @@ import (
 // the current leader's endpoint, looked up dynamically via a
 // [Coordinator]. Before delegating, it strips any inbound
 // X-Forwarded-For / X-Real-IP / True-Client-IP headers so an attacker
-// hitting a standby cannot spoof the source IP the leader sees — the
-// stdlib [httputil.ReverseProxy] then sets a fresh X-Forwarded-For
-// containing only the standby's connection peer (a trusted in-cluster
-// proxy from the leader's perspective).
+// hitting a standby cannot spoof the source IP the leader sees — we then
+// call [httputil.ProxyRequest.SetXForwarded] so the leader sees a fresh
+// X-Forwarded-For containing only the standby's connection peer (a
+// trusted in-cluster proxy from the leader's perspective).
 //
 // LeaderEndpoint outcomes are kept distinct so a real config bug isn't
 // masked as a transient election:
@@ -65,29 +65,37 @@ func NewForwarder(coord Coordinator, tlsClient *tls.Config, opts ...ForwarderOpt
 		opt(f)
 	}
 	f.proxy = &httputil.ReverseProxy{
-		Director:     f.director,
+		Rewrite:      f.rewrite,
 		ErrorHandler: f.errorHandler,
 		Transport:    transport,
 	}
 	return f
 }
 
-// director rewrites the outgoing request URL to point at the leader.
-// Returns nil silently when no leader endpoint is available; the
-// transport step then fails and errorHandler emits the 503. We use a
-// request-context key to surface the no-leader case to errorHandler so
-// the response code is distinguishable from a real upstream failure.
-func (f *Forwarder) director(r *http.Request) {
-	// Drop any client-supplied source-IP headers BEFORE delegating to
-	// ReverseProxy. ReverseProxy.ServeHTTP appends r.RemoteAddr to
-	// X-Forwarded-For; with the inbound values removed, the leader sees
-	// only the standby's connection peer and downstream rate-limiters
-	// can't be tricked into keying on a spoofed IP.
-	r.Header.Del("X-Forwarded-For")
-	r.Header.Del("X-Real-IP")
-	r.Header.Del("True-Client-IP")
+// rewrite retargets the outgoing request at the current leader. It runs
+// in the ReverseProxy.Rewrite phase — the successor to the deprecated
+// Director — which receives both the inbound (pr.In) and outbound
+// (pr.Out) requests.
+//
+// It drops any client-supplied X-Forwarded-For / X-Real-IP /
+// True-Client-IP on pr.Out, then calls SetXForwarded so the leader sees a
+// fresh X-Forwarded-For carrying only the standby's connection peer
+// (pr.In.RemoteAddr) — the same result ReverseProxy produced
+// automatically under Director. We delete X-Forwarded-For ourselves
+// rather than trust the proxy's own pre-Rewrite scrub, so the spoof strip
+// holds regardless of stdlib internals.
+//
+// When no leader endpoint is available it points pr.Out at a dead host so
+// the transport step fails and errorHandler emits the response; the
+// no-leader (503) and lookup-error (502) cases are surfaced via
+// request-context keys read back in errorHandler.
+func (f *Forwarder) rewrite(pr *httputil.ProxyRequest) {
+	pr.Out.Header.Del("X-Forwarded-For")
+	pr.Out.Header.Del("X-Real-IP")
+	pr.Out.Header.Del("True-Client-IP")
+	pr.SetXForwarded()
 
-	endpoint, err := f.coord.LeaderEndpoint(r.Context())
+	endpoint, err := f.coord.LeaderEndpoint(pr.Out.Context())
 	switch {
 	case err != nil:
 		// A genuine lookup error — e.g. a peer-map misconfiguration —
@@ -95,19 +103,18 @@ func (f *Forwarder) director(r *http.Request) {
 		// errorHandler emits a distinct 502 with the error text, instead
 		// of masquerading as a "retry, no leader yet" 503.
 		f.log.Warn("forwarder: leader endpoint lookup failed", "err", err)
-		*r = *r.WithContext(context.WithValue(r.Context(), lookupErrKey{}, err))
-		r.URL = &url.URL{Scheme: f.scheme, Host: "127.0.0.1:0"}
+		pr.Out = pr.Out.WithContext(context.WithValue(pr.Out.Context(), lookupErrKey{}, err))
+		pr.Out.URL = &url.URL{Scheme: f.scheme, Host: "127.0.0.1:0"}
 		return
 	case endpoint == "":
 		// No leader observed yet (in-flight election). Transient → 503.
-		*r = *r.WithContext(context.WithValue(r.Context(), noLeaderKey{}, true))
-		r.URL = &url.URL{Scheme: f.scheme, Host: "127.0.0.1:0"}
+		pr.Out = pr.Out.WithContext(context.WithValue(pr.Out.Context(), noLeaderKey{}, true))
+		pr.Out.URL = &url.URL{Scheme: f.scheme, Host: "127.0.0.1:0"}
 		return
 	}
-	r.URL.Scheme = f.scheme
-	r.URL.Host = endpoint
-	r.Host = endpoint
-	r.RequestURI = ""
+	pr.Out.URL.Scheme = f.scheme
+	pr.Out.URL.Host = endpoint
+	pr.Out.Host = endpoint
 }
 
 type noLeaderKey struct{}
