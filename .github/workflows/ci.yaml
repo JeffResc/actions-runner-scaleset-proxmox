@@ -45,6 +45,11 @@ jobs:
         with:
           version: v2.13.1
           args: --timeout=5m
+          # The action's cache key does not include the golangci-lint or
+          # Go version, so a linter bump reuses stale per-package analysis
+          # results and can mask newly-added findings until the cache
+          # rolls over. Analyze fresh every run; Lint here is ~40s.
+          skip-cache: true
 
       - name: Run deadcode
         run: |
