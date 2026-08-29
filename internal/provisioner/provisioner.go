@@ -626,6 +626,9 @@ func (p *pmox) applyFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) e
 	if err := pVM.FirewallOptionSet(ctx, fwOpts); err != nil {
 		return fmt.Errorf("enable firewall on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
 	}
+	p.log.Info("firewall applied to clone",
+		"vmid", pVM.VMID, "node", pVM.Node,
+		"security_group", p.cfg.Firewall.SecurityGroup, "dhcp", p.cfg.Firewall.DHCPOrDefault())
 	return nil
 }
 
@@ -830,10 +833,22 @@ func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) 
 	// string lacks firewall=1 (it bypasses the firewall bridge). The
 	// config was fetched by getVM just above, so it reflects current
 	// state; overridden=0 because no profile override is in play here.
+	nicsPatched := 0
 	if patches := nicFirewallPatches(pVM.VirtualMachineConfig, 0); len(patches) > 0 {
 		if _, err := pVM.Config(ctx, patches...); err != nil {
 			return fmt.Errorf("force firewall=1 on NICs of vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
 		}
+		nicsPatched = len(patches)
+	}
+	// A repair here means the VM reached Start without a full sandbox —
+	// an adopted crash-recovery clone or a pre-feature VM — so log it at
+	// Info; the already-sandboxed common case stays at Debug.
+	if !hasGroup || !enabled || nicsPatched > 0 {
+		p.log.Info("firewall repaired before start",
+			"vmid", pVM.VMID, "node", pVM.Node, "security_group", p.cfg.Firewall.SecurityGroup,
+			"group_added", !hasGroup, "options_enabled", !enabled, "nics_patched", nicsPatched)
+	} else {
+		p.log.Debug("firewall already sandboxed before start", "vmid", pVM.VMID, "node", pVM.Node)
 	}
 	return nil
 }
