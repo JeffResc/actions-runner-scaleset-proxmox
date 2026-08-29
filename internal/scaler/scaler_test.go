@@ -638,7 +638,7 @@ func TestHandleJobStarted_QuotaOverIncrementsThrottled(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 1.0,
-		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", bucketNameForMetric("acme/platform")),
 		"quota over-cap must increment scaleset_quota_throttled_total{repo}")
 }
 
@@ -665,7 +665,7 @@ func TestHandleJobStarted_QuotaUnderCapNoThrottle(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 0.0,
-		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", bucketNameForMetric("acme/platform")),
 		"under-cap job must NOT increment throttled counter")
 }
 
@@ -718,7 +718,10 @@ func TestHandleJobStarted_QuotaBoundaries(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			got := counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform")
+			// The name label is FNV-bucketed to bound cardinality (#363),
+			// so query the metric under the bucketed value, not the raw
+			// "acme/platform".
+			got := counterValue(t, metrics.QuotaThrottled, "test", "repo", bucketNameForMetric("acme/platform"))
 			require.Equal(t, tc.wantThrottleHits, got,
 				"cap=%d count=%d → expected %v throttle hits, got %v",
 				tc.cap, tc.count, tc.wantThrottleHits, got)
@@ -757,7 +760,7 @@ func TestHandleJobStarted_QuotaLookupErrorDoesNotEmitMetric(t *testing.T) {
 	})
 	require.NoError(t, err, "lookup errors must NOT escalate to the listener")
 	require.Equal(t, 0.0,
-		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", bucketNameForMetric("acme/platform")),
 		"lookup error must NOT increment throttled counter — false signal")
 }
 
@@ -785,7 +788,7 @@ func TestHandleJobStarted_DisabledQuotaResolverIsNoop(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 0.0,
-		counterValue(t, metrics.QuotaThrottled, "test", "repo", "acme/platform"),
+		counterValue(t, metrics.QuotaThrottled, "test", "repo", bucketNameForMetric("acme/platform")),
 		"disabled quotas resolver must skip the check entirely")
 }
 
@@ -1385,6 +1388,47 @@ func TestMetricCardinality_QuotaThrottledLabelsBoundedByMatcher(t *testing.T) {
 	require.LessOrEqual(t, count, 1,
 		"quota_throttled_total series must reflect matcher-resolved scopes, not raw job (org,repo) tuples; saw %d series after 200 distinct repos (issue #290)",
 		count)
+}
+
+// TestMetricCardinality_QuotaThrottledNameBucketed pins #363: even when
+// MANY distinct org/repo names each legitimately exceed their quota, the
+// quota_throttled_total name label is FNV-bucketed so the series count is
+// bounded by the bucket count, not the (workflow-author-influenceable)
+// number of distinct repo names.
+func TestMetricCardinality_QuotaThrottledNameBucketed(t *testing.T) {
+	t.Parallel()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 1, ScaleSetName: "test", NamePrefix: "gh-runner-test-"}, nil, &fakePool{}, stubProvForScaler{}, log, metrics)
+
+	qr, err := quotas.New(quotas.Config{DefaultPerRepo: 1})
+	require.NoError(t, err)
+	s.SetQuotas(qr)
+
+	const distinct = 500
+	counts := make(map[string]int, distinct)
+	for i := 0; i < distinct; i++ {
+		counts[fmt.Sprintf("acme/repo-%d", i)] = 99 // every repo is over the cap of 1
+	}
+	s.SetQuotaCounter(&stubQuotaCounter{repoCounts: counts})
+
+	for i := 0; i < distinct; i++ {
+		require.NoError(t, s.HandleJobStarted(context.Background(), &scaleset.JobStarted{
+			JobMessageBase: scaleset.JobMessageBase{
+				OwnerName:      "acme",
+				RepositoryName: fmt.Sprintf("repo-%d", i),
+			},
+			RunnerName: fmt.Sprintf("gh-runner-test-%d", 20000+i),
+			RunnerID:   10000 + i,
+		}))
+	}
+
+	series := testutil.CollectAndCount(metrics.QuotaThrottled)
+	require.LessOrEqual(t, series, unroutedLabelsBucketCount,
+		"quota_throttled_total name must be bucketed so %d distinct over-cap repos produce at most %d series, saw %d (#363)",
+		distinct, unroutedLabelsBucketCount, series)
+	require.Greater(t, series, 1,
+		"bucketing many distinct names should still spread across multiple buckets")
 }
 
 // TestMetricCardinality_EmptyOrgNonEmptyRepoDoesNotCrash locks

@@ -225,7 +225,7 @@ func (s *Scaler) recordQuota(_ context.Context, org, repo string) {
 		s.log.Warn("quota: bucket over cap",
 			"scope", res.Scope, "name", res.Name, "count", count, "cap", res.Cap)
 		if s.metrics != nil {
-			s.metrics.QuotaThrottled.WithLabelValues(s.cfg.ScaleSetName, string(res.Scope), res.Name).Inc()
+			s.metrics.QuotaThrottled.WithLabelValues(s.cfg.ScaleSetName, string(res.Scope), bucketNameForMetric(res.Name)).Inc()
 		}
 	}
 }
@@ -313,6 +313,24 @@ func joinLabelsForMetric(labels []string) string {
 	joined := strings.Join(cp, "|")
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(joined))
+	return fmt.Sprintf("bucket-%02d", h.Sum64()%unroutedLabelsBucketCount)
+}
+
+// bucketNameForMetric renders an org/repo name into a bounded-
+// cardinality Prometheus label value using the same FNV-1a bucketing as
+// joinLabelsForMetric. Org/repo names are effectively unbounded — a
+// large enterprise has thousands of repos, and a new series appears
+// whenever a job runs under a new name (workflow-author-influenceable) —
+// so emitting the raw name is the exact cardinality explosion this
+// scheme guards against elsewhere. The real name is still logged at the
+// throttle site, so debuggability is preserved. Empty maps to "empty".
+// (#363)
+func bucketNameForMetric(name string) string {
+	if name == "" {
+		return "empty"
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
 	return fmt.Sprintf("bucket-%02d", h.Sum64()%unroutedLabelsBucketCount)
 }
 

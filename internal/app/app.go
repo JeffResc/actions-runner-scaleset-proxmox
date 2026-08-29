@@ -703,6 +703,15 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 	if err != nil {
 		return fmt.Errorf("init pool: %w", err)
 	}
+	// The manager launches its destroyDispatcher at construction, so tear
+	// it down even if we return before mgr.Run below (a later build step
+	// failing, or leadership lost mid-setup). Close is idempotent and a
+	// no-op after Run's drain has already cancelled workerCtx. (#362)
+	defer func() {
+		if c, ok := mgr.(interface{ Close() }); ok {
+			c.Close()
+		}
+	}()
 
 	if err := mgr.Adopt(leaderCtx); err != nil {
 		log.Warn("adopt: list-owned-vms failed; starting with empty pool", "scaleset", entry.Name, "err", err)

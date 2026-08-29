@@ -189,6 +189,23 @@ var validGHActions = map[string]struct{}{
 	GHActionUnknown:   {},
 }
 
+// DBStateUnknown is the fallback for off-list values of the
+// GHStateMismatch.db_state label. Same closed-enum guarantee as
+// validGHStates.
+const DBStateUnknown = "unknown"
+
+// validDBStates mirrors store.State's closed enum. Kept local (rather
+// than importing store) to match how this package clamps every other
+// label against a local set, and so a future free-form caller can't
+// expand db_state cardinality silently. If store adds a state, an
+// unmapped value clamps to DBStateUnknown here — a safe, bounded failure
+// mode for a debugging metric.
+var validDBStates = map[string]struct{}{
+	"provisioning": {}, "warm": {}, "booting": {}, "hot": {},
+	"assigned": {}, "running": {}, "recycling": {}, "draining": {},
+	"destroying": {}, "poison": {}, DBStateUnknown: {},
+}
+
 // RecordProxmoxError increments ProxmoxErrors with the op clamped to
 // validProxmoxOps. Off-list values become "unknown" so a future
 // caller passing an unbounded string (per-VMID, per-task-id, etc.)
@@ -206,14 +223,17 @@ func (m *Metrics) RecordProxmoxError(scaleset, op, node string) string {
 	return op
 }
 
-// RecordGHStateMismatch increments GHStateMismatch with ghState and
-// action clamped to their respective closed enums. db_state is
-// expected to be a store.State value; we leave it unchanged because
-// store.State is a typed enum at the call site (no risk of unbounded
-// input). Off-list ghState / action become "unknown".
+// RecordGHStateMismatch increments GHStateMismatch with dbState, ghState,
+// and action each clamped to their respective closed enums. db_state is
+// expected to be a store.State value, but it is clamped defensively (like
+// the other labels) so a future free-form caller can't expand cardinality
+// silently. Off-list values become "unknown".
 func (m *Metrics) RecordGHStateMismatch(scaleset, dbState, ghState, action string) (string, string) {
 	if m == nil {
 		return ghState, action
+	}
+	if _, ok := validDBStates[dbState]; !ok {
+		dbState = DBStateUnknown
 	}
 	if _, ok := validGHStates[ghState]; !ok {
 		ghState = GHStateUnknown
@@ -304,7 +324,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"scaleset", "labels"}),
 		QuotaThrottled: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "quota_throttled_total",
-			Help: "Jobs observed exceeding their configured per-org or per-repo quota.",
+			Help: "Jobs observed exceeding their configured per-org or per-repo quota. The name label is FNV-bucketed to bound cardinality; the raw org/repo name is logged at the throttle site.",
 		}, []string{"scaleset", "scope", "name"}),
 		PriorityAcquires: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "priority_acquires_total",

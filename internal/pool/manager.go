@@ -434,6 +434,19 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 	return m, nil
 }
 
+// Close releases the manager's background resources — currently the
+// destroyDispatcher goroutine launched in NewManager — for callers that
+// construct a manager but never reach Run (an early startup error, a
+// leader that loses election before Run, or a test). Without it those
+// paths leak the dispatcher and its workerCtx for the process lifetime.
+//
+// Run's drain() already cancels workerCtx on the normal path, so Close is
+// a no-op after a completed Run. Safe to call multiple times —
+// context.CancelFunc is idempotent. (#362)
+func (m *manager) Close() {
+	m.workerCancel()
+}
+
 // defaultProfile returns the profile name to use when a caller doesn't
 // specify one — the first declared profile (which is the synthesised
 // "default" profile in single-profile configs).
