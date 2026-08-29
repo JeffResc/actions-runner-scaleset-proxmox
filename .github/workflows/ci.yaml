@@ -43,7 +43,7 @@ jobs:
       - name: Install golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.13.1
+          version: v2.13.2
           args: --timeout=5m
           # The action's cache key does not include the golangci-lint or
           # Go version, so a linter bump reuses stale per-package analysis
