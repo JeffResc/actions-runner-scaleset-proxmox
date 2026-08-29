@@ -212,6 +212,12 @@ func Start(t testing.TB, opts Options) *Harness {
 			TaskDuration: 5 * time.Millisecond,
 		})
 	}
+	if opts.FirewallEnabled {
+		// The config template names security_group "gh-runner"; model the
+		// operator having pre-created it so the provisioner's startup
+		// existence check passes (issue #419).
+		proxmox.SeedSecurityGroup("gh-runner")
+	}
 	gh := opts.FakeGitHub
 	if gh == nil {
 		if multi {

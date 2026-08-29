@@ -76,6 +76,10 @@ type store struct {
 	taskDur   time.Duration
 	agentWait time.Duration
 	faults    []Fault
+	// securityGroups is the set of datacenter firewall security group
+	// names the fake claims to host, served at GET
+	// /cluster/firewall/groups. Seed via Server.SeedSecurityGroup.
+	securityGroups []string
 }
 
 // snapshot returns a deep copy of the VM set suitable for assertion.

@@ -165,7 +165,9 @@ proxmox:
   # Prerequisites:
   #   - The security group must already exist under Datacenter ->
   #     Firewall -> Security Group (e.g. "gh-runner": allow DNS +
-  #     internet, drop LAN).
+  #     internet, drop LAN). Its existence is checked once at startup;
+  #     a missing or misspelled group fails the orchestrator loudly
+  #     rather than shipping an inert rule per clone.
   #   - The datacenter and node firewalls must be enabled for VM-level
   #     filtering to take effect.
   #   - The API token needs VM.Config.Network on the VM path (already
