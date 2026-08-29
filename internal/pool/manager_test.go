@@ -271,6 +271,23 @@ func newTestStore(t *testing.T) *store.Store {
 	return s
 }
 
+// TestManager_CloseCancelsWorkerCtx pins #362: a manager constructed but
+// never Run (early startup error, a leader deposed before Run, tests)
+// must be able to tear down its destroyDispatcher goroutine. Close
+// cancels workerCtx — the only thing the dispatcher selects on to exit —
+// and is idempotent so it composes with Run's own drain.
+func TestManager_CloseCancelsWorkerCtx(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	mgr := newTestManager(t, st, &fakeProv{}, Config{HotSize: 0, WarmSize: 0})
+
+	require.NoError(t, mgr.workerCtx.Err(), "workerCtx must be live before Close")
+	mgr.Close()
+	require.Error(t, mgr.workerCtx.Err(),
+		"Close must cancel workerCtx so the destroyDispatcher exits on a non-Run path (#362)")
+	mgr.Close() // idempotent — must not panic
+}
+
 func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner, cfg Config) *manager {
 	t.Helper()
 	if cfg.MaxConcurrentRunners == 0 {

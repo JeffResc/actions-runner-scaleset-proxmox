@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
@@ -320,9 +321,10 @@ func TestRecordProxmoxError_ClampsUnknownOp(t *testing.T) {
 		"unbounded op string must be clamped to unknown, not emitted verbatim")
 }
 
-// TestRecordGHStateMismatch_ClampsUnknownLabels guarantees the same
-// closed-enum protection for ghState and action; db_state is left
-// alone because callers pass it as a typed store.State value.
+// TestRecordGHStateMismatch_ClampsUnknownLabels guarantees the closed-
+// enum protection for db_state, ghState, and action: every label is
+// clamped to "unknown" for off-list values so a future free-form caller
+// can't expand cardinality silently (#363).
 func TestRecordGHStateMismatch_ClampsUnknownLabels(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
@@ -337,6 +339,17 @@ func TestRecordGHStateMismatch_ClampsUnknownLabels(t *testing.T) {
 	gh, ac = m.RecordGHStateMismatch("test-ss", "assigned", "stale-gh-runner-id-9999", "retry-7")
 	require.Equal(t, "unknown", gh)
 	require.Equal(t, "unknown", ac)
+
+	// An unknown db_state is clamped too. The return doesn't expose it,
+	// so assert the series landed under the clamped "unknown" label and
+	// NOT under the raw free-form value.
+	m.RecordGHStateMismatch("test-ss", "free-form-row-id-4321", "busy", "promote_running")
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(m.GHStateMismatch.WithLabelValues("test-ss", "unknown", "busy", "promote_running")),
+		"an off-list db_state must clamp to \"unknown\"")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(m.GHStateMismatch.WithLabelValues("test-ss", "free-form-row-id-4321", "busy", "promote_running")),
+		"the raw db_state value must NOT be emitted as a series")
 }
 
 func TestServe_RespondsToProbes(t *testing.T) {

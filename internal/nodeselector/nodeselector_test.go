@@ -82,6 +82,66 @@ func (f *fakeFetcher) Fetch(_ context.Context) (map[string]float64, error) {
 	return out, nil
 }
 
+// ctxObservingFetcher blocks in Fetch until released, then fails if its
+// context was cancelled — modelling a real Proxmox API call that honours
+// ctx. Lets a test drive the "triggering caller cancels mid-flight" race.
+type ctxObservingFetcher struct {
+	entered chan struct{}
+	proceed chan struct{}
+	scores  map[string]float64
+}
+
+func (f *ctxObservingFetcher) Fetch(ctx context.Context) (map[string]float64, error) {
+	close(f.entered)
+	<-f.proceed
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	out := make(map[string]float64, len(f.scores))
+	for k, v := range f.scores {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// TestLeastLoaded_SharedFetchSurvivesTriggeringCallerCancel pins #362:
+// the singleflight-shared Fetch is detached from the triggering caller's
+// context, so a caller that abandons/times out mid-flight does not cancel
+// the shared fetch and fail every concurrent waiter. On a cold cache
+// there is no stale fallback, so without the detach the first
+// cancellation would fail the selection outright.
+func TestLeastLoaded_SharedFetchSurvivesTriggeringCallerCancel(t *testing.T) {
+	t.Parallel()
+	f := &ctxObservingFetcher{
+		entered: make(chan struct{}),
+		proceed: make(chan struct{}),
+		scores:  map[string]float64{"a": 0.1, "b": 0.9},
+	}
+	l := newLeastLoadedFromFetcher(f, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resCh := make(chan struct {
+		node string
+		err  error
+	}, 1)
+	go func() {
+		node, err := l.Select(ctx, Hint{})
+		resCh <- struct {
+			node string
+			err  error
+		}{node, err}
+	}()
+
+	<-f.entered      // the fetch is now in flight under a detached ctx
+	cancel()         // the triggering caller abandons its request
+	close(f.proceed) // let the fetch complete; it checks ctx.Err()
+
+	got := <-resCh
+	require.NoError(t, got.err,
+		"a detached shared fetch must survive the triggering caller's cancellation (#362)")
+	require.Equal(t, "a", got.node)
+}
+
 func TestLeastLoaded_PicksMin(t *testing.T) {
 	t.Parallel()
 	f := &fakeFetcher{scores: map[string]float64{"a": 0.9, "b": 0.2, "c": 0.5}}

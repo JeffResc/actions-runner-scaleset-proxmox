@@ -184,6 +184,12 @@ type leastLoaded struct {
 // delegate TTL accounting to the library.
 const scoresCacheKey = "scores"
 
+// fetchTimeout bounds the detached, singleflight-shared Fetch. The call
+// is deliberately decoupled from any single caller's context (so one
+// caller's cancellation can't fail every waiter), so it needs its own
+// deadline to avoid hanging forever on an unresponsive Proxmox API.
+const fetchTimeout = 30 * time.Second
+
 // NewLeastLoaded returns a Selector that polls Proxmox at most every
 // `refresh` interval for node load. If `nodes` is non-empty, only nodes in
 // the list are considered.
@@ -242,7 +248,18 @@ func (l *leastLoaded) scores(ctx context.Context) (map[string]float64, error) {
 	// constant — at most one Fetch in flight at a time across all
 	// callers. Late arrivals share the result.
 	v, err, _ := l.sf.Do(scoresCacheKey, func() (any, error) {
-		fresh, err := l.fetcher.Fetch(ctx)
+		// Detach from the triggering caller's ctx. This Fetch is shared
+		// by every concurrent waiter, so if the first caller cancels
+		// (abandons / times out) it must not cancel the shared fetch and
+		// fail all the other waiters whose own contexts are still live —
+		// on a cold cache there is no stale fallback to mask it, so the
+		// first cancellation would fail every concurrent selection.
+		// WithoutCancel keeps ctx values (tracing) but drops
+		// cancellation; an independent timeout bounds the detached call
+		// (#362).
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
+		defer cancel()
+		fresh, err := l.fetcher.Fetch(fetchCtx)
 		if err != nil {
 			return nil, err
 		}
