@@ -453,7 +453,7 @@ func TestValidateFirewallSecurityGroup_DisabledSkips(t *testing.T) {
 func TestNew_FirewallGroupMissingAbortsStartup(t *testing.T) {
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{})
-	cfg := firewallProxmoxConfig(fp.Server.URL, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
+	cfg := firewallProxmoxConfig(fp.URL, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
 	_, err := New(context.Background(), cfg, "test-scaleset", "gh-runner-test-", Options{}, quietLogger())
 	require.ErrorIs(t, err, ErrFirewallGroupNotFound)
 }
@@ -464,7 +464,7 @@ func TestNew_FirewallGroupPresentSucceeds(t *testing.T) {
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{})
 	fp.SeedSecurityGroup("gh-runner")
-	cfg := firewallProxmoxConfig(fp.Server.URL, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
+	cfg := firewallProxmoxConfig(fp.URL, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
 	p, err := New(context.Background(), cfg, "test-scaleset", "gh-runner-test-", Options{}, quietLogger())
 	require.NoError(t, err)
 	require.NotNil(t, p)
