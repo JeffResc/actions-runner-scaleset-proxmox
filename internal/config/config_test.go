@@ -1615,6 +1615,19 @@ func TestSchedules_ProfileScheduleParses(t *testing.T) {
 	require.Equal(t, "America/New_York", s.Location.String())
 	require.Equal(t, 5, s.HotSize)
 	require.Equal(t, 10, s.WarmSize)
+
+	// The timezone is bound to the parsed cron schedule at load time, so
+	// Next computes in America/New_York regardless of the input time's
+	// zone. Feeding a UTC-typed time must still yield an 08:00 New-York
+	// fire — the old code only worked because callers passed now.In(loc)
+	// at every call site, a load-bearing coincidence (#364).
+	require.NotNil(t, s.CronSchedule)
+	ny, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	next := s.CronSchedule.Next(time.Date(2026, 1, 6, 0, 0, 0, 0, time.UTC))
+	require.Equal(t, 8, next.In(ny).Hour(),
+		"cron must fire at 08:00 New York, not 08:00 UTC — timezone must be bound to the schedule")
+	require.Equal(t, 0, next.In(ny).Minute())
 }
 
 func TestSchedules_RejectsInvalidCron(t *testing.T) {

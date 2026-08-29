@@ -170,8 +170,10 @@ func (p *pmox) injectJITConfigInner(ctx context.Context, vm *VM, jitConfig strin
 }
 
 // agentExecWait runs a command inside the VM and waits for it to exit
-// successfully. Returns an error if the command exits non-zero, if
-// stderr is non-empty, or if ctx is cancelled mid-poll.
+// successfully. Returns an error if the command exits non-zero (the
+// command's stderr is included in the error message) or if ctx is
+// cancelled mid-poll. A command that exits zero is treated as success
+// even if it wrote to stderr — only the exit code gates success.
 //
 // The 30s deadline caps a single command; on top of that the loop
 // honours ctx so SIGTERM (and the manager's drain cancel) propagates
