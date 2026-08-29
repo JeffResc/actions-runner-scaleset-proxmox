@@ -60,3 +60,65 @@ func TestAwaitTask_DestroyTaskFailureSurfacesError(t *testing.T) {
 	require.True(t, strings.Contains(err.Error(), "delete") || strings.Contains(err.Error(), "destroy"),
 		"destroy error should mention the failed delete/destroy task, got: %v", err)
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot create / rollback (recycle_mode: snapshot_rollback support)
+// ---------------------------------------------------------------------------
+
+// TestSnapshotCreateAndRollback_RoundTrip drives both snapshot methods
+// through the real go-proxmox client against fakeproxmox: create the
+// named snapshot, then roll back to it. Verifies the wire paths, the
+// task-await handling, and the fake's counters end-to-end.
+func TestSnapshotCreateAndRollback_RoundTrip(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10050, "gh-runner-test-10050", false /* stopped */, nil)
+
+	p := newTestProvisioner(t, fp.Server, "pve1")
+	vm := &VM{VMID: 10050, Node: "pve1", Name: "gh-runner-test-10050"}
+
+	require.NoError(t, p.SnapshotCreate(context.Background(), vm, "scaleset-clean"))
+	require.NoError(t, p.SnapshotRollback(context.Background(), vm, "scaleset-clean"))
+
+	for _, v := range fp.Snapshot() {
+		if v.VMID != 10050 {
+			continue
+		}
+		require.Equal(t, []string{"scaleset-clean"}, v.Snapshots)
+		require.Equal(t, 1, v.SnapshotCreates)
+		require.Equal(t, 1, v.Rollbacks)
+		return
+	}
+	t.Fatal("vm 10050 disappeared from the fake")
+}
+
+// TestSnapshotRollback_MissingSnapshotFails: rolling back to a snapshot
+// that was never created must return an error carrying the vmid/node
+// context — the pool's rollback worker keys its destroy fallback on it.
+func TestSnapshotRollback_MissingSnapshotFails(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10051, "gh-runner-test-10051", false, nil)
+
+	p := newTestProvisioner(t, fp.Server, "pve1")
+	err := p.SnapshotRollback(context.Background(), &VM{VMID: 10051, Node: "pve1"}, "scaleset-clean")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "10051")
+	require.Contains(t, err.Error(), "pve1")
+}
+
+// TestSnapshotCreate_TaskFailureSurfacesError: a snapshot task that
+// completes with a failure exit status (e.g. storage without snapshot
+// support) must surface as an error, mirroring the other awaitTask
+// call sites pinned above.
+func TestSnapshotCreate_TaskFailureSurfacesError(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10052, "gh-runner-test-10052", false, nil)
+	fp.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultTaskFails, TaskType: "qmsnapshot"})
+
+	p := newTestProvisioner(t, fp.Server, "pve1")
+	err := p.SnapshotCreate(context.Background(), &VM{VMID: 10052, Node: "pve1"}, "scaleset-clean")
+	require.Error(t, err, "a snapshot task that completes with a failure exitstatus must surface as an error")
+	require.Contains(t, err.Error(), "snapshot")
+}

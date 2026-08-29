@@ -2407,6 +2407,58 @@ func TestParse_DoesNotSupportRuntimeReload(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Recycle mode (pool.recycle_mode — snapshot-rollback recycle)
+// ---------------------------------------------------------------------------
+
+// TestParse_RecycleModeDefaultsToDestroy locks in the back-compat
+// contract: configs that never mention recycle_mode get the classic
+// destroy-after-job lifecycle.
+func TestParse_RecycleModeDefaultsToDestroy(t *testing.T) {
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.Equal(t, config.RecycleModeDestroy, cfg.Pool.RecycleMode)
+}
+
+// TestParse_RecycleModeAcceptsValidValues covers both members of the
+// closed enum round-tripping through Parse unchanged.
+func TestParse_RecycleModeAcceptsValidValues(t *testing.T) {
+	for _, mode := range []string{config.RecycleModeDestroy, config.RecycleModeSnapshotRollback} {
+		t.Run(mode, func(t *testing.T) {
+			good := strings.Replace(validPATYAML,
+				"  hot_size: 2",
+				"  recycle_mode: "+mode+"\n  hot_size: 2", 1)
+			cfg, err := config.Parse([]byte(good))
+			require.NoError(t, err)
+			require.Equal(t, mode, cfg.Pool.RecycleMode)
+		})
+	}
+}
+
+// TestParse_RecycleModeRejectsUnknownValue: a typo'd mode must fail the
+// load with an error naming the key and the offending value rather than
+// silently falling back to destroy.
+func TestParse_RecycleModeRejectsUnknownValue(t *testing.T) {
+	bad := strings.Replace(validPATYAML,
+		"  hot_size: 2",
+		"  recycle_mode: rollback\n  hot_size: 2", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "pool.recycle_mode")
+	require.Contains(t, err.Error(), `"rollback"`)
+}
+
+// TestParse_RecycleModeEnvOverride pins the koanf env mapping for the
+// new key: SCALESET_POOL_RECYCLE_MODE must override the yaml-side
+// default the same way every other pool.* key does.
+func TestParse_RecycleModeEnvOverride(t *testing.T) {
+	// No t.Parallel — t.Setenv forbids parallel tests.
+	setEnv(t, map[string]string{"SCALESET_POOL_RECYCLE_MODE": config.RecycleModeSnapshotRollback})
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.Equal(t, config.RecycleModeSnapshotRollback, cfg.Pool.RecycleMode)
+}
+
+// ---------------------------------------------------------------------------
 // proxmox.firewall (per-clone VM firewall)
 // ---------------------------------------------------------------------------
 

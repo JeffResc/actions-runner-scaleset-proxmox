@@ -91,11 +91,25 @@ type fakeProv struct {
 	// inFlightClones drives InFlightCloneCount.
 	inFlightClones int
 
+	// snapshotErr / rollbackErr inject failures into SnapshotCreate /
+	// SnapshotRollback so recycle-mode tests can drive the "snapshot
+	// failed at clone" and "rollback failed → destroy fallback" paths.
+	snapshotErr error
+	rollbackErr error
+
 	clones       []provisioner.CloneOptions
 	destroys     []int
 	starts       []int
 	injects      []int
+	snapshots    []snapshotCall // SnapshotCreate calls in order
+	rollbacks    []snapshotCall // SnapshotRollback calls in order
 	listOwnedRet []*provisioner.VM
+}
+
+// snapshotCall records one SnapshotCreate / SnapshotRollback invocation.
+type snapshotCall struct {
+	vmid int
+	name string
 }
 
 func (f *fakeProv) TemplateNode() string         { return "pve1" }
@@ -164,6 +178,22 @@ func (f *fakeProv) Destroy(ctx context.Context, v *provisioner.VM) error {
 
 func (f *fakeProv) WaitReady(_ context.Context, _ *provisioner.VM, _ time.Duration) error {
 	return f.waitErr
+}
+
+func (f *fakeProv) SnapshotCreate(_ context.Context, v *provisioner.VM, name string) error {
+	f.mu.Lock()
+	f.snapshots = append(f.snapshots, snapshotCall{vmid: v.VMID, name: name})
+	err := f.snapshotErr
+	f.mu.Unlock()
+	return err
+}
+
+func (f *fakeProv) SnapshotRollback(_ context.Context, v *provisioner.VM, name string) error {
+	f.mu.Lock()
+	f.rollbacks = append(f.rollbacks, snapshotCall{vmid: v.VMID, name: name})
+	err := f.rollbackErr
+	f.mu.Unlock()
+	return err
 }
 
 func (f *fakeProv) InjectJITConfig(_ context.Context, v *provisioner.VM, _ string) error {
@@ -651,6 +681,7 @@ func TestComputeCloneNeeds(t *testing.T) {
 		stats                                  Stats
 		inflight, hotProv, warmProv            int
 		hotSize, warmSize, desired, profileMax int
+		credit                                 returningCredit
 		wantHot, wantWarm                      int
 	}{
 		{
@@ -703,6 +734,158 @@ func TestComputeCloneNeeds(t *testing.T) {
 			hotSize: 2, warmSize: 0, desired: 0, profileMax: 10,
 			wantHot: 0, wantWarm: 0,
 		},
+		{
+			// snapshot-rollback mode: a post-job recycle is seconds from
+			// re-entering the pool — cloning a hot replacement for it
+			// would grow the fleet and defeat the mode's purpose.
+			name:    "credited recycling counts toward hot available (no refill clone mid-rollback)",
+			stats:   Stats{Recycling: 1},
+			hotSize: 1, warmSize: 0, desired: 0, profileMax: 10,
+			credit:  returningCredit{recycling: 1},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// snapshot-rollback mode: adopt-time mass recycle (leader
+			// restart with a stopped warm pool) puts every warm VM in
+			// Recycling; each will land back in Warm, so dispatching
+			// warm clones for them would double the warm pool.
+			name:    "credited recycling counts toward warm inflight (no double clone on restart)",
+			stats:   Stats{Recycling: 3},
+			hotSize: 0, warmSize: 3, desired: 0, profileMax: 10,
+			credit:  returningCredit{recycling: 3},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// A Recycling row whose rollback is doomed (no snapshot) is
+			// NOT credited — the VM never returns, so its replacement
+			// must be cloned rather than waited for forever.
+			name:    "uncredited recycling row still gets a replacement clone",
+			stats:   Stats{Recycling: 1},
+			hotSize: 1, warmSize: 0, desired: 0, profileMax: 10,
+			credit:  returningCredit{},
+			wantHot: 1, wantWarm: 0,
+		},
+		{
+			// THE production bug this credit fixes: one hot VM acquired
+			// for a job (hot 1 → assigned 1) while desired still counts
+			// that job. Without the credit, needIdle = hotSize - 0 = 1
+			// dispatched a wasted replacement full-clone; the job's VM
+			// rolls back into the pool ~15s after the job ends.
+			name:    "credited assigned vm suppresses the baseline replacement clone",
+			stats:   Stats{Assigned: 1},
+			hotSize: 1, warmSize: 0, desired: 1, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			name:    "credited running vm suppresses the baseline replacement clone",
+			stats:   Stats{Running: 1},
+			hotSize: 1, warmSize: 0, desired: 1, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// BURST PRESERVATION: a second job arrives while the only VM
+			// is busy. desired=2 counts both jobs; busy=1 cancels the
+			// first inside needBurst, so the pending one still forces a
+			// clone — the credit must never dull real demand.
+			name:    "second concurrent job still clones despite the busy credit",
+			stats:   Stats{Assigned: 1},
+			hotSize: 1, warmSize: 0, desired: 2, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 1, wantWarm: 0,
+		},
+		{
+			// Burst preservation at scale: 3 busy (all credited), 5
+			// desired → exactly the 2 uncovered jobs are cloned for.
+			name:    "burst clones only the uncovered demand",
+			stats:   Stats{Assigned: 2, Running: 1},
+			hotSize: 3, warmSize: 0, desired: 5, profileMax: 10,
+			credit:  returningCredit{busy: 3},
+			wantHot: 2, wantWarm: 0,
+		},
+		{
+			// profileMax still caps burst even when busy rows are
+			// credited: 1 busy + max 1 leaves no room for the second job.
+			name:    "profileMax caps burst regardless of credit",
+			stats:   Stats{Assigned: 1},
+			hotSize: 1, warmSize: 0, desired: 2, profileMax: 1,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// A busy VM that will NOT return (no snapshot / over-age →
+			// credit.busy stays 0) keeps destroy-mode semantics: the
+			// baseline replacement clone is dispatched during the job.
+			name:    "uncredited busy vm still gets a replacement clone",
+			stats:   Stats{Assigned: 1},
+			hotSize: 1, warmSize: 0, desired: 1, profileMax: 10,
+			credit:  returningCredit{},
+			wantHot: 1, wantWarm: 0,
+		},
+		{
+			// Returning busy VMs land in WARM (rollback → Warm), so the
+			// credit offsets the warm deficit too — otherwise the warm
+			// top-up cloned now + the rollback landing later would
+			// overshoot warmSize.
+			name:    "credited busy vm counts against the warm deficit",
+			stats:   Stats{Hot: 1, Warm: 1, Running: 1},
+			hotSize: 1, warmSize: 2, desired: 1, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// CONSERVATION: one returning VM covers ONE pool slot, never
+			// two. With the fleet below hotSize+warmSize (the warm VM was
+			// reaped mid-job) the credited busy VM offsets the hot
+			// deficit only — the warm deficit must still be cloned for,
+			// otherwise the pool runs a VM short for the whole job.
+			name:    "one returning vm cannot cover both a hot and a warm deficit",
+			stats:   Stats{Running: 1},
+			hotSize: 1, warmSize: 1, desired: 1, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 1,
+		},
+		{
+			// Conservation, recycling flavour: a lone credited Recycling
+			// row covers the hot deficit (rollback → Warm → promote), so
+			// the warm deficit still gets its clone.
+			name:    "one credited recycling row cannot cover both deficits",
+			stats:   Stats{Recycling: 1},
+			hotSize: 1, warmSize: 1, desired: 0, profileMax: 10,
+			credit:  returningCredit{recycling: 1},
+			wantHot: 0, wantWarm: 1,
+		},
+		{
+			// Conservation with enough returners: two credited busy VMs
+			// cover hot deficit 1 + warm deficit 1 — nothing cloned, the
+			// fleet total already equals hotSize+warmSize.
+			name:    "two returning vms cover one hot and one warm deficit",
+			stats:   Stats{Assigned: 1, Running: 1},
+			hotSize: 1, warmSize: 1, desired: 2, profileMax: 10,
+			credit:  returningCredit{busy: 2},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// Credit beyond the hot deficit spills to the warm side: hot
+			// is already full, so the credited busy VM offsets warm.
+			name:    "surplus credit flows from hot to warm",
+			stats:   Stats{Hot: 1, Running: 1},
+			hotSize: 1, warmSize: 1, desired: 1, profileMax: 10,
+			credit:  returningCredit{busy: 1},
+			wantHot: 0, wantWarm: 0,
+		},
+		{
+			// Full recycling population (credited or not) counts against
+			// profileMax room: a doomed-rollback VM is still a live
+			// Proxmox VM until its destroy lands, so scale-up waits a
+			// tick rather than overshooting the operator's cap.
+			name:    "uncredited recycling still occupies profileMax room",
+			stats:   Stats{Recycling: 2},
+			hotSize: 2, warmSize: 0, desired: 0, profileMax: 2,
+			credit:  returningCredit{},
+			wantHot: 0, wantWarm: 0,
+		},
 	}
 	for _, c := range cases {
 		c := c
@@ -710,11 +893,253 @@ func TestComputeCloneNeeds(t *testing.T) {
 			t.Parallel()
 			needHot, needWarm := computeCloneNeeds(c.stats,
 				c.inflight, c.hotProv, c.warmProv,
-				c.hotSize, c.warmSize, c.desired, c.profileMax)
+				c.hotSize, c.warmSize, c.desired, c.profileMax, c.credit)
 			require.Equal(t, c.wantHot, needHot, "needHot")
 			require.Equal(t, c.wantWarm, needWarm, "needWarm")
 		})
 	}
+}
+
+// TestProfileReturningCredit covers the row-level credit filter feeding
+// computeCloneNeeds: Assigned/Running/Recycling rows are credited only
+// in snapshot-rollback mode, only with the recycle snapshot present,
+// and only under the vm_max_age cutoff (the same cutoff shouldRecycle
+// and recycleOldVMs use). Rows the credit skips are exactly the rows
+// that will be destroyed — not recycled — after their job.
+func TestProfileReturningCredit(t *testing.T) {
+	t.Parallel()
+	seed := func(t *testing.T, st *store.Store, vmid int, state store.State, hasSnap bool, age time.Duration) {
+		t.Helper()
+		require.NoError(t, st.Insert(&store.VM{
+			VMID: vmid, Node: "pve1", Name: fmt.Sprintf("gh-runner-test-%d", vmid),
+			Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+			State: state, HasRecycleSnapshot: hasSnap,
+			CreatedAt: time.Now().Add(-age),
+		}))
+	}
+
+	t.Run("credits assigned, running and recycling rows with snapshots", func(t *testing.T) {
+		t.Parallel()
+		st := newTestStore(t)
+		seed(t, st, 40001, store.StateAssigned, true, time.Minute)
+		seed(t, st, 40002, store.StateRunning, true, time.Minute)
+		seed(t, st, 40003, store.StateRecycling, true, time.Minute)
+		seed(t, st, 40004, store.StateHot, true, time.Minute) // not busy: never credited
+		mgr := newTestManager(t, st, &fakeProv{}, Config{
+			RecycleMode: config.RecycleModeSnapshotRollback,
+		})
+		credit := mgr.profileReturningCredit(defaultProfileName, time.Hour)
+		require.Equal(t, returningCredit{busy: 2, recycling: 1}, credit)
+	})
+
+	t.Run("skips rows without the recycle snapshot", func(t *testing.T) {
+		t.Parallel()
+		st := newTestStore(t)
+		seed(t, st, 40011, store.StateAssigned, false, time.Minute)
+		seed(t, st, 40012, store.StateRecycling, false, time.Minute)
+		mgr := newTestManager(t, st, &fakeProv{}, Config{
+			RecycleMode: config.RecycleModeSnapshotRollback,
+		})
+		require.Equal(t, returningCredit{}, mgr.profileReturningCredit(defaultProfileName, time.Hour))
+	})
+
+	t.Run("skips rows over the vm_max_age cutoff", func(t *testing.T) {
+		t.Parallel()
+		st := newTestStore(t)
+		seed(t, st, 40021, store.StateRunning, true, 2*time.Hour) // over the 1h cutoff
+		seed(t, st, 40022, store.StateRunning, true, time.Minute) // under
+		mgr := newTestManager(t, st, &fakeProv{}, Config{
+			RecycleMode: config.RecycleModeSnapshotRollback,
+		})
+		require.Equal(t, returningCredit{busy: 1}, mgr.profileReturningCredit(defaultProfileName, time.Hour))
+	})
+
+	t.Run("maxAge zero disables the age gate", func(t *testing.T) {
+		t.Parallel()
+		st := newTestStore(t)
+		seed(t, st, 40031, store.StateRunning, true, 200*time.Hour)
+		mgr := newTestManager(t, st, &fakeProv{}, Config{
+			RecycleMode: config.RecycleModeSnapshotRollback,
+		})
+		require.Equal(t, returningCredit{busy: 1}, mgr.profileReturningCredit(defaultProfileName, 0))
+	})
+
+	t.Run("destroy mode never credits", func(t *testing.T) {
+		t.Parallel()
+		st := newTestStore(t)
+		seed(t, st, 40041, store.StateAssigned, true, time.Minute)
+		mgr := newTestManager(t, st, &fakeProv{}, Config{}) // default: destroy mode
+		require.Equal(t, returningCredit{}, mgr.profileReturningCredit(defaultProfileName, time.Hour))
+	})
+}
+
+// TestReconcile_RecycleModeSuppressesReplacementClone drives the whole
+// reconcile path (not just the pure math) for the production shape the
+// credit fixes: a single hot VM acquired for a job must NOT trigger a
+// replacement full-clone in snapshot-rollback mode, and the
+// suppression must be observable via scaleset_clone_suppressed_total.
+// The destroy-mode twin below pins that nothing changed there.
+func TestReconcile_RecycleModeSuppressesReplacementClone(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	// One busy row that WILL return: mid-job, snapshot present, young.
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 41000, Node: "pve1", Name: "gh-runner-test-41000",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning, HasRecycleSnapshot: true,
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:              1,
+		MaxConcurrentRunners: 5, // room exists — only the credit stops the clone
+		VMMaxAge:             time.Hour,
+		RecycleMode:          config.RecycleModeSnapshotRollback,
+	})
+	mgr.SetDesiredCount(1) // GitHub still counts the in-flight job
+
+	mgr.reconcileOnce(context.Background())
+
+	// The reconcile pass dispatches clones asynchronously; give any
+	// erroneous dispatch time to land before asserting the negative.
+	time.Sleep(100 * time.Millisecond)
+	fp.mu.Lock()
+	clones := len(fp.clones)
+	fp.mu.Unlock()
+	require.Zero(t, clones,
+		"recycle mode must not clone a replacement for a returning busy VM")
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(mgr.metrics.CloneSuppressed.WithLabelValues("test", defaultProfileName)),
+		"the suppressed clone must be counted")
+}
+
+// TestReconcile_RecycleModeBurstStillClones is the demand-side twin: a
+// SECOND job arriving while the only (credited) VM is busy must still
+// get a clone dispatched — the credit offsets only the baseline
+// top-up, never pending demand.
+func TestReconcile_RecycleModeBurstStillClones(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 41001, Node: "pve1", Name: "gh-runner-test-41001",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning, HasRecycleSnapshot: true,
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:              1,
+		MaxConcurrentRunners: 5,
+		VMMaxAge:             time.Hour,
+		RecycleMode:          config.RecycleModeSnapshotRollback,
+	})
+	mgr.SetDesiredCount(2) // in-flight job + one pending job
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.clones) == 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"pending demand beyond the busy VM must still dispatch a clone")
+}
+
+// TestReconcile_RecycleModeUncreditedBusyVMStillReplaced: a busy VM
+// whose clone-time snapshot failed will be destroyed after its job —
+// the reconciler must treat it like destroy mode and clone the
+// replacement during the job.
+func TestReconcile_RecycleModeUncreditedBusyVMStillReplaced(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 41002, Node: "pve1", Name: "gh-runner-test-41002",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning, HasRecycleSnapshot: false, // snapshot failed at clone time
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:              1,
+		MaxConcurrentRunners: 5,
+		VMMaxAge:             time.Hour,
+		RecycleMode:          config.RecycleModeSnapshotRollback,
+	})
+	mgr.SetDesiredCount(1)
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.clones) == 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"a non-returning busy VM must still get its replacement cloned")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(mgr.metrics.CloneSuppressed.WithLabelValues("test", defaultProfileName)))
+}
+
+// TestReconcile_DestroyModeStillReplacesBusyVM pins destroy-mode
+// behavior: the same population (busy VM, hot deficit) keeps
+// dispatching the eager replacement clone, and the suppression counter
+// stays at zero.
+func TestReconcile_DestroyModeStillReplacesBusyVM(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 41003, Node: "pve1", Name: "gh-runner-test-41003",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning,
+		// Even a (stale) snapshot flag must not credit in destroy mode.
+		HasRecycleSnapshot: true,
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:              1,
+		MaxConcurrentRunners: 5,
+		VMMaxAge:             time.Hour,
+	})
+	mgr.SetDesiredCount(1)
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.clones) == 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"destroy mode must keep the eager-replacement behavior")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(mgr.metrics.CloneSuppressed.WithLabelValues("test", defaultProfileName)))
+}
+
+// TestReconcile_RecycleModeOverAgeBusyVMStillReplaced: a busy VM past
+// vm_max_age takes the destroy path after its job (shouldRecycle's age
+// gate), so the reconciler must clone its replacement during the job
+// rather than crediting a return that will never happen.
+func TestReconcile_RecycleModeOverAgeBusyVMStillReplaced(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 41004, Node: "pve1", Name: "gh-runner-test-41004",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning, HasRecycleSnapshot: true,
+		CreatedAt: time.Now().Add(-2 * time.Hour), // past the 1h max age
+	}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:              1,
+		MaxConcurrentRunners: 5,
+		VMMaxAge:             time.Hour,
+		RecycleMode:          config.RecycleModeSnapshotRollback,
+	})
+	mgr.SetDesiredCount(1)
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.clones) == 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"an over-age busy VM must still get its replacement cloned")
 }
 
 func TestAllocateVMID_AvoidsCollisions(t *testing.T) {
@@ -1928,6 +2353,12 @@ func (p *panickyProv) ListOwnedVMs(ctx context.Context) ([]*provisioner.VM, erro
 func (p *panickyProv) PowerState(ctx context.Context, vm *provisioner.VM) (string, error) {
 	return p.inner.PowerState(ctx, vm)
 }
+func (p *panickyProv) SnapshotCreate(ctx context.Context, vm *provisioner.VM, name string) error {
+	return p.inner.SnapshotCreate(ctx, vm, name)
+}
+func (p *panickyProv) SnapshotRollback(ctx context.Context, vm *provisioner.VM, name string) error {
+	return p.inner.SnapshotRollback(ctx, vm, name)
+}
 func (p *panickyProv) Ping(ctx context.Context) error { return p.inner.Ping(ctx) }
 func (p *panickyProv) TemplateNode() string           { return p.inner.TemplateNode() }
 func (p *panickyProv) Client() *proxmox.Client        { return p.inner.Client() }
@@ -2863,4 +3294,386 @@ func TestSetTargetSizes_ClampsToMaxConcurrentRunners(t *testing.T) {
 	require.NoError(t, mgr.SetTargetSizes("cpu", 99, 99))
 	require.Equal(t, int32(5), ps.hotSize.Load())
 	require.Equal(t, int32(0), ps.warmSize.Load())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot-rollback recycle (recycle_mode: snapshot_rollback)
+// ---------------------------------------------------------------------------
+
+// orphanRecorder is a thread-safe OnRunnerOrphaned capture for the
+// recycle tests.
+type orphanRecorder struct {
+	mu  sync.Mutex
+	ids []int64
+}
+
+func (o *orphanRecorder) callback(_ context.Context, runnerID int64) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ids = append(o.ids, runnerID)
+	return nil
+}
+
+func (o *orphanRecorder) snapshot() []int64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]int64(nil), o.ids...)
+}
+
+// seedRunningForRecycle inserts one Running row paired with a runner,
+// with an explicit CreatedAt so the tests can pin the vm_max_age gate
+// and the CreatedAt-is-preserved invariant.
+func seedRunningForRecycle(t *testing.T, st *store.Store, vmid int, createdAt time.Time) {
+	t.Helper()
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: vmid, Node: "pve1", Name: fmt.Sprintf("gh-runner-test-%d", vmid),
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning, JobID: 42, RunnerID: 7777,
+		Org: "acme", Repo: "acme/ci", CreatedAt: createdAt,
+	}))
+}
+
+// TestMarkCompleted_SnapshotRollbackRecyclesToWarm drives the happy
+// path: Running → Recycling → Warm with the runner deregistered, the
+// recycle counter bumped, CreatedAt untouched, and NO destroy — the
+// row (and its VMID) survives for the next job.
+func TestMarkCompleted_SnapshotRollbackRecyclesToWarm(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	created := time.Now().Add(-time.Minute)
+	seedRunningForRecycle(t, st, 21000, created)
+
+	fp := &fakeProv{}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		VMMaxAge:         time.Hour, // row is 1m old — well inside the recycle window
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+	})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21000))
+
+	require.Eventually(t, func() bool {
+		row, err := st.Get(21000)
+		return err == nil && row.State == store.StateWarm
+	}, 2*time.Second, 10*time.Millisecond, "row never returned to warm")
+
+	row, err := st.Get(21000)
+	require.NoError(t, err)
+	require.Equal(t, store.PoolKindWarm, row.PoolKind)
+	require.Equal(t, 1, row.RecycleCount)
+	require.Zero(t, row.RunnerID, "runner pairing must be cleared before the VM re-enters warm")
+	require.Zero(t, row.JobID)
+	require.Empty(t, row.Org)
+	require.True(t, row.CreatedAt.Equal(created), "CreatedAt must survive the recycle so vm_max_age still applies")
+
+	require.Equal(t, []int64{7777}, orphans.snapshot(), "the GitHub runner must be deregistered exactly like the destroy path")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Equal(t, []snapshotCall{{vmid: 21000, name: recycleSnapshotName}}, fp.rollbacks)
+	require.Empty(t, fp.destroys, "a successful recycle must not destroy the VM")
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(mgr.metrics.Recycles.WithLabelValues("test", defaultProfileName)))
+}
+
+// TestMarkCompleted_RollbackFailureFallsBackToDestroy: any rollback
+// error (missing snapshot, storage failure) must route the row into
+// the standard destroy path so the pool self-heals with a fresh clone.
+func TestMarkCompleted_RollbackFailureFallsBackToDestroy(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedRunningForRecycle(t, st, 21001, time.Now())
+
+	fp := &fakeProv{rollbackErr: errors.New("snapshot 'scaleset-clean' does not exist")}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		VMMaxAge:         time.Hour,
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+	})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21001))
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		destroyed := len(fp.destroys) == 1
+		fp.mu.Unlock()
+		if !destroyed {
+			return false
+		}
+		_, err := st.Get(21001)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "rollback failure never fell back to destroy")
+
+	// Deregistration happened once, on the rollback path; the destroy
+	// path saw RunnerID already cleared and must not double-fire.
+	require.Equal(t, []int64{7777}, orphans.snapshot())
+	require.Equal(t, float64(1),
+		testutil.ToFloat64(mgr.metrics.RecycleFailures.WithLabelValues("test", defaultProfileName)))
+}
+
+// TestMarkCompleted_MaxAgeExceededDestroysNotRecycles: a row older
+// than the profile's vm_max_age takes the full destroy path even in
+// snapshot-rollback mode, so template updates land on the replacement
+// clone.
+func TestMarkCompleted_MaxAgeExceededDestroysNotRecycles(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedRunningForRecycle(t, st, 21002, time.Now().Add(-2*time.Hour))
+
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     0,
+		VMMaxAge:    time.Hour, // row is 2h old — past the recycle window
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21002))
+
+	require.Eventually(t, func() bool {
+		_, err := st.Get(21002)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "aged row was never destroyed")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.rollbacks, "aged rows must not be rolled back")
+	require.Equal(t, []int{21002}, fp.destroys)
+}
+
+// TestMarkCompleted_DestroyModeNeverRollsBack pins the default-mode
+// contract: without recycle_mode: snapshot_rollback, MarkCompleted
+// behaves exactly as before this feature (destroy, no rollback).
+func TestMarkCompleted_DestroyModeNeverRollsBack(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedRunningForRecycle(t, st, 21003, time.Now())
+
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 0, VMMaxAge: time.Hour})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21003))
+
+	require.Eventually(t, func() bool {
+		_, err := st.Get(21003)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.rollbacks)
+	require.Empty(t, fp.snapshots)
+}
+
+// TestRunClone_SnapshotRollbackSnapshotsBeforeBoot: in snapshot mode a
+// hot-fill clone must NOT auto-start inside Clone — the clean snapshot
+// is taken while the VM is stopped, and only then is the VM started
+// and promoted to Hot.
+func TestRunClone_SnapshotRollbackSnapshotsBeforeBoot(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     1,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		rows, err := st.ListByState(store.StateHot)
+		return err == nil && len(rows) == 1
+	}, 2*time.Second, 10*time.Millisecond, "clone never reached hot")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Len(t, fp.clones, 1)
+	require.False(t, fp.clones[0].PoweredOn, "snapshot mode must clone powered-off so the snapshot precedes first boot")
+	require.Equal(t, []snapshotCall{{vmid: fp.clones[0].NewVMID, name: recycleSnapshotName}}, fp.snapshots)
+	require.Equal(t, []int{fp.clones[0].NewVMID}, fp.starts, "hot fill must start the VM after the snapshot")
+}
+
+// TestRunClone_SnapshotFailureFallsBackToDestroyMode: a failed
+// SnapshotCreate must not poison or destroy the fresh clone — the VM
+// still serves a job; its first rollback fails and the destroy
+// fallback handles it then.
+func TestRunClone_SnapshotFailureFallsBackToDestroyMode(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{snapshotErr: errors.New("storage does not support snapshots")}
+	mgr := newTestManager(t, st, fp, Config{
+		WarmSize:    1,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	mgr.reconcileOnce(context.Background())
+
+	require.Eventually(t, func() bool {
+		rows, err := st.ListByState(store.StateWarm)
+		return err == nil && len(rows) == 1
+	}, 2*time.Second, 10*time.Millisecond, "clone never reached warm despite the snapshot failure being non-fatal")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Len(t, fp.snapshots, 1)
+	require.Empty(t, fp.destroys)
+}
+
+// TestAdopt_SnapshotRollbackRollsBackStoppedVM: a stopped owned VM
+// found at startup may carry a dirty disk (crashed mid-job), so
+// adoption in snapshot mode routes it through Recycling → rollback →
+// Warm instead of trusting the disk.
+func TestAdopt_SnapshotRollbackRollsBackStoppedVM(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 30000, Node: "pve1", Name: "gh-runner-test-30000", Profile: defaultProfileName},
+		},
+		powerStateBy: map[int]string{30000: "stopped"},
+	}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     0,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	require.Eventually(t, func() bool {
+		row, err := st.Get(30000)
+		return err == nil && row.State == store.StateWarm
+	}, 2*time.Second, 10*time.Millisecond, "adopted stopped vm never landed in warm")
+
+	row, err := st.Get(30000)
+	require.NoError(t, err)
+	require.Equal(t, 1, row.RecycleCount)
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Equal(t, []snapshotCall{{vmid: 30000, name: recycleSnapshotName}}, fp.rollbacks)
+	require.Empty(t, fp.destroys)
+}
+
+// TestAdopt_SnapshotRollbackFailureDestroysStoppedVM: adoption of a
+// stopped VM whose snapshot is missing (e.g. the operator flipped an
+// existing destroy-mode fleet to snapshot_rollback) must self-heal by
+// destroying it.
+func TestAdopt_SnapshotRollbackFailureDestroysStoppedVM(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 30001, Node: "pve1", Name: "gh-runner-test-30001", Profile: defaultProfileName},
+		},
+		powerStateBy: map[int]string{30001: "stopped"},
+		rollbackErr:  errors.New("snapshot 'scaleset-clean' does not exist"),
+	}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:     0,
+		RecycleMode: config.RecycleModeSnapshotRollback,
+	})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		destroyed := len(fp.destroys) == 1
+		fp.mu.Unlock()
+		if !destroyed {
+			return false
+		}
+		_, err := st.Get(30001)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "unrollbackable adopted vm was never destroyed")
+}
+
+// TestAdopt_SnapshotRollbackDeregistersStaleRunner: a stopped VM found
+// at startup can still hold a GitHub runner registration (the previous
+// leader crashed after the job but before the deregister). Because a
+// recycled row keeps its name forever, the reconciler's orphan-runner
+// sweep will never reap that registration — so the adopt-time recycle
+// must thread the observed runner ID through to the rollback worker,
+// which deregisters it exactly like the normal recycle path.
+func TestAdopt_SnapshotRollbackDeregistersStaleRunner(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{
+		listOwnedRet: []*provisioner.VM{
+			{VMID: 30002, Node: "pve1", Name: "gh-runner-test-30002", Profile: defaultProfileName},
+		},
+		powerStateBy: map[int]string{30002: "stopped"},
+	}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+		RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+			// Offline registration left over from the crashed job.
+			return map[string]RunnerInfo{
+				"gh-runner-test-30002": {ID: 9999, Online: false},
+			}, nil
+		},
+	})
+
+	require.NoError(t, mgr.Adopt(context.Background()))
+
+	require.Eventually(t, func() bool {
+		row, err := st.Get(30002)
+		return err == nil && row.State == store.StateWarm
+	}, 2*time.Second, 10*time.Millisecond, "adopted stopped vm never landed in warm")
+
+	row, err := st.Get(30002)
+	require.NoError(t, err)
+	require.Zero(t, row.RunnerID, "stale runner pairing must be cleared before the VM re-enters warm")
+	require.Equal(t, []int64{9999}, orphans.snapshot(),
+		"the stale GitHub registration must be deregistered during the adopt-time recycle")
+}
+
+// TestSweepStuckRows_RecyclingRowSelfHealsToDestroy is the in-process
+// crash-recovery backstop for the Recycling state: if the rollback
+// worker dies (panic, cancelled sem acquire, drain skip) the row would
+// otherwise pin its VMID forever. The fleet-wide stuck sweep must
+// route a stale Recycling row into the destroy path — and the destroy
+// must still deregister the GitHub runner the dead worker never got to.
+func TestSweepStuckRows_RecyclingRowSelfHealsToDestroy(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	old := time.Now().Add(-10 * time.Minute) // well past the 5m stuck grace
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 21010, Node: "pve1", Name: "gh-runner-test-21010",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRecycling, RunnerID: 8888,
+		CreatedAt: old, UpdatedAt: old, StateSince: old,
+	}))
+
+	fp := &fakeProv{}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+	})
+
+	mgr.sweepStuckRows()
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		destroyed := len(fp.destroys) == 1
+		fp.mu.Unlock()
+		if !destroyed {
+			return false
+		}
+		_, err := st.Get(21010)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "stuck recycling row was never destroyed")
+
+	require.Equal(t, []int64{8888}, orphans.snapshot(),
+		"destroying a wedged recycle must still deregister the GitHub runner")
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.rollbacks, "the sweep must destroy, not retry the rollback")
 }

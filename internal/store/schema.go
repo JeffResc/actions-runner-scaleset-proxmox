@@ -19,9 +19,16 @@ const (
 	StateHot          State = "hot"
 	StateAssigned     State = "assigned"
 	StateRunning      State = "running"
-	StateDraining     State = "draining"
-	StateDestroying   State = "destroying"
-	StatePoison       State = "poison"
+	// StateRecycling is the transient state between a completed job
+	// and Warm in snapshot-rollback recycle mode: the rollback worker
+	// owns the row while it deregisters the GitHub runner and rolls
+	// the VM back to its post-clone snapshot. On success the row
+	// returns to Warm; on failure it falls through to the destroy
+	// path (Draining).
+	StateRecycling  State = "recycling"
+	StateDraining   State = "draining"
+	StateDestroying State = "destroying"
+	StatePoison     State = "poison"
 )
 
 // PoolKind is the pool budget a VM counts toward.
@@ -42,6 +49,7 @@ var AllStates = []State{
 	StateHot,
 	StateAssigned,
 	StateRunning,
+	StateRecycling,
 	StateDraining,
 	StateDestroying,
 	StatePoison,
@@ -82,9 +90,27 @@ type VM struct {
 	JobID        int64
 	RunnerID     int64
 	BootAttempts int
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	StateSince   time.Time
+	// RecycleCount is how many times this VM has been returned to the
+	// warm pool via a snapshot rollback (pool.recycle_mode:
+	// snapshot_rollback). Always 0 in destroy mode. CreatedAt is NOT
+	// reset on recycle, so vm_max_age still bounds the VM's total
+	// lifetime regardless of how often it was recycled.
+	RecycleCount int
+	// HasRecycleSnapshot records whether the VM carries the
+	// "scaleset-clean" recycle snapshot (pool.recycle_mode:
+	// snapshot_rollback). Set true where the snapshot outcome is
+	// known: after a successful clone-time SnapshotCreate, after a
+	// successful rollback (which proves the snapshot exists), and
+	// optimistically on adoption in recycle mode (an inherited VM was
+	// cloned by a recycle-mode leader; if the optimism is wrong its
+	// next rollback fails and the destroy fallback self-heals). False
+	// means the VM will be destroyed — not recycled — after its job,
+	// so the reconciler must NOT credit it as "returning to the pool"
+	// when sizing replacement clones. Always false in destroy mode.
+	HasRecycleSnapshot bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	StateSince         time.Time
 }
 
 // Clone returns a deep copy. memdb stores by pointer; mutating a row read

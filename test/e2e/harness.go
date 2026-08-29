@@ -78,6 +78,11 @@ type Options struct {
 	// Defaults to "octocat". The fake accepts any value.
 	Org string
 
+	// RecycleMode, when non-empty, sets pool.recycle_mode in the
+	// generated config ("destroy" or "snapshot_rollback"). Empty
+	// omits the key so the orchestrator's default (destroy) applies.
+	RecycleMode string
+
 	// FirewallEnabled, when true, emits a proxmox.firewall block
 	// (enabled, security_group "gh-runner") so scenarios can assert
 	// per-clone firewall application. False omits the block entirely
@@ -249,6 +254,7 @@ func Start(t testing.TB, opts Options) *Harness {
 		HotSize:              opts.HotSize,
 		WarmSize:             opts.WarmSize,
 		MaxConcurrentRunners: opts.MaxConcurrentRunners,
+		RecycleMode:          opts.RecycleMode,
 		FirewallEnabled:      opts.FirewallEnabled,
 		ObsAddr:              obsAddr,
 		AdminAddr:            adminAddr,
@@ -459,7 +465,8 @@ type configValues struct {
 	HotSize              int
 	WarmSize             int
 	MaxConcurrentRunners int
-	FirewallEnabled      bool // emits the proxmox.firewall block when true
+	RecycleMode          string // empty omits pool.recycle_mode (default destroy)
+	FirewallEnabled      bool   // emits the proxmox.firewall block when true
 	ObsAddr              string
 	AdminAddr            string
 
@@ -581,6 +588,9 @@ pool:
   vmid_reuse_cooldown: 10m
   orphan_grace: 5s
   clone_inflight_grace: 1m
+{{- if .RecycleMode }}
+  recycle_mode: {{.RecycleMode}}
+{{- end }}
 observability:
   http_addr: "{{.ObsAddr}}"
   log_level: warn

@@ -158,6 +158,21 @@ type Provisioner interface {
 	ReadJITConfig(ctx context.Context, vm *VM) ([]byte, error)
 	ListOwnedVMs(ctx context.Context) ([]*VM, error)
 
+	// SnapshotCreate takes a named snapshot of the VM and waits for the
+	// task to settle. The pool manager calls it once right after Clone
+	// (while the VM is still stopped) in snapshot-rollback recycle mode
+	// so SnapshotRollback can later restore the pristine post-clone
+	// state. Requires snapshot-capable storage; on storage that can't
+	// snapshot, Proxmox fails the task and the error is surfaced.
+	SnapshotCreate(ctx context.Context, vm *VM, name string) error
+
+	// SnapshotRollback rolls the VM back to the named snapshot and
+	// waits for the task to settle. Rolling back a stopped VM returns
+	// it to the (stopped) snapshot state. Fails when the snapshot does
+	// not exist — callers treat that as "this VM can't be recycled"
+	// and fall back to destroying it.
+	SnapshotRollback(ctx context.Context, vm *VM, name string) error
+
 	// PowerState returns the Proxmox status string for the VM —
 	// typically "running", "stopped", or "paused". Returns an empty
 	// string when the VM cannot be located (callers should treat that
@@ -957,6 +972,44 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	// would race PVE-side lock-file cleanup and produce
 	// "VM N is running - destroy failed" errors.
 	p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
+	return nil
+}
+
+// SnapshotCreate takes a named snapshot of the VM and awaits the task.
+// The 300s task budget mirrors Start's: snapshotting a stopped VM is
+// normally seconds, but slow storage under load deserves headroom.
+func (p *pmox) SnapshotCreate(ctx context.Context, vm *VM, name string) error {
+	pVM, err := p.getVM(ctx, vm)
+	if err != nil {
+		return classifyProxmoxError(err)
+	}
+	task, err := pVM.NewSnapshot(ctx, name)
+	if err != nil {
+		return fmt.Errorf("create snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
+	}
+	if err := awaitTask(ctx, task, 300); err != nil {
+		return fmt.Errorf("await snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
+	}
+	return nil
+}
+
+// SnapshotRollback rolls the VM back to the named snapshot and awaits
+// the task. 600s budget matches Clone's — a rollback rewrites the same
+// order of disk state a clone does on copy-on-write storage. A missing
+// snapshot surfaces as an error (wrapped ErrVMNotFound via the "does
+// not exist" classifier) so the caller's destroy fallback fires.
+func (p *pmox) SnapshotRollback(ctx context.Context, vm *VM, name string) error {
+	pVM, err := p.getVM(ctx, vm)
+	if err != nil {
+		return classifyProxmoxError(err)
+	}
+	task, err := pVM.Snapshot(name).Rollback(ctx)
+	if err != nil {
+		return fmt.Errorf("rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
+	}
+	if err := awaitTask(ctx, task, 600); err != nil {
+		return fmt.Errorf("await rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
+	}
 	return nil
 }
 

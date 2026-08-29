@@ -195,6 +195,9 @@ func (s *Server) routes() http.Handler {
 	r.Post("/nodes/{node}/qemu/{vmid}/status/start", s.handleStart)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/stop", s.handleStop)
 	r.Post("/nodes/{node}/qemu/{vmid}/status/shutdown", s.handleShutdown)
+	r.Post("/nodes/{node}/qemu/{vmid}/snapshot", s.handleSnapshotCreate)
+	r.Get("/nodes/{node}/qemu/{vmid}/snapshot", s.handleSnapshotList)
+	r.Post("/nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback", s.handleSnapshotRollback)
 	// Per-VM firewall endpoints. The mutating pair is synchronous on
 	// real PVE (no UPID task) — the response is a bare {"data": null}.
 	// The GET pair backs the provisioner's ensureFirewall pre-start
@@ -531,6 +534,116 @@ func (s *Server) stopLike(w http.ResponseWriter, r *http.Request, kind string) {
 	}
 	v.Running = false
 	task := s.store.newTaskLocked(v.Node, kind, fmt.Sprintf("%d", vmid))
+	writeData(w, task.UPID)
+}
+
+// handleSnapshotCreate models POST /nodes/{node}/qemu/{vmid}/snapshot.
+// Records the snapshot name on the VM and returns a UPID task like the
+// other mutating routes. Duplicate names are rejected the way real PVE
+// does ("snapshot name 'x' already used").
+func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	var body struct {
+		SnapName string `json:"snapname"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad snapshot body: "+err.Error())
+		return
+	}
+	if body.SnapName == "" {
+		writeError(w, http.StatusBadRequest, "snapname is required")
+		return
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	for _, name := range v.Snapshots {
+		if name == body.SnapName {
+			writeError(w, http.StatusInternalServerError,
+				fmt.Sprintf("snapshot name '%s' already used", body.SnapName))
+			return
+		}
+	}
+	v.Snapshots = append(v.Snapshots, body.SnapName)
+	v.SnapshotCreates++
+	task := s.store.newTaskLocked(v.Node, "qmsnapshot", fmt.Sprintf("%d", vmid))
+	writeData(w, task.UPID)
+}
+
+// handleSnapshotList models GET /nodes/{node}/qemu/{vmid}/snapshot.
+// Real PVE appends a synthetic "current" entry ("You are here!");
+// go-proxmox just unmarshals whatever names come back, so we mirror
+// that shape for fidelity.
+func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	out := make([]map[string]any, 0, len(v.Snapshots)+1)
+	for _, name := range v.Snapshots {
+		out = append(out, map[string]any{"name": name})
+	}
+	out = append(out, map[string]any{"name": "current", "description": "You are here!"})
+	writeData(w, out)
+}
+
+// handleSnapshotRollback models
+// POST /nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback. An
+// unknown snapshot fails with the "does not exist" body shape the
+// orchestrator's error classifier keys on. On success the VM is marked
+// stopped — the clean snapshot was taken pre-boot, so rolling back
+// lands on the stopped snapshot state.
+func (s *Server) handleSnapshotRollback(w http.ResponseWriter, r *http.Request) {
+	vmid, err := vmidParam(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad vmid")
+		return
+	}
+	snapname := chi.URLParam(r, "snapname")
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	v, ok := s.store.findVMLocked(vmid)
+	if !ok {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("Configuration file 'nodes/%s/qemu-server/%d.conf' does not exist",
+				chi.URLParam(r, "node"), vmid))
+		return
+	}
+	found := false
+	for _, name := range v.Snapshots {
+		if name == snapname {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("snapshot '%s' does not exist", snapname))
+		return
+	}
+	v.Rollbacks++
+	v.Running = false
+	task := s.store.newTaskLocked(v.Node, "qmrollback", fmt.Sprintf("%d", vmid))
 	writeData(w, task.UPID)
 }
 

@@ -21,6 +21,14 @@ type vmRecord struct {
 	StartedAt time.Time // wall-clock start so guest-agent delay can be enforced
 	Config    map[string]any
 
+	// Snapshots holds the VM's snapshot names in creation order.
+	// SnapshotCreates / Rollbacks count the respective API calls so
+	// tests can assert "snapshotted exactly once, rolled back twice"
+	// without scraping the task table.
+	Snapshots       []string
+	SnapshotCreates int
+	Rollbacks       int
+
 	// FirewallRules / FirewallOptions record what the orchestrator
 	// applied via POST .../firewall/rules and PUT .../firewall/options.
 	// Mirrors real PVE: this state is per-VM and (like the real
@@ -97,6 +105,9 @@ func (s *store) snapshot() []VMSnapshot {
 			Name:                       v.Name,
 			Tags:                       v.Tags,
 			Running:                    v.Running,
+			Snapshots:                  append([]string(nil), v.Snapshots...),
+			SnapshotCreates:            v.SnapshotCreates,
+			Rollbacks:                  v.Rollbacks,
 			Config:                     cfgCopy,
 			FirewallRules:              append([]FirewallRuleRecord(nil), v.FirewallRules...),
 			FirewallOptions:            fwOpts,
@@ -110,13 +121,18 @@ func (s *store) snapshot() []VMSnapshot {
 
 // VMSnapshot is the externally observable view of one VM. Tags are kept
 // in semicolon-joined wire form so assertion code matches the
-// orchestrator's own format.
+// orchestrator's own format. Snapshots / SnapshotCreates / Rollbacks
+// expose the VM's Proxmox-snapshot bookkeeping for recycle-mode tests.
 type VMSnapshot struct {
 	VMID    int
 	Node    string
 	Name    string
 	Tags    string
 	Running bool
+
+	Snapshots       []string
+	SnapshotCreates int
+	Rollbacks       int
 
 	// Config is a copy of the VM's qemu config keys as set via the
 	// config endpoint (or inherited from the template on clone). Nil

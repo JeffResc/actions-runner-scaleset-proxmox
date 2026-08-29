@@ -450,7 +450,13 @@ func (s *Server) handleGenerateJIT(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRunnerDelete(w http.ResponseWriter, r *http.Request) {
 	// Mirrors the REST path's RunnerDeletions accounting so e2e tests
 	// can assert "scaler removed runner N" without distinguishing
-	// which API surface drove it.
+	// which API surface drove it. Also removes the runner record —
+	// real GitHub does, and a stale busy record would otherwise
+	// re-match a recycled VM's unchanged runner name and trip the
+	// reconciler's hot+busy promote path. Unknown ids stay tolerant
+	// (no 404, unlike the REST surface): deregistration here is the
+	// orchestrator's best-effort cleanup and may legitimately retry
+	// after the record is gone.
 	idStr := chi.URLParam(r, "id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -458,6 +464,7 @@ func (s *Server) handleRunnerDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	delete(s.runners, id)
 	s.deletions = append(s.deletions, id)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)

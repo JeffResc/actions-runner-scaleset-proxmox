@@ -552,6 +552,19 @@ type AffinityMatch struct {
 	Profile string `yaml:"profile,omitempty"`
 }
 
+// Recycle modes accepted by pool.recycle_mode. See PoolConfig.RecycleMode.
+const (
+	// RecycleModeDestroy is the default: every VM is destroyed after
+	// its job and a replacement is cloned from the template.
+	RecycleModeDestroy = "destroy"
+
+	// RecycleModeSnapshotRollback snapshots each VM once right after
+	// clone and rolls back to that snapshot after each job instead of
+	// destroying, returning the VM to the warm pool. Requires
+	// snapshot-capable storage.
+	RecycleModeSnapshotRollback = "snapshot_rollback"
+)
+
 // PoolConfig configures pool sizes and timing.
 //
 // Pool-level HotSize / WarmSize / BootMaxAttempts / VMMaxAge are
@@ -589,6 +602,18 @@ type PoolConfig struct {
 	// JIT-inject worst case; otherwise the reconciler will destroy
 	// VMs the pool worker is still booting. Default "60s"; must be > 0.
 	OrphanGrace Duration `yaml:"orphan_grace"`
+
+	// RecycleMode selects what happens to a VM after its job
+	// completes. "destroy" (the default) tears the VM down and clones
+	// a replacement; "snapshot_rollback" snapshots each VM once right
+	// after clone (while it is still stopped) and rolls back to that
+	// snapshot after each job, returning the VM to the warm pool —
+	// much faster on storage without linked clones. Requires
+	// snapshot-capable storage. vm_max_age still forces a periodic
+	// full destroy + re-clone so template updates land. Pool-level
+	// setting: it applies to every profile of the scaleset (no
+	// per-profile override).
+	RecycleMode string `yaml:"recycle_mode"`
 
 	// CloneInflightGrace is the TTL safety net for the Provisioner's
 	// in-flight clone tracker. Entries older than this are pruned in
@@ -1252,6 +1277,9 @@ func (c *Config) ApplyDefaults() {
 	c.Pool.VMIDReuseCooldown.setDefault(30 * time.Second)
 	c.Pool.OrphanGrace.setDefault(60 * time.Second)
 	c.Pool.CloneInflightGrace.setDefault(5 * time.Minute)
+	if c.Pool.RecycleMode == "" {
+		c.Pool.RecycleMode = RecycleModeDestroy
+	}
 	// Observability
 	if c.Observability.HTTPAddr == "" {
 		c.Observability.HTTPAddr = ":9100"
@@ -1455,6 +1483,14 @@ func (c *Config) Resolve() error {
 	}
 	if c.Pool.CloneInflightGrace.D() <= 0 {
 		return errors.New("pool.clone_inflight_grace must be positive")
+	}
+	// RecycleMode is a closed enum; ApplyDefaults substituted "destroy"
+	// for the unset case, so anything else here is an operator typo.
+	switch c.Pool.RecycleMode {
+	case RecycleModeDestroy, RecycleModeSnapshotRollback:
+	default:
+		return fmt.Errorf("pool.recycle_mode: unknown value %q (expected %q or %q)",
+			c.Pool.RecycleMode, RecycleModeDestroy, RecycleModeSnapshotRollback)
 	}
 	// Profiles: per-profile vm_max_age must be positive when set.
 	// Empty inherits from pool (already applied in ApplyDefaults, so

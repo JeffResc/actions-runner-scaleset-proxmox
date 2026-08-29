@@ -271,3 +271,69 @@ func TestServer_ListVMsByNode(t *testing.T) {
 	require.Equal(t, "running", vm["status"])
 	require.Equal(t, "gh-scaleset", vm["tags"])
 }
+
+func TestServer_SnapshotLifecycle(t *testing.T) {
+	t.Parallel()
+	srv := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 1 * time.Millisecond})
+	srv.SeedVM("pve1", 12400, "gh-runner-test-1", true, []string{"gh-scaleset"})
+
+	// Rollback of a snapshot that doesn't exist yet must fail with the
+	// "does not exist" body the orchestrator's error classifier keys on.
+	status, _, body := do(t, srv, http.MethodPost,
+		"/nodes/pve1/qemu/12400/snapshot/scaleset-clean/rollback", nil)
+	require.Equal(t, http.StatusInternalServerError, status)
+	require.Contains(t, body, "does not exist")
+
+	// Create the snapshot: returns a UPID task like the other mutating
+	// routes.
+	status, env, body := do(t, srv, http.MethodPost, "/nodes/pve1/qemu/12400/snapshot", map[string]any{
+		"snapname": "scaleset-clean",
+	})
+	require.Equal(t, http.StatusOK, status, body)
+	upid, ok := env["data"].(string)
+	require.True(t, ok, "snapshot POST must return UPID as data")
+	require.Eventually(t, func() bool {
+		_, env, _ := do(t, srv, http.MethodGet, fmt.Sprintf("/nodes/pve1/tasks/%s/status", upid), nil)
+		td, _ := env["data"].(map[string]any)
+		return td["status"] == "stopped" && td["exitstatus"] == "OK"
+	}, 1*time.Second, 5*time.Millisecond)
+
+	// Duplicate names are rejected the way real PVE rejects them.
+	status, _, body = do(t, srv, http.MethodPost, "/nodes/pve1/qemu/12400/snapshot", map[string]any{
+		"snapname": "scaleset-clean",
+	})
+	require.Equal(t, http.StatusInternalServerError, status)
+	require.Contains(t, body, "already used")
+
+	// List includes the named snapshot plus PVE's synthetic "current".
+	_, env, _ = do(t, srv, http.MethodGet, "/nodes/pve1/qemu/12400/snapshot", nil)
+	entries, ok := env["data"].([]any)
+	require.True(t, ok)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		m, _ := e.(map[string]any)
+		names = append(names, m["name"].(string))
+	}
+	require.Contains(t, names, "scaleset-clean")
+	require.Contains(t, names, "current")
+
+	// Rollback now succeeds and marks the (running) VM stopped — the
+	// snapshot was taken pre-boot, so its power state is "stopped".
+	status, env, body = do(t, srv, http.MethodPost,
+		"/nodes/pve1/qemu/12400/snapshot/scaleset-clean/rollback", nil)
+	require.Equal(t, http.StatusOK, status, body)
+	_, ok = env["data"].(string)
+	require.True(t, ok, "rollback POST must return UPID as data")
+
+	var vm fakeproxmox.VMSnapshot
+	for _, v := range srv.Snapshot() {
+		if v.VMID == 12400 {
+			vm = v
+			break
+		}
+	}
+	require.False(t, vm.Running, "rollback must land the VM in the stopped snapshot state")
+	require.Equal(t, []string{"scaleset-clean"}, vm.Snapshots)
+	require.Equal(t, 1, vm.SnapshotCreates)
+	require.Equal(t, 1, vm.Rollbacks)
+}

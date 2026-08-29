@@ -55,6 +55,7 @@ type Stats struct {
 	Hot          int
 	Assigned     int
 	Running      int
+	Recycling    int
 	Draining     int
 	Destroying   int
 	Poison       int
@@ -63,7 +64,7 @@ type Stats struct {
 // Total returns the sum of all non-terminal states.
 func (s Stats) Total() int {
 	return s.Provisioning + s.Warm + s.Booting + s.Hot +
-		s.Assigned + s.Running + s.Draining + s.Destroying + s.Poison
+		s.Assigned + s.Running + s.Recycling + s.Draining + s.Destroying + s.Poison
 }
 
 // Available returns the count of VMs that ARE or WILL BE acquirable from
@@ -97,17 +98,19 @@ type VM struct {
 // RowSnapshot is the reconciler's view of a single VM row. It excludes
 // the timestamps the storage layer carries internally so the reconciler
 // doesn't accidentally depend on storage layout. JobID and RunnerID are
-// int64 with 0 meaning "unset".
+// int64 with 0 meaning "unset". RecycleCount mirrors the store row's
+// snapshot-rollback recycle counter (always 0 in destroy mode).
 type RowSnapshot struct {
-	VMID       int
-	Node       string
-	Name       string
-	Profile    string
-	State      string
-	JobID      int64
-	RunnerID   int64
-	StateSince time.Time
-	CreatedAt  time.Time
+	VMID         int
+	Node         string
+	Name         string
+	Profile      string
+	State        string
+	JobID        int64
+	RunnerID     int64
+	RecycleCount int
+	StateSince   time.Time
+	CreatedAt    time.Time
 }
 
 // RunnerInfo is the subset of GitHub's per-runner state that the

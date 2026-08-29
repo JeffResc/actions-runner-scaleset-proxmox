@@ -524,6 +524,16 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 		destroyMsg: "running: runner missing from GitHub",
 	},
 
+	// recycling: post-job snapshot rollback in flight (recycle_mode:
+	// snapshot_rollback). The rollback worker owns the row until it
+	// lands back in warm (or falls back to destroy); it deregisters
+	// the runner itself, so every GitHub-side observation here is
+	// expected transitional noise — never act on it.
+	{dbState: "recycling", ghLabel: "busy"}:    {op: opNoop},
+	{dbState: "recycling", ghLabel: "idle"}:    {op: opNoop},
+	{dbState: "recycling", ghLabel: "offline"}: {op: opNoop},
+	{dbState: "recycling", ghLabel: "missing"}: {op: opNoop},
+
 	// hot: pre-JIT pool. Only the busy-without-promote case is
 	// actionable; missing/offline/idle are the expected pre-handshake
 	// states and the pool's own age-based recycle handles a stalled
