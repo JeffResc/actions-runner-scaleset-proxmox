@@ -21,6 +21,9 @@ you get the isolation of a fresh VM without paying the boot cost on every run.
   survives a run.
 - **Hot and warm pools** — pre-booted and pre-cloned VMs so jobs start in
   seconds, not minutes. → [scaling](docs/profiles-and-scaling.md)
+- **Snapshot-rollback recycling** — optionally reuse a VM by rolling it back to
+  a clean post-clone snapshot instead of destroying it, for ~15s turnaround on
+  storage without linked clones. → [recycling](docs/profiles-and-scaling.md#recycling-vms-with-snapshot-rollback)
 - **Runner profiles** — per-shape bundles of hardware, labels, templates, and
   networks. Route GPU jobs to GPU hosts and ARM jobs to ARM templates by
   `runs-on:` labels alone. → [profiles](docs/profiles-and-scaling.md#runner-profiles)
