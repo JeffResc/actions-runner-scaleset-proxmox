@@ -3322,7 +3322,10 @@ func (o *orphanRecorder) snapshot() []int64 {
 
 // seedRunningForRecycle inserts one Running row paired with a runner,
 // with an explicit CreatedAt so the tests can pin the vm_max_age gate
-// and the CreatedAt-is-preserved invariant.
+// and the CreatedAt-is-preserved invariant. HasRecycleSnapshot is true:
+// a VM that reaches job completion in recycle mode normally carries the
+// clean snapshot taken at clone time (the snapshotless case is covered
+// by TestMarkCompleted_NoSnapshotDestroysWithoutRollback).
 func seedRunningForRecycle(t *testing.T, st *store.Store, vmid int, createdAt time.Time) {
 	t.Helper()
 	require.NoError(t, st.Insert(&store.VM{
@@ -3330,6 +3333,7 @@ func seedRunningForRecycle(t *testing.T, st *store.Store, vmid int, createdAt ti
 		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
 		State: store.StateRunning, JobID: 42, RunnerID: 7777,
 		Org: "acme", Repo: "acme/ci", CreatedAt: createdAt,
+		HasRecycleSnapshot: true,
 	}))
 }
 
@@ -3466,6 +3470,46 @@ func TestMarkCompleted_DestroyModeNeverRollsBack(t *testing.T) {
 	defer fp.mu.Unlock()
 	require.Empty(t, fp.rollbacks)
 	require.Empty(t, fp.snapshots)
+}
+
+// TestMarkCompleted_NoSnapshotDestroysWithoutRollback: a VM whose
+// clone-time snapshot failed (HasRecycleSnapshot=false) can never be
+// rolled back, so in snapshot-rollback mode MarkCompleted must send it
+// straight to the destroy path instead of attempting a rollback that is
+// certain to fail. No SnapshotRollback call must be made.
+func TestMarkCompleted_NoSnapshotDestroysWithoutRollback(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 21004, Node: "pve1", Name: "gh-runner-test-21004",
+		Profile: defaultProfileName, PoolKind: store.PoolKindHot,
+		State: store.StateRunning, JobID: 42, RunnerID: 7777,
+		Org: "acme", Repo: "acme/ci", CreatedAt: time.Now(),
+		HasRecycleSnapshot: false, // clone-time snapshot create failed
+	}))
+
+	fp := &fakeProv{}
+	orphans := &orphanRecorder{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:          0,
+		VMMaxAge:         time.Hour, // young — only the missing snapshot forces destroy
+		RecycleMode:      config.RecycleModeSnapshotRollback,
+		OnRunnerOrphaned: orphans.callback,
+	})
+
+	require.NoError(t, mgr.MarkCompleted(context.Background(), 21004))
+
+	require.Eventually(t, func() bool {
+		_, err := st.Get(21004)
+		return errors.Is(err, store.ErrNotFound)
+	}, 2*time.Second, 10*time.Millisecond, "snapshotless row was never destroyed")
+
+	// The GitHub runner is still deregistered exactly like the destroy path.
+	require.Equal(t, []int64{7777}, orphans.snapshot())
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Empty(t, fp.rollbacks, "a snapshotless VM must never attempt a rollback")
+	require.Equal(t, []int{21004}, fp.destroys)
 }
 
 // TestRunClone_SnapshotRollbackSnapshotsBeforeBoot: in snapshot mode a
