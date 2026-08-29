@@ -846,10 +846,10 @@ func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) 
 	// A repair here means the VM reached Start without a full sandbox —
 	// an adopted crash-recovery clone or a pre-feature VM — so log it at
 	// Info; the already-sandboxed common case stays at Debug.
-	if !hasGroup || !enabled || nicsPatched > 0 {
+	if !hasGroup || nicsPatched > 0 {
 		p.log.Info("firewall repaired before start",
 			"vmid", pVM.VMID, "node", pVM.Node, "security_group", p.cfg.Firewall.SecurityGroup,
-			"group_added", !hasGroup, "options_enabled", !enabled, "nics_patched", nicsPatched)
+			"group_added", !hasGroup, "nics_patched", nicsPatched)
 	} else {
 		p.log.Debug("firewall already sandboxed before start", "vmid", pVM.VMID, "node", pVM.Node)
 	}
