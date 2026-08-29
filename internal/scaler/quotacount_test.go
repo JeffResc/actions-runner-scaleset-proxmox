@@ -65,6 +65,7 @@ func TestQuotaCount_ScopeDispatch(t *testing.T) {
 		repoRet     int
 		orgRet      int
 		wantCount   int
+		wantErr     bool
 		wantRepoHit bool
 		wantOrgHit  bool
 	}{
@@ -91,12 +92,14 @@ func TestQuotaCount_ScopeDispatch(t *testing.T) {
 			wantCount: 0,
 		},
 		{
-			// The type system does not prevent an out-of-band scope; the
-			// switch falls through to (0, nil) with no lookup.
-			name:      "unknown scope falls through to (0, nil) with no lookup",
-			scope:     quotas.Scope("datacenter"),
-			bucket:    "dc1",
-			wantCount: 0,
+			// The type system does not prevent an out-of-band scope. It
+			// must fail loud, not silently return (0, nil) — a silent zero
+			// reads as "under cap" and disables throttling for the scope
+			// (#359).
+			name:    "unknown scope fails loud with no lookup",
+			scope:   quotas.Scope("datacenter"),
+			bucket:  "dc1",
+			wantErr: true,
 		},
 	}
 	for _, c := range cases {
@@ -108,8 +111,12 @@ func TestQuotaCount_ScopeDispatch(t *testing.T) {
 			s.SetQuotaCounter(counter)
 
 			got, err := s.quotaCount(c.scope, c.bucket)
-			require.NoError(t, err)
-			require.Equal(t, c.wantCount, got)
+			if c.wantErr {
+				require.Error(t, err, "an unhandled scope must fail loud, not return (0, nil)")
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, c.wantCount, got)
+			}
 
 			if c.wantRepoHit {
 				require.Equal(t, []string{c.bucket}, counter.repoCalls)

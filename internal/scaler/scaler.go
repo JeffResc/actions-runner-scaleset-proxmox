@@ -261,8 +261,15 @@ func (s *Scaler) quotaCount(scope quotas.Scope, name string) (int, error) {
 		// Caller already short-circuited on ScopeNone; defensive
 		// no-op so the exhaustive lint stays happy if recordQuota
 		// ever forgets the guard.
+		return 0, nil
+	default:
+		// A scope value outside the closed set. Fail loud rather than
+		// return (0, nil): a silent zero reads as "under cap" and would
+		// disable throttling for the whole scope. A future scope added
+		// without a case here now surfaces as a logged error instead of
+		// a silent false-negative (#359).
+		return 0, fmt.Errorf("scaler: quotaCount: unhandled quota scope %q", scope)
 	}
-	return 0, nil
 }
 
 // recordRouting consults the router (when configured) and either logs
