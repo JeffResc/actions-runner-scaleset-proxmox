@@ -1812,14 +1812,19 @@ func (m *manager) recycleOldVMs(profile string, maxAge time.Duration) {
 		if !o.CreatedAt.Before(cutoff) {
 			continue
 		}
+		// CAS from the state observed in the snapshot (Hot or Warm) to
+		// Draining. An unconditional Update would clobber a row that was
+		// acquired for a job (Hot->Assigned->Running) between ListBy...
+		// above and here, destroying a VM mid-job. Mirror shrinkHotPool's
+		// guard so the recycler only reaps rows still idle in the pool
+		// (#356/#360).
+		ok, err := m.store.UpdateState(o.VMID, o.State, store.StateDraining, nil)
+		if err != nil || !ok {
+			continue
+		}
 		m.log.Info("recycle: vm exceeded max age",
 			"vmid", o.VMID, "profile", profile, "age", time.Since(o.CreatedAt))
-		if _, err := m.store.Update(o.VMID, func(v *store.VM) {
-			v.State = store.StateDraining
-			v.StateSince = time.Now()
-		}); err == nil {
-			m.destroyAsync(o.VMID, o.Node, profile)
-		}
+		m.destroyAsync(o.VMID, o.Node, profile)
 	}
 }
 
