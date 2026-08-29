@@ -254,10 +254,15 @@ pool:
   #                       VM to the warm pool. Much faster than a full
   #                       re-clone on storage without linked clones.
   #                       Requires snapshot-capable storage (ZFS,
-  #                       LVM-thin, qcow2, Ceph RBD, ...). vm_max_age
-  #                       still forces a periodic full destroy +
-  #                       re-clone so template updates land. Rollback
-  #                       failures fall back to the destroy path.
+  #                       LVM-thin, qcow2, Ceph RBD, LINSTOR, ...).
+  #                       Storage that cannot snapshot (raw disks,
+  #                       raw-on-NFS, ...) is NOT supported: the
+  #                       clone-time snapshot fails and every VM
+  #                       silently falls back to the destroy path, so
+  #                       no recycling happens. vm_max_age still forces
+  #                       a periodic full destroy + re-clone so template
+  #                       updates land. Rollback failures fall back to
+  #                       the destroy path.
   #                       While a job runs, its VM counts as "returning
   #                       shortly", so the reconciler suppresses the
   #                       replacement clone destroy mode would dispatch
