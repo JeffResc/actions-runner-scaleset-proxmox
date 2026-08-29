@@ -86,29 +86,42 @@ that's what release automation reads.
 cmd/scaleset/       # Binary entry point (Cobra CLI)
 internal/
 ├── adminapi/       # HTTP admin/debug API (go-chi router)
-├── cluster/        # Kubernetes Lease-based leader election
+├── app/            # Process wiring: config load, leader election, worker supervision
+├── canary/         # Template canary rollouts and auto-revert
+├── cluster/        # Raft leader election + admin-API forwarder
 ├── config/         # YAML config loading and validation
-├── gh/             # GitHub Actions runner WebSocket session
+├── fileperm/       # Permission checks on operator-supplied secret files
+├── gh/             # GitHub REST reconciler (backstop for missed callbacks)
 ├── githubauth/     # GitHub App / PAT auth wiring
+├── ipam/           # IP allocation for runner NICs (noop / static)
 ├── nodeselector/   # Picks a Proxmox node for a new VM
 ├── observability/  # Prometheus metrics + OpenTelemetry tracing
 ├── pool/           # VM pool state machine (go-memdb)
-├── provisioner/    # Proxmox VM clone/start/delete operations
+├── priority/       # Priority-class matching and preemption eligibility
+├── provisioner/    # Proxmox VM clone/start/delete + guest-agent JIT injection
+├── quotas/         # Per-org / per-repo concurrency accounting
+├── router/         # Maps a job's RequestLabels to a runner profile
 ├── scaler/         # Demand-driven reconciliation loop
+├── schedule/       # Cron-driven hot/warm pool-size overrides
 ├── store/          # In-memory state (go-memdb)
-└── tags/           # Runner-label/tag matching
+├── tags/           # Proxmox tag schema for VMs owned by this scale set
+└── testutil/       # Fake Proxmox and fake GitHub servers used by tests
 ```
 
-- **cluster:** Multiple replicas run with Kubernetes Lease-based leader
-  election. The leader holds the GitHub WebSocket session and drives the
-  pool; standbys are warm spares that take over on Lease expiry.
+- **cluster:** `cluster.mode` is `standalone` (always leader) or `raft`
+  ([hashicorp/raft](https://github.com/hashicorp/raft) +
+  `raft-boltdb/v2`). Under raft, only the leader drives the control plane;
+  standbys are warm spares that rebuild state from Proxmox on promotion. The
+  admin API is bound everywhere and non-leaders reverse-proxy to the leader.
 - **pool / store:** Pool state is held in-process via
   [hashicorp/go-memdb](https://github.com/hashicorp/go-memdb) — there is
   no on-disk database.
 - **provisioner:** Talks to Proxmox via
   [go-proxmox](https://github.com/luthermonson/go-proxmox) to clone, start,
-  and delete ephemeral runner VMs.
-- **gh:** Connects to GitHub Actions using the Scaleset SDK.
+  and delete ephemeral runner VMs, and injects JIT config through the QEMU
+  guest agent.
+- **scaler:** Connects to GitHub Actions using the Scaleset SDK and pairs
+  demand with VMs.
 
 ## Testing
 
