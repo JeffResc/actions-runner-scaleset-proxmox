@@ -768,8 +768,10 @@ func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, er
 //   - a pre-feature fleet adopted after the operator turns
 //     proxmox.firewall on.
 //
-// ensureFirewall is idempotent, so the common case (a VM already
-// sandboxed by Clone) costs two GETs and performs no writes.
+// ensureFirewall is idempotent: for a VM Clone already sandboxed it
+// lists the rules (and skips re-adding the group rule) and re-patches
+// no NIC, re-applying only the firewall options — an idempotent PUT —
+// so a duplicate group rule never accumulates across starts.
 func (p *pmox) Start(ctx context.Context, vm *VM) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
@@ -801,11 +803,6 @@ func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) 
 			break
 		}
 	}
-	fwOpts, err := pVM.FirewallOptionGet(ctx)
-	if err != nil {
-		return fmt.Errorf("get firewall options on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
-	}
-	enabled := fwOpts != nil && bool(fwOpts.Enable)
 	if !hasGroup {
 		rule := &proxmox.FirewallRule{
 			Type:   "group",
@@ -817,14 +814,20 @@ func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) 
 				p.cfg.Firewall.SecurityGroup, pVM.VMID, pVM.Node, err)
 		}
 	}
-	if !enabled {
-		opts := &proxmox.FirewallVirtualMachineOption{
-			Enable: true,
-			Dhcp:   proxmox.IntOrBool(p.cfg.Firewall.DHCPOrDefault()),
-		}
-		if err := pVM.FirewallOptionSet(ctx, opts); err != nil {
-			return fmt.Errorf("enable firewall on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
-		}
+	// Firewall options are re-applied unconditionally rather than gated
+	// on a read-back: go-proxmox's FirewallOptionGet does not populate a
+	// result (it passes a nil pointer to the client, so the decode is
+	// discarded), leaving no reliable way to tell an already-enabled
+	// firewall from a fresh one. FirewallOptionSet is an idempotent PUT,
+	// so re-writing enable + dhcp on every Start is harmless — and it
+	// still runs AFTER the group rule above, preserving the ordering
+	// contract that the firewall is never enabled over an empty rule set.
+	opts := &proxmox.FirewallVirtualMachineOption{
+		Enable: true,
+		Dhcp:   proxmox.IntOrBool(p.cfg.Firewall.DHCPOrDefault()),
+	}
+	if err := pVM.FirewallOptionSet(ctx, opts); err != nil {
+		return fmt.Errorf("enable firewall on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
 	}
 	// NIC attachment: rules and options do nothing for a NIC whose net
 	// string lacks firewall=1 (it bypasses the firewall bridge). The
