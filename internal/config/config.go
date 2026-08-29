@@ -40,6 +40,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/fileperm"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
 // Duration is a [time.Duration] that decodes from a Go duration string
@@ -1671,11 +1672,31 @@ func (c *Config) validateScalesets() error {
 	}
 	seenName := make(map[string]int, len(c.Scalesets))
 	seenScope := make(map[string]int, len(c.Scalesets))
+	seenOwnerTag := make(map[string]int, len(c.Scalesets))
 	for i, s := range c.Scalesets {
 		if prev, dup := seenName[s.Name]; dup {
 			return fmt.Errorf("scalesets: duplicate name %q at indexes %d and %d", s.Name, prev, i)
 		}
 		seenName[s.Name] = i
+
+		// Distinct legal names can collapse to the same Proxmox owner
+		// tag: OwnerTag validates a permissive character set but then
+		// lowercases and folds every non-[a-z0-9] rune to '-', so
+		// "foo.bar", "foo-bar", "foo_bar", and "Foo-Bar" all sanitize to
+		// gh-scaleset-owner-foo-bar. Owner tags are the crash-recovery
+		// ownership gate (tags.IsOwnedBy), so a collision would let two
+		// scale sets claim each other's VMs. Reject at load. This also
+		// surfaces an invalid scale-set name format at config time rather
+		// than deep in app startup. (#354)
+		ownerTag, err := tags.OwnerTag(s.Name)
+		if err != nil {
+			return fmt.Errorf("scalesets[%d] %q: %w", i, s.Name, err)
+		}
+		if prev, dup := seenOwnerTag[ownerTag]; dup {
+			return fmt.Errorf("scalesets: %q and %q sanitize to the same owner tag %q — distinct names that differ only in case or punctuation collide and would let the scale sets claim each other's VMs; rename one",
+				c.Scalesets[prev].Name, s.Name, ownerTag)
+		}
+		seenOwnerTag[ownerTag] = i
 
 		hasOrg := s.Scope.Org != ""
 		hasRepo := s.Scope.Repo != ""
