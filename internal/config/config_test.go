@@ -290,6 +290,56 @@ pool:
 	require.Len(t, cfg.Scalesets, 2)
 }
 
+// TestParse_RejectsCollidingSanitizedOwnerTags pins #354: two distinct,
+// individually-legal scale-set names that sanitize to the same Proxmox
+// owner tag (here "team.a" and "team-a" both fold to
+// gh-scaleset-owner-team-a) must be rejected at load. Owner tags are the
+// crash-recovery ownership gate, so a collision would let the two scale
+// sets claim each other's VMs.
+func TestParse_RejectsCollidingSanitizedOwnerTags(t *testing.T) {
+	src := `
+github:
+  auth_mode: pat
+  pat:
+    token: testtoken
+scalesets:
+  - name: team.a
+    labels: [a]
+    max_concurrent_runners: 5
+    scope: { org: org-a }
+    vmid_range: { min: 10000, max: 14999 }
+  - name: team-a
+    labels: [b]
+    max_concurrent_runners: 5
+    scope: { org: org-b }
+    vmid_range: { min: 15000, max: 19999 }
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  auth:
+    token_id: scaleset@pve!automation
+    token_secret: testsecret
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 19999 }
+  storage: { disk: local-lvm, snippets: local }
+  network: { bridge: vmbr0 }
+nodes:
+  strategy: single
+  single_node: pve1
+pool:
+  hot_size: 2
+  warm_size: 1
+  reconcile_interval: 5s
+  vm_max_age: 12h
+  drain_timeout: 15m
+  boot_max_attempts: 3
+`
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
+	_, err := config.Parse([]byte(src))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "same owner tag")
+	require.Contains(t, err.Error(), "gh-scaleset-owner-team-a")
+}
+
 func TestParse_ProxmoxEndpointScheme(t *testing.T) {
 	cases := []struct {
 		name      string
