@@ -93,6 +93,12 @@ type fakePool struct {
 	// markCompletedErr injects a pool-side failure.
 	markedCompleted  []int
 	markCompletedErr error
+
+	// setRunnerIDCalls records every (vmid, runnerID) seen via
+	// SetRunnerID; setRunnerIDErr injects a pool-side failure so the
+	// swallowed-error path in provisionOne can be exercised.
+	setRunnerIDCalls []markedRunningCall
+	setRunnerIDErr   error
 }
 
 type markedRunningCall struct {
@@ -162,7 +168,12 @@ func (f *fakePool) MarkRunning(_ context.Context, vmid int, runnerID int64) erro
 	f.markedRunning = append(f.markedRunning, markedRunningCall{VMID: vmid, RunnerID: runnerID})
 	return f.markRunningErr
 }
-func (f *fakePool) SetRunnerID(context.Context, int, int64) error             { return nil }
+func (f *fakePool) SetRunnerID(_ context.Context, vmid int, runnerID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setRunnerIDCalls = append(f.setRunnerIDCalls, markedRunningCall{VMID: vmid, RunnerID: runnerID})
+	return f.setRunnerIDErr
+}
 func (f *fakePool) PromoteToRunning(context.Context, int, int64, int64) error { return nil }
 func (f *fakePool) ForceDestroy(context.Context, int, string) error           { return nil }
 func (f *fakePool) Preempt(context.Context, int, string) error                { return nil }
