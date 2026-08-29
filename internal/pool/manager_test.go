@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/canary"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
@@ -1302,6 +1303,66 @@ func TestReconcile_PoisonAfterMaxBootAttempts(t *testing.T) {
 		row, err := st.Get(11000)
 		return err == nil && row.State == store.StatePoison
 	}, 2*time.Second, 10*time.Millisecond)
+}
+
+// TestMarkPoisonOrDestroy_CanaryFailureCountedOncePerVMID pins #353:
+// markPoisonOrDestroy runs on every failed boot attempt and bumps
+// BootAttempts each time, but a single candidate clone must contribute
+// at most ONE failure to the canary controller. Otherwise a bad canary
+// VM with BootMaxAttempts=N adds up to N failures against its one clone,
+// so failures/clones exceeds 1.0 and the auto-revert trips far earlier
+// than canary_max_failure_rate intends.
+func TestMarkPoisonOrDestroy_CanaryFailureCountedOncePerVMID(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	require.NoError(t, st.Insert(&store.VM{
+		VMID:     12000,
+		Node:     "pve1",
+		Name:     "cand-broken",
+		Profile:  "p",
+		PoolKind: store.PoolKindWarm,
+		State:    store.StateWarm,
+		Template: string(canary.Candidate),
+	}))
+
+	ctrl, err := canary.New([]canary.ProfileConfig{{
+		Name:                  "p",
+		StableTemplateVMID:    9000,
+		CandidateTemplateVMID: 9100,
+		Percent:               100,
+		MaxFailureRate:        0.5,
+	}})
+	require.NoError(t, err)
+	ctrl.SetMinFailureSamples(1)
+	ctrl.RecordClone("p", canary.Candidate) // exactly one candidate clone
+
+	// destroyHang keeps the row alive across repeated attempts so we can
+	// drive several markPoisonOrDestroy calls against the same VMID.
+	fp := &fakeProv{destroyHang: true}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize: 0, WarmSize: 0, BootMaxAttempts: 5, Canary: ctrl,
+		Profiles: []ProfileSettings{{Name: "p", MaxConcurrentRunners: 5, BootMaxAttempts: 5}},
+	})
+
+	row, err := st.Get(12000)
+	require.NoError(t, err)
+	// Three failed boot attempts on the SAME VMID (all sub-threshold).
+	for i := 0; i < 3; i++ {
+		mgr.markPoisonOrDestroy(row)
+	}
+
+	// The row must have survived all three attempts (destroyHang blocks
+	// deletion) so BootAttempts climbed to 3 — this proves the single
+	// failure count is the dedup guard, not the row vanishing after the
+	// first attempt.
+	after, err := st.Get(12000)
+	require.NoError(t, err)
+	require.Equal(t, 3, after.BootAttempts, "all three attempts must hit the same surviving row")
+
+	status, err := ctrl.Status("p")
+	require.NoError(t, err)
+	require.Equal(t, 1, status.CanaryFailures,
+		"one clone must contribute exactly one canary failure regardless of boot retries (#353)")
 }
 
 // TestReconcile_PoisonHonorsPerProfileBootMaxAttempts asserts that a

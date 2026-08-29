@@ -2323,7 +2323,16 @@ func (m *manager) markPoisonOrDestroy(row *store.VM) {
 	// When the cumulative rate trips the operator's threshold the
 	// controller returns true and we emit the
 	// scaleset_canary_reverted_total counter.
-	if m.cfg.Canary != nil && row.Template != "" {
+	//
+	// Gate on the 0->1 BootAttempts transition so a clone contributes
+	// at most ONE failure. markPoisonOrDestroy runs once per failed
+	// boot attempt and increments BootAttempts each time, while
+	// RecordClone fires once per clone. Recording on every attempt let
+	// a single bad canary VM add up to BootMaxAttempts failures against
+	// one clone, pushing failures/clones above 1.0 and tripping the
+	// auto-revert far earlier than canary_max_failure_rate intends
+	// (#353).
+	if m.cfg.Canary != nil && row.Template != "" && updated.BootAttempts == 1 {
 		if reverted := m.cfg.Canary.RecordFailure(row.Profile, canary.Template(row.Template)); reverted {
 			m.log.Warn("canary: auto-reverted percent to 0; investigate canary template",
 				"profile", row.Profile, "vmid", row.VMID)
