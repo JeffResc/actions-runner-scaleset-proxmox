@@ -239,6 +239,11 @@ func (c *Controller) RecordClone(profile string, t Template) {
 // at least MinFailureSamples), flips Percent to 0 and returns
 // true. The caller logs / emits a metric on the true return. As
 // with RecordClone, only Candidate clones contribute.
+//
+// The rate math (failures/clones) assumes at most ONE failure per
+// clone. Callers that retry a failed boot must dedupe so a single
+// clone contributes a single failure; otherwise the rate can exceed
+// 1.0 and trip the auto-revert prematurely (#353).
 func (c *Controller) RecordFailure(profile string, t Template) bool {
 	if t != Candidate {
 		return false
