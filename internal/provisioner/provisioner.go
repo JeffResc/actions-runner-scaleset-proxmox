@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -523,9 +524,22 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		return nil, fmt.Errorf("fetch cloned vm: %w", err)
 	}
 
-	configOpts, err := buildCloneConfig(p.scaleSetName, opts)
+	configOpts, err := buildCloneConfig(p.scaleSetName, opts, p.cfg.Firewall.Enabled)
 	if err != nil {
 		return nil, err
+	}
+	if p.cfg.Firewall.Enabled {
+		// Profile NIC overrides carry firewall=1 via encodeNIC, but a
+		// template NIC that is NOT overridden is copied verbatim by
+		// the clone — and PVE only routes a NIC through the VM
+		// firewall bridge when its net string carries firewall=1.
+		// With enable=1 and rules in place but no NIC flag, filtering
+		// silently never engages: the exact "looks sandboxed, isn't"
+		// failure this feature exists to prevent. Patch every
+		// inherited net<N> in the same Config call so the flag lands
+		// atomically with the tags/overrides.
+		configOpts = append(configOpts,
+			nicFirewallPatches(newVM.VirtualMachineConfig, len(opts.NICs))...)
 	}
 	if _, err := newVM.Config(ctx, configOpts...); err != nil {
 		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
@@ -547,6 +561,16 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		}
 	}
 
+	// Per-VM firewall MUST land before the first Start below (hot-fill
+	// clones pass PoweredOn and boot inside this method): the sandbox
+	// has to be active before the runner's first instruction executes,
+	// not bolted on while it is already talking to the network.
+	if p.cfg.Firewall.Enabled {
+		if err := p.applyFirewall(ctx, newVM); err != nil {
+			return nil, fmt.Errorf("apply firewall: %w", err)
+		}
+	}
+
 	if opts.PoweredOn {
 		if err := p.startInternal(ctx, newVM); err != nil {
 			return nil, err
@@ -554,6 +578,55 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	}
 
 	return &VM{VMID: newID, Node: resultNode, Name: opts.Name}, nil
+}
+
+// applyFirewall attaches the configured datacenter security group to a
+// freshly cloned VM and enables its per-VM firewall.
+//
+// Why this exists: Proxmox does NOT copy /etc/pve/firewall/<vmid>.fw on
+// qm clone (empirically verified). The NIC's firewall=1 flag lives in
+// the VM config and IS cloned, but without per-VM firewall options and
+// rules the VM firewall stays disabled and traffic flows unfiltered. So
+// every clone gets its rules written fresh via the PVE firewall API:
+//
+//  1. POST /nodes/{node}/qemu/{vmid}/firewall/rules — the security-group
+//     rule ({"type":"group","action":"<group>","enable":1}).
+//  2. PUT  /nodes/{node}/qemu/{vmid}/firewall/options — {"enable":1}
+//     plus the dhcp toggle.
+//
+// Both endpoints are synchronous (no task to await). Ordering matters
+// within the pair too: the group rule is inserted before the firewall
+// is enabled so there is no window where an enabled firewall runs with
+// an empty rule set (default input policy DROP would black-hole DHCP).
+//
+// Failure policy: FAIL the clone (the error propagates out of Clone and
+// the pool's failed-clone path destroys the VM). A warn-and-continue
+// here would let a runner that was supposed to be sandboxed run
+// unsandboxed — the whole point of the feature is that this must never
+// happen.
+//
+// Lifecycle: on destroy PVE removes the vmid.fw file together with the
+// VM ("purge" semantics of qmdestroy); even if a stale file ever
+// survived to a future VM reusing the VMID, it would be harmless here
+// because this method rewrites fresh rules on every clone.
+func (p *pmox) applyFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) error {
+	rule := &proxmox.FirewallRule{
+		Type:   "group",
+		Action: p.cfg.Firewall.SecurityGroup,
+		Enable: 1,
+	}
+	if err := pVM.NewFirewallRule(ctx, rule); err != nil {
+		return fmt.Errorf("attach security group %q to vm %d (node %s): %w",
+			p.cfg.Firewall.SecurityGroup, pVM.VMID, pVM.Node, err)
+	}
+	fwOpts := &proxmox.FirewallVirtualMachineOption{
+		Enable: true,
+		Dhcp:   proxmox.IntOrBool(p.cfg.Firewall.DHCPOrDefault()),
+	}
+	if err := pVM.FirewallOptionSet(ctx, fwOpts); err != nil {
+		return fmt.Errorf("enable firewall on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+	}
+	return nil
 }
 
 // resolveTemplateVMID picks the source template VMID for a clone:
@@ -615,10 +688,16 @@ func buildLibCloneOptions(opts CloneOptions, templateNodeName string) *proxmox.V
 // so the orchestrator can apply everything in a single Config call
 // — keeping the tag-apply atomic with the resource override.
 //
+// firewallOn forces firewall=1 onto every rebuilt net<N> string: a
+// profile network override REPLACES the template's NIC line, so
+// without re-adding the flag here the override would silently strip
+// the template's firewall=1 and detach the VM firewall from the
+// bridge even though applyFirewall wrote rules for it.
+//
 // Disk resize is intentionally out of scope: it goes through a
 // distinct Proxmox endpoint (ResizeDisk) and is applied separately
 // after the Config call lands.
-func buildCloneConfig(scaleSetName string, opts CloneOptions) ([]proxmox.VirtualMachineOption, error) {
+func buildCloneConfig(scaleSetName string, opts CloneOptions, firewallOn bool) ([]proxmox.VirtualMachineOption, error) {
 	initial, err := tags.Initial(scaleSetName, opts.Profile, opts.TemplateClass)
 	if err != nil {
 		return nil, fmt.Errorf("compute initial tags: %w", err)
@@ -635,7 +714,7 @@ func buildCloneConfig(scaleSetName string, opts CloneOptions) ([]proxmox.Virtual
 	for i, nic := range opts.NICs {
 		configOpts = append(configOpts, proxmox.VirtualMachineOption{
 			Name:  fmt.Sprintf("net%d", i),
-			Value: encodeNIC(nic),
+			Value: encodeNIC(nic, firewallOn),
 		})
 	}
 	if opts.IPConfig != "" {
@@ -676,12 +755,87 @@ func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, er
 // Start powers on an existing VM and waits up to 5 minutes for the task to
 // settle. The VM may not yet have a working guest agent on return; call
 // WaitReady to confirm.
+//
+// When proxmox.firewall is enabled, Start re-verifies the sandbox
+// before powering on and fails rather than boot an unsandboxed VM.
+// Clone covers freshly created VMs, but VMs can reach Start without
+// ever having passed through this process's applyFirewall:
+//
+//   - crash-recovery adoption of a VM whose clone died between the
+//     qmclone task completing and applyFirewall (the pool adopts a
+//     stopped owner-tagged — or even untagged in-range — VM as Warm
+//     and later boots it via this method), and
+//   - a pre-feature fleet adopted after the operator turns
+//     proxmox.firewall on.
+//
+// ensureFirewall is idempotent, so the common case (a VM already
+// sandboxed by Clone) costs two GETs and performs no writes.
 func (p *pmox) Start(ctx context.Context, vm *VM) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		return err
 	}
+	if p.cfg.Firewall.Enabled {
+		if err := p.ensureFirewall(ctx, pVM); err != nil {
+			return fmt.Errorf("ensure firewall before start: %w", err)
+		}
+	}
 	return p.startInternal(ctx, pVM)
+}
+
+// ensureFirewall verifies that a VM carries the configured sandbox —
+// security-group rule attached, per-VM firewall options enabled, and
+// firewall=1 on every NIC — and applies whatever is missing. Same
+// ordering contract as applyFirewall: the group rule is inserted
+// before the firewall is enabled so an enabled-with-empty-rules window
+// never exists.
+func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) error {
+	rules, err := pVM.FirewallRules(ctx)
+	if err != nil {
+		return fmt.Errorf("list firewall rules on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+	}
+	hasGroup := false
+	for _, r := range rules {
+		if r.Type == "group" && r.Action == p.cfg.Firewall.SecurityGroup && r.Enable == 1 {
+			hasGroup = true
+			break
+		}
+	}
+	fwOpts, err := pVM.FirewallOptionGet(ctx)
+	if err != nil {
+		return fmt.Errorf("get firewall options on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+	}
+	enabled := fwOpts != nil && bool(fwOpts.Enable)
+	if !hasGroup {
+		rule := &proxmox.FirewallRule{
+			Type:   "group",
+			Action: p.cfg.Firewall.SecurityGroup,
+			Enable: 1,
+		}
+		if err := pVM.NewFirewallRule(ctx, rule); err != nil {
+			return fmt.Errorf("attach security group %q to vm %d (node %s): %w",
+				p.cfg.Firewall.SecurityGroup, pVM.VMID, pVM.Node, err)
+		}
+	}
+	if !enabled {
+		opts := &proxmox.FirewallVirtualMachineOption{
+			Enable: true,
+			Dhcp:   proxmox.IntOrBool(p.cfg.Firewall.DHCPOrDefault()),
+		}
+		if err := pVM.FirewallOptionSet(ctx, opts); err != nil {
+			return fmt.Errorf("enable firewall on vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+		}
+	}
+	// NIC attachment: rules and options do nothing for a NIC whose net
+	// string lacks firewall=1 (it bypasses the firewall bridge). The
+	// config was fetched by getVM just above, so it reflects current
+	// state; overridden=0 because no profile override is in play here.
+	if patches := nicFirewallPatches(pVM.VirtualMachineConfig, 0); len(patches) > 0 {
+		if _, err := pVM.Config(ctx, patches...); err != nil {
+			return fmt.Errorf("force firewall=1 on NICs of vm %d (node %s): %w", pVM.VMID, pVM.Node, err)
+		}
+	}
+	return nil
 }
 
 func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) error {
@@ -1051,11 +1205,17 @@ func isAlreadyRunning(err error) bool {
 // syntax (e.g. "virtio,bridge=vmbr0,tag=42,mtu=9000"). Empty
 // optional fields are omitted so Proxmox's defaults apply.
 //
+// firewallOn appends firewall=1 so the NIC is attached to the VM
+// firewall bridge port. Required whenever proxmox.firewall is
+// enabled: setting net<N> replaces the template's whole NIC string,
+// so omitting the flag here would drop the template's firewall=1 and
+// leave the security-group rules applied by applyFirewall inert.
+//
 // Tag semantics:
 //   - VLANUntagged == true     → no tag= attribute (untagged)
 //   - VLANTag > 0              → tag=<N>
 //   - VLANTag == 0 && !Untagged → no tag= attribute (use bridge default)
-func encodeNIC(nic CloneNIC) string {
+func encodeNIC(nic CloneNIC, firewallOn bool) string {
 	model := nic.Model
 	if model == "" {
 		model = "virtio"
@@ -1067,5 +1227,66 @@ func encodeNIC(nic CloneNIC) string {
 	if nic.MTU > 0 {
 		parts = append(parts, fmt.Sprintf("mtu=%d", nic.MTU))
 	}
+	if firewallOn {
+		parts = append(parts, "firewall=1")
+	}
 	return strings.Join(parts, ",")
+}
+
+// nicFirewallPatches returns Config options that force firewall=1 onto
+// every net<N> string in cfg that a profile override did not rebuild
+// (overridden indexes 0..overridden-1 come from encodeNIC, which
+// already appends the flag). Each NIC string is preserved verbatim —
+// model, MAC, bridge, tag, mtu — only the firewall attribute is added
+// or corrected, so a cloned NIC keeps its generated MAC address.
+//
+// Why this exists: PVE only routes a NIC through the VM firewall
+// bridge (fwbr<N>) when the NIC's net string carries firewall=1.
+// Enabling the VM firewall and attaching rules does nothing for a NIC
+// without the flag — traffic flows unfiltered with zero errors
+// anywhere. Clone uses this for template-inherited NICs;
+// ensureFirewall uses it (overridden=0) to re-verify before Start.
+func nicFirewallPatches(cfg *proxmox.VirtualMachineConfig, overridden int) []proxmox.VirtualMachineOption {
+	if cfg == nil || len(cfg.Nets) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(cfg.Nets))
+	for k := range cfg.Nets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic option order for tests and logs
+	var out []proxmox.VirtualMachineOption
+	for _, k := range keys {
+		var idx int
+		if _, err := fmt.Sscanf(k, "net%d", &idx); err == nil && idx < overridden {
+			continue // rebuilt by encodeNIC; flag already present
+		}
+		val := cfg.Nets[k]
+		if val == "" {
+			continue
+		}
+		if patched, changed := forceNICFirewallFlag(val); changed {
+			out = append(out, proxmox.VirtualMachineOption{Name: k, Value: patched})
+		}
+	}
+	return out
+}
+
+// forceNICFirewallFlag rewrites one Proxmox net<N> value so it carries
+// firewall=1: an existing firewall=... attribute is corrected in
+// place, otherwise the flag is appended. The second return reports
+// whether the string changed (false means the flag was already set).
+func forceNICFirewallFlag(nic string) (string, bool) {
+	parts := strings.Split(nic, ",")
+	for i, part := range parts {
+		key, val, ok := strings.Cut(part, "=")
+		if ok && strings.TrimSpace(key) == "firewall" {
+			if strings.TrimSpace(val) == "1" {
+				return nic, false
+			}
+			parts[i] = "firewall=1"
+			return strings.Join(parts, ","), true
+		}
+	}
+	return nic + ",firewall=1", true
 }

@@ -1259,7 +1259,7 @@ func TestBuildCloneConfig_TagsAlwaysPresent(t *testing.T) {
 	got, err := buildCloneConfig("test-scaleset", CloneOptions{
 		NewVMID: 10042,
 		Profile: "default",
-	})
+	}, false)
 	require.NoError(t, err)
 	require.NotEmpty(t, got)
 	require.Equal(t, "tags", got[0].Name, "tags must be first so it always lands")
@@ -1276,7 +1276,7 @@ func TestBuildCloneConfig_HardwareOverridesEmitted(t *testing.T) {
 		Profile:  "default",
 		CPUCores: 4,
 		MemoryMB: 8192,
-	})
+	}, false)
 	require.NoError(t, err)
 
 	names := make([]string, 0, len(got))
@@ -1300,7 +1300,7 @@ func TestBuildCloneConfig_NICsAndIPConfigStamped(t *testing.T) {
 			{Bridge: "vmbr1", VLANUntagged: true},
 		},
 		IPConfig: "ip=10.0.0.5/24,gw=10.0.0.1",
-	})
+	}, false)
 	require.NoError(t, err)
 
 	collected := make(map[string]any, len(got))
@@ -1317,7 +1317,7 @@ func TestBuildCloneConfig_NICsAndIPConfigStamped(t *testing.T) {
 // zero-valued cores/memory (which Proxmox would reject or default).
 func TestBuildCloneConfig_OmitsAbsentOverrides(t *testing.T) {
 	t.Parallel()
-	got, err := buildCloneConfig("test-scaleset", CloneOptions{NewVMID: 1, Profile: "default"})
+	got, err := buildCloneConfig("test-scaleset", CloneOptions{NewVMID: 1, Profile: "default"}, false)
 	require.NoError(t, err)
 	require.Len(t, got, 1, "no overrides → only tags")
 	require.Equal(t, "tags", got[0].Name)
@@ -1464,13 +1464,13 @@ func TestStop_TimeoutCancellationUnwinds(t *testing.T) {
 
 func TestEncodeNIC_DefaultsModelToVirtio(t *testing.T) {
 	t.Parallel()
-	got := encodeNIC(CloneNIC{Bridge: "vmbr0"})
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0"}, false)
 	require.Equal(t, "virtio,bridge=vmbr0", got)
 }
 
 func TestEncodeNIC_TaggedVLANAddsTagAttr(t *testing.T) {
 	t.Parallel()
-	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 42})
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 42}, false)
 	require.Equal(t, "virtio,bridge=vmbr0,tag=42", got)
 }
 
@@ -1478,7 +1478,7 @@ func TestEncodeNIC_UntaggedSkipsTagEvenIfTagNumberSet(t *testing.T) {
 	t.Parallel()
 	// VLANUntagged=true is the operator's explicit "no tag" — the
 	// VLANTag field is ignored when this is set.
-	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 42, VLANUntagged: true})
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 42, VLANUntagged: true}, false)
 	require.Equal(t, "virtio,bridge=vmbr0", got)
 }
 
@@ -1486,18 +1486,18 @@ func TestEncodeNIC_ZeroVLANTagSkipsAttribute(t *testing.T) {
 	t.Parallel()
 	// Tag=0 (without VLANUntagged) skips the tag= attribute so the
 	// bridge's VLAN-aware default applies.
-	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 0})
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", VLANTag: 0}, false)
 	require.Equal(t, "virtio,bridge=vmbr0", got)
 }
 
 func TestEncodeNIC_MTUJumboFrames(t *testing.T) {
 	t.Parallel()
-	got := encodeNIC(CloneNIC{Bridge: "vmbr1", VLANTag: 100, MTU: 9000})
+	got := encodeNIC(CloneNIC{Bridge: "vmbr1", VLANTag: 100, MTU: 9000}, false)
 	require.Equal(t, "virtio,bridge=vmbr1,tag=100,mtu=9000", got)
 }
 
 func TestEncodeNIC_CustomModel(t *testing.T) {
 	t.Parallel()
-	got := encodeNIC(CloneNIC{Bridge: "vmbr0", Model: "e1000"})
+	got := encodeNIC(CloneNIC{Bridge: "vmbr0", Model: "e1000"}, false)
 	require.Equal(t, "e1000,bridge=vmbr0", got)
 }
