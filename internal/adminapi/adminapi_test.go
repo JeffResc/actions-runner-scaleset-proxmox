@@ -401,6 +401,61 @@ func TestLeaderGate_LeaderServesLocally(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 }
 
+// TestLeaderGate_ForwardedRequestStillBearerCheckedByLeader pins the
+// defense-in-depth property behind the forward-before-auth design
+// (#361): the standby forwards unauthenticated requests, but the LEADER
+// they land on runs its own middleware chain and still enforces the
+// bearer token. This guards against the concentration risk that the
+// leader is the sole auth gate — a regression that let forwarded
+// requests skip the leader's requireBearerToken would serve
+// unauthenticated admin actions.
+func TestLeaderGate_ForwardedRequestStillBearerCheckedByLeader(t *testing.T) {
+	t.Parallel()
+
+	// Leader: serves locally through the full middleware chain, including
+	// the bearer check.
+	leaderPool := &fakePool{stats: pool.Stats{Hot: 3}}
+	leader, err := New(
+		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
+		func() pool.Manager { return leaderPool },
+		nil,
+		&fakeGate{isLeader: true},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	require.NoError(t, err)
+	leaderHandler := chiHandler(leader)
+
+	// Standby: forwards every request into the leader's handler chain,
+	// modelling the reverse-proxy hop without the network.
+	standby, err := New(
+		Config{HTTPAddr: "ignored", SharedSecret: "topsecret"},
+		func() pool.Manager { return &fakePool{} },
+		nil,
+		&fakeGate{isLeader: false, forward: leaderHandler.ServeHTTP},
+		nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	require.NoError(t, err)
+	standbyHandler := chiHandler(standby)
+
+	// Unauthenticated request through the standby → the leader rejects it.
+	w := httptest.NewRecorder()
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
+	standbyHandler.ServeHTTP(w, r)
+	require.Equal(t, http.StatusUnauthorized, w.Code,
+		"a forwarded request without a bearer token must still be rejected by the leader (#361)")
+
+	// Correctly-authenticated request through the standby → reaches the
+	// leader's handler.
+	w = httptest.NewRecorder()
+	r = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/admin/state", nil)
+	r.Header.Set("Authorization", "Bearer topsecret")
+	standbyHandler.ServeHTTP(w, r)
+	require.Equal(t, http.StatusOK, w.Code,
+		"a forwarded request with the correct bearer token must reach the handler")
+}
+
 // TestLeaderGate_LeaderWithoutPoolReturns503 covers the race where this
 // replica passed the leader gate but OnElected hasn't yet wired the
 // pool manager into the accessor. /admin/state must return 503 with
