@@ -309,7 +309,7 @@ func TestStampJobMetadata_ConcurrentDistinctJobs_NoHybrid(t *testing.T) {
 // hit vm_max_age (or the process restarts), rather than being drained
 // when warmSize is reduced. A human should decide whether a warm
 // shrink-to-target path is warranted.
-func TestReconcile_WarmShrinkToZero_LeavesWarmRows(t *testing.T) {
+func TestReconcile_WarmShrinkToZero_DrainsWarmRows(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	seedWarm(t, st, 5) // vmids 30000..30004, no vm_max_age set
@@ -320,16 +320,45 @@ func TestReconcile_WarmShrinkToZero_LeavesWarmRows(t *testing.T) {
 	require.NoError(t, mgr.SetTargetSizes(defaultProfileName, 0, 0))
 	mgr.reconcileOnce(context.Background())
 
-	// Give any (erroneous) async destroy time to land.
-	time.Sleep(100 * time.Millisecond)
-	fp.mu.Lock()
-	require.Empty(t, fp.destroys,
-		"warm shrink-to-zero must not (currently) destroy existing warm rows")
-	fp.mu.Unlock()
+	// shrinkWarmPool must drain the now-excess warm rows down to the new
+	// target of zero (#360), rather than leaving them until vm_max_age.
+	// Wait on the async destroy count (destroyAsync appends to
+	// fp.destroys off the dispatcher, after the synchronous CAS to
+	// Draining).
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.destroys) == 5
+	}, 3*time.Second, 10*time.Millisecond,
+		"warm shrink-to-zero must destroy all 5 excess warm rows")
 
 	warm, err := st.ListByState(store.StateWarm)
 	require.NoError(t, err)
-	require.Len(t, warm, 5, "all 5 warm rows must still be present (current behavior)")
+	require.Empty(t, warm, "no warm rows may remain after shrinking to zero")
+}
+
+// TestShrinkWarmPool_TrimsToTarget pins the partial-shrink case (#360):
+// lowering warm_size to a non-zero target drains only the excess, oldest
+// first, leaving exactly the target count.
+func TestShrinkWarmPool_TrimsToTarget(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedWarm(t, st, 5) // vmids 30000..30004
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 0, WarmSize: 2, MaxConcurrentRunners: 10})
+
+	mgr.shrinkWarmPool(defaultProfileName, 2)
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.destroys) == 3
+	}, 3*time.Second, 10*time.Millisecond,
+		"shrinkWarmPool must destroy exactly the 3 excess warm VMs")
+
+	warm, err := st.ListByState(store.StateWarm)
+	require.NoError(t, err)
+	require.Len(t, warm, 2, "exactly the target of 2 warm rows must remain")
 }
 
 // TestValidateConfig_InertPool (#360) pins that validateConfig accepts a

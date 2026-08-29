@@ -1533,6 +1533,7 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	}
 
 	m.shrinkHotPool(profile, hotSize, desired, stats.Busy())
+	m.shrinkWarmPool(profile, warmSize)
 
 	// Stuck-state sweep is fleet-wide (transient-state issues aren't
 	// profile-specific). Pin it to the default profile to avoid N
@@ -1791,6 +1792,47 @@ func (m *manager) shrinkHotPool(profile string, hotSize, desired, busy int) {
 		}
 		m.log.Info("shrink: hot pool over target; destroying excess",
 			"vmid", row.VMID, "profile", profile, "hot_size", hotSize, "target", hotTarget, "current_hot", freshStats.Hot)
+		m.destroyAsync(row.VMID, row.Node, profile)
+		killed++
+	}
+}
+
+// shrinkWarmPool destroys the oldest Warm rows when the current Warm
+// population exceeds the warm target (warmSize). Mirrors shrinkHotPool so
+// a lowered warm_size — including 0 — is honored promptly instead of
+// leaving excess warm VMs to linger until vm_max_age (#360). Warm has no
+// burst dimension (desired drives the hot pool), so the target is simply
+// warmSize. Runs after the promote/clone steps so warms consumed by
+// demand this tick aren't counted as excess. Uses a CAS (Warm->Draining)
+// so a warm VM promoted to Booting concurrently is never clobbered.
+func (m *manager) shrinkWarmPool(profile string, warmSize int) {
+	freshStats, statsErr := m.statsForProfile(profile)
+	if statsErr != nil {
+		m.log.Warn("reconcile: re-stats failed; skipping warm shrink this tick", "profile", profile, "err", statsErr)
+		return
+	}
+	if freshStats.Warm <= warmSize {
+		return
+	}
+	excess := freshStats.Warm - warmSize
+	warmRows, err := m.store.ListByProfileAndStates(profile, store.StateWarm)
+	if err != nil {
+		return
+	}
+	sort.Slice(warmRows, func(i, j int) bool {
+		return warmRows[i].CreatedAt.Before(warmRows[j].CreatedAt)
+	})
+	killed := 0
+	for _, row := range warmRows {
+		if killed >= excess {
+			break
+		}
+		ok, err := m.store.UpdateState(row.VMID, store.StateWarm, store.StateDraining, nil)
+		if err != nil || !ok {
+			continue
+		}
+		m.log.Info("shrink: warm pool over target; destroying excess",
+			"vmid", row.VMID, "profile", profile, "warm_size", warmSize, "current_warm", freshStats.Warm)
 		m.destroyAsync(row.VMID, row.Node, profile)
 		killed++
 	}
