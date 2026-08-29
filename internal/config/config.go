@@ -1485,6 +1485,23 @@ func (c *Config) Resolve() error {
 	if c.Pool.CloneInflightGrace.D() <= 0 {
 		return errors.New("pool.clone_inflight_grace must be positive")
 	}
+	// GitHub reconciler grace knobs must be strictly positive. Like the
+	// pool durations above, ApplyDefaults substituted defaults for unset
+	// fields, so a failure here means an explicit non-positive value in
+	// YAML/env (e.g. `assigned_offline_grace: 0s`) — which gh.New would
+	// otherwise silently coerce to a default rather than honor or reject.
+	if c.GitHub.PollInterval.D() <= 0 {
+		return errors.New("github.poll_interval must be positive")
+	}
+	if c.GitHub.AssignedGrace.D() <= 0 {
+		return errors.New("github.assigned_grace must be positive")
+	}
+	if c.GitHub.RunningIdleGrace.D() <= 0 {
+		return errors.New("github.running_idle_grace must be positive")
+	}
+	if c.GitHub.AssignedOfflineGrace.D() <= 0 {
+		return errors.New("github.assigned_offline_grace must be positive")
+	}
 	// RecycleMode is a closed enum; ApplyDefaults substituted "destroy"
 	// for the unset case, so anything else here is an operator typo.
 	switch c.Pool.RecycleMode {

@@ -132,7 +132,7 @@ func TestCleanupOrphanRunners_RowAppearingMidGraceIsNotDestroyed(t *testing.T) {
 	// window, but because the row now matches the runner the sweep must
 	// prune tracking and leave the live VM alone.
 	rows := []pool.RowSnapshot{{VMID: 10001, Name: name}}
-	r.now = func() time.Time { return t0.Add(2 * orphanGrace) }
+	r.now = func() time.Time { return t0.Add(2 * baseCfg().OrphanGrace) }
 	r.cleanupOrphanRunners(context.Background(), rows, runners, false)
 
 	require.NotContains(t, r.orphanFirstSeen, name, "a row that appears mid-grace must prune the orphan tracking entry")
