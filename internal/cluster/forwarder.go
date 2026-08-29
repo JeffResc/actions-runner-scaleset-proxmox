@@ -25,9 +25,11 @@ import (
 //     converges once a leader is elected.
 //   - a non-nil error (e.g. "leader raft addr has no matching HTTP peer
 //     entry" — a peer-map misconfiguration, not a transient) → 502 Bad
-//     Gateway with the error text, and the error is logged. Otherwise an
-//     operator debugging a broken peer map gets a misleading "retry"
-//     signal with nothing logged.
+//     Gateway with a generic body, and the error is logged server-side.
+//     Otherwise an operator debugging a broken peer map gets a misleading
+//     "retry" signal with nothing logged. The detail stays in the log,
+//     not the response body, so internal topology isn't leaked to clients
+//     that can reach a standby's admin port (#361).
 type Forwarder struct {
 	coord  Coordinator
 	proxy  *httputil.ReverseProxy
@@ -123,7 +125,11 @@ type lookupErrKey struct{}
 
 func (f *Forwarder) errorHandler(w http.ResponseWriter, r *http.Request, _ error) {
 	if err, ok := r.Context().Value(lookupErrKey{}).(error); ok && err != nil {
-		http.Error(w, "leader lookup error: "+err.Error(), http.StatusBadGateway)
+		// The error originates from the internal raft peer map and was
+		// already logged in rewrite. Return a generic 502 rather than
+		// reflecting the internal topology/addressing to any client that
+		// can reach the standby's admin port (#361).
+		http.Error(w, "leader lookup error", http.StatusBadGateway)
 		return
 	}
 	if v, _ := r.Context().Value(noLeaderKey{}).(bool); v {

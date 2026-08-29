@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -372,7 +373,18 @@ func NewAppFromFileWithConfig(c AppConfig, pemPath string) (Auth, error) {
 	if pemPath == "" {
 		return nil, errors.New("githubauth: pem path is required")
 	}
-	info, err := os.Stat(pemPath)
+	// Open once and fstat the file descriptor, then read from that same
+	// fd. A separate os.Stat + os.ReadFile is a stat-then-read TOCTOU:
+	// the path is resolved twice, so a symlink swapped between the two
+	// calls lets an attacker-controlled target evade the perm/ownership
+	// gate. Checking and reading through one fd binds the checks to the
+	// exact bytes we read (#361).
+	f, err := os.Open(pemPath) // #nosec G304 -- operator-supplied path; opened once and fstat-checked below to close the stat-then-read TOCTOU.
+	if err != nil {
+		return nil, fmt.Errorf("githubauth: open private key %s: %w", pemPath, err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: stat private key %s: %w", pemPath, err)
 	}
@@ -382,7 +394,7 @@ func NewAppFromFileWithConfig(c AppConfig, pemPath string) (Auth, error) {
 	if err := fileperm.CheckOwnership(info, pemPath); err != nil {
 		return nil, fmt.Errorf("githubauth: private key: %w", err)
 	}
-	pem, err := os.ReadFile(pemPath) // #nosec G304 -- pemPath is operator-supplied and perm-checked above.
+	pem, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: read private key %s: %w", pemPath, err)
 	}
