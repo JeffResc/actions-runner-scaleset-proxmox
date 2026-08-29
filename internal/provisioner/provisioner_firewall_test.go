@@ -389,3 +389,83 @@ func TestStart_FirewallDisabledMakesNoFirewallCalls(t *testing.T) {
 	require.Nil(t, got.FirewallOptions)
 	require.True(t, got.Running)
 }
+
+// ---------------------------------------------------------------------------
+// Startup security-group existence check (issue #419)
+// ---------------------------------------------------------------------------
+//
+// When proxmox.firewall is enabled the provisioner attaches a
+// type=group rule naming security_group on every clone. If that group
+// does not exist in the datacenter the rule is inert: fail-closed under
+// a DROP input policy, silently unfiltered otherwise. The provisioner
+// confirms the group exists once at startup and fails loud when it does
+// not, rather than shipping an inert rule per clone.
+
+// firewallProxmoxConfig builds the ProxmoxConfig New() needs to reach
+// the fake, with the firewall block applied.
+func firewallProxmoxConfig(url string, fw config.FirewallConfig) config.ProxmoxConfig {
+	return config.ProxmoxConfig{
+		Endpoint:           url,
+		InsecureSkipVerify: true,
+		Auth: config.ProxmoxAuth{
+			TokenID:     "scaleset@pve!automation",
+			TokenSecret: "fake-secret",
+		},
+		TemplateVMID: 9000,
+		Firewall:     fw,
+	}
+}
+
+// TestValidateFirewallSecurityGroup_PresentPasses: the configured group
+// exists in the datacenter, so validation succeeds.
+func TestValidateFirewallSecurityGroup_PresentPasses(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedSecurityGroup("gh-runner")
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
+	require.NoError(t, p.validateFirewallSecurityGroup(context.Background()))
+}
+
+// TestValidateFirewallSecurityGroup_MissingFails: a configured group
+// absent from the datacenter must fail with ErrFirewallGroupNotFound and
+// name the offending group.
+func TestValidateFirewallSecurityGroup_MissingFails(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedSecurityGroup("some-other-group") // a different group exists, not ours
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
+	err := p.validateFirewallSecurityGroup(context.Background())
+	require.ErrorIs(t, err, ErrFirewallGroupNotFound)
+	require.Contains(t, err.Error(), "gh-runner")
+}
+
+// TestValidateFirewallSecurityGroup_DisabledSkips: with the firewall
+// feature off, the check is a no-op even when no groups exist.
+func TestValidateFirewallSecurityGroup_DisabledSkips(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	p := newFirewallProvisioner(t, fp, config.FirewallConfig{Enabled: false})
+	require.NoError(t, p.validateFirewallSecurityGroup(context.Background()))
+}
+
+// TestNew_FirewallGroupMissingAbortsStartup proves New wires the check:
+// an enabled firewall whose group is missing must fail construction.
+func TestNew_FirewallGroupMissingAbortsStartup(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	cfg := firewallProxmoxConfig(fp.Server.URL, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
+	_, err := New(context.Background(), cfg, "test-scaleset", "gh-runner-test-", Options{}, quietLogger())
+	require.ErrorIs(t, err, ErrFirewallGroupNotFound)
+}
+
+// TestNew_FirewallGroupPresentSucceeds: with the group seeded, New
+// completes construction as normal.
+func TestNew_FirewallGroupPresentSucceeds(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedSecurityGroup("gh-runner")
+	cfg := firewallProxmoxConfig(fp.Server.URL, config.FirewallConfig{Enabled: true, SecurityGroup: "gh-runner"})
+	p, err := New(context.Background(), cfg, "test-scaleset", "gh-runner-test-", Options{}, quietLogger())
+	require.NoError(t, err)
+	require.NotNil(t, p)
+}

@@ -37,6 +37,13 @@ var ErrTemplateNotFound = errors.New("provisioner: template VMID not found on an
 // template's node because they reference its disks.
 var ErrLinkedCloneCrossNode = errors.New("provisioner: linked clones must target the template's node")
 
+// ErrFirewallGroupNotFound is returned by [New] when proxmox.firewall is
+// enabled but the configured security_group is absent from the
+// datacenter firewall. Failing at startup prevents every clone from
+// attaching an inert type=group rule that would leave the runner
+// unsandboxed under a permissive PVE input policy (issue #419).
+var ErrFirewallGroupNotFound = errors.New("provisioner: configured firewall security group not found in datacenter firewall")
+
 // Operational sentinels callers can errors.Is against. These wrap the
 // underlying go-proxmox / HTTP-status error so the detection live
 // inside this package — callers never have to string-match Proxmox
@@ -302,6 +309,9 @@ func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePref
 	if err := p.discoverTemplateNode(ctx); err != nil {
 		return nil, err
 	}
+	if err := p.validateFirewallSecurityGroup(ctx); err != nil {
+		return nil, err
+	}
 	// ttlcache.Start runs a background eviction loop; stop it when ctx
 	// fires. Without WithDisableTouchOnHit a read would extend the TTL,
 	// which would mask a hung Clone() exactly when the entry is supposed
@@ -477,6 +487,36 @@ func (p *pmox) discoverTemplateNode(ctx context.Context) error {
 			ErrTemplateNotFound, p.cfg.TemplateVMID, nonTemplateHits)
 	}
 	return fmt.Errorf("%w: vmid=%d", ErrTemplateNotFound, p.cfg.TemplateVMID)
+}
+
+// validateFirewallSecurityGroup confirms once, at startup, that the
+// datacenter security group named by proxmox.firewall.security_group
+// exists. A missing group is otherwise applied as an inert type=group
+// rule on every clone: fail-closed only when the PVE input policy is
+// DROP, silently unfiltered otherwise — so the runner looks sandboxed
+// but is not (issue #419). No-op when the per-VM firewall feature is
+// disabled. Config validation already rejects an enabled firewall with
+// an empty security_group; this extends that to confirm the named group
+// is real.
+func (p *pmox) validateFirewallSecurityGroup(ctx context.Context) error {
+	if !p.cfg.Firewall.Enabled {
+		return nil
+	}
+	// Cluster.New wires the client without the /cluster/status round-trip
+	// that Client.Cluster performs — FWGroups only needs the client, and
+	// the group listing is the single API call we actually require here.
+	cluster := (&proxmox.Cluster{}).New(p.cli)
+	groups, err := cluster.FWGroups(ctx)
+	if err != nil {
+		return fmt.Errorf("provisioner: list datacenter firewall security groups: %w", err)
+	}
+	for _, g := range groups {
+		if g.Group == p.cfg.Firewall.SecurityGroup {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %q (create it under Datacenter -> Firewall -> Security Group, or correct proxmox.firewall.security_group)",
+		ErrFirewallGroupNotFound, p.cfg.Firewall.SecurityGroup)
 }
 
 func isTemplate(vm *proxmox.VirtualMachine) bool {

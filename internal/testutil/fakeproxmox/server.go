@@ -121,6 +121,17 @@ func (s *Server) SeedVM(node string, vmid int, name string, running bool, tags [
 	s.store.seedVM(node, vmid, name, false, running, tags)
 }
 
+// SeedSecurityGroup registers a datacenter firewall security group so
+// GET /cluster/firewall/groups reports it. Tests seed the group the
+// orchestrator's proxmox.firewall.security_group names so the startup
+// existence check (provisioner.validateFirewallSecurityGroup) passes;
+// omitting it models the misconfigured/missing-group case.
+func (s *Server) SeedSecurityGroup(name string) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	s.store.securityGroups = append(s.store.securityGroups, name)
+}
+
 // Snapshot returns a stable, sorted view of all VMs currently in the
 // fake's state. Tests use it to assert on the orchestrator's effects.
 func (s *Server) Snapshot() []VMSnapshot { return s.store.snapshot() }
@@ -180,6 +191,7 @@ func (s *Server) routes() http.Handler {
 	})
 
 	r.Get("/version", s.handleVersion)
+	r.Get("/cluster/firewall/groups", s.handleClusterFWGroups)
 	r.Get("/nodes", s.handleListNodes)
 	r.Get("/nodes/{node}/status", s.handleNodeStatus)
 	r.Get("/nodes/{node}/qemu", s.handleListVMs)
@@ -262,6 +274,20 @@ func (s *Server) handleVersion(w http.ResponseWriter, _ *http.Request) {
 		"release": "9.0",
 		"repoid":  "fake",
 	})
+}
+
+// handleClusterFWGroups models GET /cluster/firewall/groups. go-proxmox
+// decodes the data array into []*FirewallSecurityGroup, keyed on the
+// "group" field. Backs the provisioner's startup security-group
+// existence check.
+func (s *Server) handleClusterFWGroups(w http.ResponseWriter, _ *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	out := make([]map[string]any, 0, len(s.store.securityGroups))
+	for _, name := range s.store.securityGroups {
+		out = append(out, map[string]any{"group": name})
+	}
+	writeData(w, out)
 }
 
 func (s *Server) handleListNodes(w http.ResponseWriter, _ *http.Request) {
