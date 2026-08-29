@@ -2372,6 +2372,31 @@ func TestParse_ExplicitZeroPoolDurationsRejected(t *testing.T) {
 	}
 }
 
+// TestParse_ExplicitZeroGitHubGraceRejected locks in that an operator
+// writing an explicit `0s` on a GitHub reconciler grace knob is
+// rejected at load. Previously assigned_offline_grace was unvalidated
+// here and gh.New silently coerced a non-positive value to a 2m
+// default, so `assigned_offline_grace: 0s` was quietly overridden
+// rather than honored or rejected. (#352)
+func TestParse_ExplicitZeroGitHubGraceRejected(t *testing.T) {
+	setEnv(t, map[string]string{"TEST_GH_TOKEN": "ghp_fake", "TEST_PVE_TOKEN": "pve-secret"})
+	for field, msg := range map[string]string{
+		"poll_interval":          "github.poll_interval must be positive",
+		"assigned_grace":         "github.assigned_grace must be positive",
+		"running_idle_grace":     "github.running_idle_grace must be positive",
+		"assigned_offline_grace": "github.assigned_offline_grace must be positive",
+	} {
+		t.Run(field, func(t *testing.T) {
+			bad := strings.Replace(validPATYAML,
+				"github:\n  auth_mode: pat",
+				"github:\n  "+field+": 0s\n  auth_mode: pat", 1)
+			_, err := config.Parse([]byte(bad))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), msg)
+		})
+	}
+}
+
 // TestParse_RejectsZeroMaxConcurrentInMultiScaleset confirms a
 // multi-scaleset entry with `max_concurrent_runners: 0` is rejected
 // at Parse time — the field's "required,gt=0" tag prevents a

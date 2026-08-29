@@ -160,10 +160,10 @@ func TestReconcile_OrphanPrunedWhenRowAppearsBeforeRemoveRunnerRetry(t *testing.
 //
 //   - tick 1 (online+idle, within grace): noop (waiting)
 //   - tick 2 (busy):                        promote to running
-//   - tick 3 (offline, within grace):       still noop on the
-//     now-Running row
-//     (running+offline destroys regardless of grace — pins the
-//     matrix's running+offline cell against churn)
+//   - tick 3 (offline, within grace):       noop — running+offline now
+//     honors RunningIdleGrace, so a transient offline blip on an
+//     in-flight job is NOT force-destroyed (#352)
+//   - tick 4 (offline, past grace):         destroy
 func TestReconcile_FastOnlineBusyOfflineTransitions(t *testing.T) {
 	t.Parallel()
 	// Drive the runners list dynamically so each Tick sees a
@@ -206,12 +206,20 @@ func TestReconcile_FastOnlineBusyOfflineTransitions(t *testing.T) {
 	mgr.rows[0].State = "running"
 	mgr.rows[0].StateSince = time.Now()
 
-	// Tick 3: runner now offline → running+offline must destroy
-	// regardless of grace (the matrix cell has no grace func).
+	// Tick 3: runner now offline but the row only just entered running
+	// (StateSince set above) → within RunningIdleGrace → noop. A
+	// transient offline blip must not kill an in-flight job (#352).
 	state.Store(`{"total_count":1,"runners":[{"id":111,"name":"gh-runner-test-2001","status":"offline","busy":false}]}`)
 	require.NoError(t, rec.Tick(context.Background()))
+	require.Empty(t, mgr.destroyCalls,
+		"running+offline within RunningIdleGrace must NOT destroy — protects in-flight jobs from offline blips (#352)")
+
+	// Tick 4: backdate the row past RunningIdleGrace → the offline
+	// runner is now a genuine failure → destroy.
+	mgr.rows[0].StateSince = time.Now().Add(-2 * cfg.RunningIdleGrace)
+	require.NoError(t, rec.Tick(context.Background()))
 	require.Len(t, mgr.destroyCalls, 1,
-		"running+offline destroys with no grace — fast offline transition must reach the destroy path on the next tick")
+		"running+offline past RunningIdleGrace must reach the destroy path")
 	require.Equal(t, 2001, mgr.destroyCalls[0].VMID)
 	require.Contains(t, mgr.destroyCalls[0].Reason, "runner went offline")
 }

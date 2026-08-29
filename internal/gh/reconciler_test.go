@@ -498,7 +498,7 @@ func TestReconcile_OrphanGitHubRunner_Removes(t *testing.T) {
 
 	// Advance the clock past the grace window and tick again — now the
 	// runner should be removed.
-	r.now = func() time.Time { return time.Now().Add(2 * orphanGrace) }
+	r.now = func() time.Time { return time.Now().Add(2 * baseCfg().OrphanGrace) }
 	require.NoError(t, r.Tick(context.Background()))
 	require.Equal(t, int64(999), removedID, "second tick past grace must remove the orphan")
 }
@@ -603,9 +603,11 @@ func TestCleanupOrphanRunners_PerCallTimeout(t *testing.T) {
 	t.Cleanup(func() { cleanupTimeoutPerRunner = orig })
 
 	// Spin up a GH-API stub that hangs the DELETE forever (until the
-	// reconciler's per-call ctx fires).
+	// reconciler's per-call ctx fires). baseCfg uses a repo scope, so
+	// removeRunner issues DELETE /repos/… — the handler must live under
+	// /repos/ or the request 404s instead of hanging.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/orgs/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			<-r.Context().Done()
 			return
@@ -637,6 +639,45 @@ func TestCleanupOrphanRunners_PerCallTimeout(t *testing.T) {
 	_, stillTracked := r.orphanFirstSeen["gh-runner-test-1"]
 	require.True(t, stillTracked,
 		"timed-out RemoveRunner must leave orphan in tracking for next-tick retry")
+}
+
+// TestCleanupOrphanRunners_404TreatedAsRemoved pins #352.5: when a
+// runner deregisters itself between the list and the DELETE, GitHub
+// returns 404. That 404 means the goal (no such registration) is
+// already met, so removeRunner must report success — the orphan is
+// dropped from tracking and github_errors is NOT incremented. The old
+// behavior returned the 404 as an error, so the entry stayed tracked
+// and re-warned + metered every tick forever.
+func TestCleanupOrphanRunners_404TreatedAsRemoved(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/octocat/test/actions/runners/1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+			return
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mgr := &fakeManager{rows: nil}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), metrics)
+	require.NoError(t, err)
+
+	// Pre-seed past the grace window so cleanup goes straight to RemoveRunner.
+	r.orphanFirstSeen["gh-runner-test-1"] = time.Now().Add(-time.Hour)
+	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
+	}, false)
+
+	_, stillTracked := r.orphanFirstSeen["gh-runner-test-1"]
+	require.False(t, stillTracked,
+		"a 404 (runner already gone) must drop the orphan from tracking, not retry forever")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(metrics.GitHubErrors.WithLabelValues("test", "remove_runner")),
+		"a 404 on RemoveRunner must not increment github_errors")
 }
 
 // 13. Proxmox VM exists but no DB row → reconciler destroys it.
@@ -807,6 +848,7 @@ func TestConfig_Validate(t *testing.T) {
 		{"zero poll", func(c *Config) { c.PollInterval = 0 }, true},
 		{"zero assigned grace", func(c *Config) { c.AssignedGrace = 0 }, true},
 		{"zero running grace", func(c *Config) { c.RunningIdleGrace = 0 }, true},
+		{"zero assigned offline grace", func(c *Config) { c.AssignedOfflineGrace = 0 }, true},
 		{"empty prefix", func(c *Config) { c.RunnerNamePrefix = "" }, true},
 	}
 	for _, c := range cases {
@@ -863,10 +905,10 @@ func TestStateTransitionTable_Completeness(t *testing.T) {
 
 // TestCleanupOrphanRunners_GraceWindowBoundary pins the exact
 // comparison the prune logic uses (issue #281). The code reads
-// `now.Sub(firstSeen) < orphanGrace`, so:
-//   - elapsed < orphanGrace  → still in grace, do not remove
-//   - elapsed == orphanGrace → REMOVE (boundary)
-//   - elapsed > orphanGrace  → REMOVE
+// `now.Sub(firstSeen) < OrphanGrace`, so:
+//   - elapsed < OrphanGrace  → still in grace, do not remove
+//   - elapsed == OrphanGrace → REMOVE (boundary)
+//   - elapsed > OrphanGrace  → REMOVE
 //
 // Without this test a future regression that flips ">" to ">="
 // (or vice versa) would silently change the reap moment by one
@@ -879,9 +921,9 @@ func TestCleanupOrphanRunners_GraceWindowBoundary(t *testing.T) {
 		elapsed  time.Duration
 		mustReap bool
 	}{
-		{"one_below_grace", orphanGrace - 1, false},
-		{"at_grace", orphanGrace, true},
-		{"one_past_grace", orphanGrace + 1, true},
+		{"one_below_grace", baseCfg().OrphanGrace - 1, false},
+		{"at_grace", baseCfg().OrphanGrace, true},
+		{"one_past_grace", baseCfg().OrphanGrace + 1, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -924,10 +966,10 @@ func TestCleanupOrphanRunners_GraceWindowBoundary(t *testing.T) {
 			defer mu.Unlock()
 			if tc.mustReap {
 				require.Contains(t, removed, int64(1001),
-					"elapsed=%v >= grace=%v must reap the orphan", tc.elapsed, orphanGrace)
+					"elapsed=%v >= grace=%v must reap the orphan", tc.elapsed, baseCfg().OrphanGrace)
 			} else {
 				require.NotContains(t, removed, int64(1001),
-					"elapsed=%v < grace=%v must NOT reap the orphan", tc.elapsed, orphanGrace)
+					"elapsed=%v < grace=%v must NOT reap the orphan", tc.elapsed, baseCfg().OrphanGrace)
 			}
 		})
 	}
@@ -981,9 +1023,9 @@ func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *te
 		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
 	}, false)
 
-	// Tick 3: t0+orphanGrace. A is exactly at its grace boundary → reap.
+	// Tick 3: t0+OrphanGrace. A is exactly at its grace boundary → reap.
 	// B is at 20s in → still inside its own grace.
-	r.now = func() time.Time { return t0.Add(orphanGrace) }
+	r.now = func() time.Time { return t0.Add(baseCfg().OrphanGrace) }
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-1": {ID: 1, Online: true, Busy: false},
 		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
@@ -994,9 +1036,9 @@ func TestCleanupOrphanRunners_MultipleConcurrentOrphansPrunedIndependently(t *te
 		"orphan B's grace clock must be independent — must NOT be reaped at A's expiry (issue #281)")
 	removeMu.Unlock()
 
-	// Tick 4: advance to t0 + 20s + orphanGrace. B is at its own
+	// Tick 4: advance to t0 + 20s + OrphanGrace. B is at its own
 	// boundary now → reap.
-	r.now = func() time.Time { return t0.Add(20*time.Second + orphanGrace) }
+	r.now = func() time.Time { return t0.Add(20*time.Second + baseCfg().OrphanGrace) }
 	r.cleanupOrphanRunners(context.Background(), nil, map[string]pool.RunnerInfo{
 		"gh-runner-test-2": {ID: 2, Online: true, Busy: false},
 	}, false)

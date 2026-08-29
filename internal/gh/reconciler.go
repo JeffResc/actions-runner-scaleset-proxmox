@@ -96,6 +96,9 @@ func (c Config) Validate() error {
 	if c.RunningIdleGrace <= 0 {
 		return errors.New("gh: running_idle_grace must be > 0")
 	}
+	if c.AssignedOfflineGrace <= 0 {
+		return errors.New("gh: assigned_offline_grace must be > 0")
+	}
 	if c.OrphanGrace <= 0 {
 		return errors.New("gh: orphan_grace must be > 0")
 	}
@@ -157,9 +160,6 @@ func New(cfg Config, gh *github.Client, p pool.Manager, prov provisioner.Provisi
 	if cfg.FailureBackoffMax == 0 {
 		cfg.FailureBackoffMax = 5 * time.Minute
 	}
-	if cfg.AssignedOfflineGrace == 0 {
-		cfg.AssignedOfflineGrace = 2 * time.Minute
-	}
 	return &Reconciler{
 		cfg:                    cfg,
 		gh:                     gh,
@@ -172,12 +172,6 @@ func New(cfg Config, gh *github.Client, p pool.Manager, prov provisioner.Provisi
 		now:                    time.Now,
 	}, nil
 }
-
-// orphanGrace is how long a runner must have been observed unmatched
-// against the DB before cleanup destroys its GitHub registration. Set
-// just above one PollInterval so a fresh runner that registered mid-tick
-// (before its DB row landed) gets a second tick to be matched.
-const orphanGrace = 30 * time.Second
 
 // cleanupTimeoutPerRunner caps an individual GitHub Actions
 // RemoveRunner call. A GitHub-side outage previously stalled the
@@ -518,6 +512,13 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 	{dbState: "running", ghLabel: "offline"}: {
 		op:         opDestroy,
 		destroyMsg: "running: runner went offline",
+		// A runner executing a job reports Online=false during agent
+		// restarts, network hiccups, or GitHub status-propagation lag.
+		// Without a grace window applyMatrix force-destroys the VM on the
+		// first poll that observes the blip, killing an in-flight job.
+		// Reuse RunningIdleGrace so a transient offline flap has at least
+		// one grace window to recover before we act (#352).
+		grace: func(c Config) time.Duration { return c.RunningIdleGrace },
 	},
 	{dbState: "running", ghLabel: "missing"}: {
 		op:         opDestroy,
@@ -553,7 +554,7 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 // [stateTransitionTable], and fires the cell's action. The transition
 // table is the documentation for the reconciler's behaviour.
 func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo) {
-	now := time.Now()
+	now := r.now()
 	for _, row := range rows {
 		gr, present := runners[row.Name]
 		ghLabel := ghStateLabel(gr, present)
@@ -600,9 +601,14 @@ func (r *Reconciler) promoteToRunning(ctx context.Context, row pool.RowSnapshot,
 
 // cleanupOrphanRunners removes GitHub runner registrations that match
 // our prefix but have no corresponding DB row AND have been in that
-// state for at least orphanGrace. The grace window prevents reaping a
+// state for at least OrphanGrace. The grace window prevents reaping a
 // runner that registered on GitHub microseconds before the orchestrator
 // wrote its store row — a real production race during burst scaling.
+//
+// The window is the config-driven OrphanGrace (default 60s, > one
+// PollInterval), shared with sweepProxmoxOrphans so raising
+// pool.orphan_grace widens both sweeps consistently rather than only the
+// Proxmox side (#352).
 //
 // State for the grace logic lives in r.orphanFirstSeen, which is pruned
 // here as runners reappear matched to rows.
@@ -621,10 +627,10 @@ func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSn
 		firstSeen, ok := r.orphanFirstSeen[name]
 		if !ok {
 			r.orphanFirstSeen[name] = now
-			r.log.Debug("reconcile: tracking new orphan candidate", "name", name, "grace", orphanGrace)
+			r.log.Debug("reconcile: tracking new orphan candidate", "name", name, "grace", r.cfg.OrphanGrace)
 			continue
 		}
-		if now.Sub(firstSeen) < orphanGrace {
+		if now.Sub(firstSeen) < r.cfg.OrphanGrace {
 			// Still within grace; give the next tick a chance to match.
 			continue
 		}
@@ -672,6 +678,11 @@ func (r *Reconciler) pruneOrphanTracking(known map[string]struct{}, runners map[
 // Returns nil on success (the caller drops its tracking entry) or the
 // error after recording github_errors (the caller leaves the entry for
 // a next-tick retry).
+//
+// A 404 is treated as success: the runner deregistered itself between
+// the list and remove calls, so the goal (no such registration) is
+// already met. Returning it as an error kept the orphan tracked and
+// re-warned + incremented GitHubErrors every tick forever (#352).
 func (r *Reconciler) removeRunner(ctx context.Context, id int64) error {
 	rmCtx, cancel := context.WithTimeout(ctx, cleanupTimeoutPerRunner)
 	defer cancel()
@@ -683,6 +694,10 @@ func (r *Reconciler) removeRunner(ctx context.Context, id int64) error {
 		_, err = r.gh.Actions.RemoveRunner(rmCtx, owner, repo, id)
 	}
 	if err != nil {
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response != nil && ghErr.Response.StatusCode == http.StatusNotFound {
+			return nil
+		}
 		if r.metrics != nil {
 			r.metrics.GitHubErrors.WithLabelValues(r.cfg.ScaleSetName, "remove_runner").Inc()
 		}
