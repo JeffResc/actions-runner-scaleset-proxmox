@@ -1000,12 +1000,20 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 
 // shouldRecycle decides whether a completed job's VM is rolled back to
 // its clean snapshot (true) or destroyed (false). Recycle only in
-// snapshot-rollback mode AND while the row is younger than the
-// profile's vm_max_age — an aged VM takes the full destroy path so a
-// fresh clone picks up template updates. VMMaxAge <= 0 disables the
-// age gate (matching recycleOldVMs' semantics for the sweep).
+// snapshot-rollback mode, only when the VM actually carries the clean
+// snapshot, AND while the row is younger than the profile's vm_max_age
+// — an aged VM takes the full destroy path so a fresh clone picks up
+// template updates. A VM whose clone-time snapshot failed
+// (HasRecycleSnapshot=false) is destroyed directly rather than made to
+// attempt a rollback that is certain to fail; profileReturningCredit
+// already excludes it, so its replacement was cloned during the job.
+// VMMaxAge <= 0 disables the age gate (matching recycleOldVMs'
+// semantics for the sweep).
 func (m *manager) shouldRecycle(row *store.VM) bool {
 	if !m.snapshotRecycle() {
+		return false
+	}
+	if !row.HasRecycleSnapshot {
 		return false
 	}
 	maxAge := m.cfg.VMMaxAge
