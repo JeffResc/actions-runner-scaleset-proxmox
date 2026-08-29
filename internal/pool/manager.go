@@ -1483,7 +1483,10 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 			returningCredit{recycling: credit.recycling})
 		if suppressed := (baseHot - needHot) + (baseWarm - needWarm); suppressed > 0 {
 			if m.metrics != nil {
-				m.metrics.CloneSuppressed.WithLabelValues(m.cfg.ScaleSetName, profile).Add(float64(suppressed))
+				// metricsProfile keeps this label consistent with the
+				// Recycles / RecycleFailures counters, which clamp an
+				// empty profile name to the default profile label.
+				m.metrics.CloneSuppressed.WithLabelValues(m.cfg.ScaleSetName, metricsProfile(profile)).Add(float64(suppressed))
 			}
 			m.log.Debug("reconcile: suppressed replacement clones for returning vms",
 				"profile", profile, "suppressed", suppressed,
