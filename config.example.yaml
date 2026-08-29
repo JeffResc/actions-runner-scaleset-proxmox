@@ -153,6 +153,36 @@ proxmox:
   clone:
     linked: true      # linked clones complete in 1-3s but pin to template storage
 
+  # Optional per-clone VM firewall. Proxmox does NOT copy
+  # /etc/pve/firewall/<vmid>.fw on clone, so a firewall configured on
+  # the template never reaches the runners. When enabled, every clone
+  # gets the named datacenter security group attached and its VM
+  # firewall enabled via the PVE firewall API BEFORE first start; if
+  # that fails, the clone fails (a runner meant to be sandboxed never
+  # runs unsandboxed). Rules are removed together with the VM on
+  # destroy.
+  #
+  # Prerequisites:
+  #   - The security group must already exist under Datacenter ->
+  #     Firewall -> Security Group (e.g. "gh-runner": allow DNS +
+  #     internet, drop LAN).
+  #   - The datacenter and node firewalls must be enabled for VM-level
+  #     filtering to take effect.
+  #   - The API token needs VM.Config.Network on the VM path (already
+  #     common for clone/config permissions) to manage per-VM firewall
+  #     rules and options.
+  #
+  # NIC attachment is handled automatically: every runner NIC is forced
+  # to firewall=1 on clone — profile-overridden NICs and NICs inherited
+  # from the template alike — because a NIC without that flag bypasses
+  # the VM firewall entirely even when rules are attached. No
+  # template-side NIC firewall flag is required.
+  #
+  # firewall:
+  #   enabled: true               # default false — no behavior change when absent
+  #   security_group: gh-runner   # required when enabled
+  #   dhcp: true                  # default true — allow the guest's DHCP handshake
+
 nodes:
   strategy: single                # single | round_robin | least_loaded
   members: [pve1, pve2, pve3]     # ignored for "single"

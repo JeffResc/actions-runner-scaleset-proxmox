@@ -28,7 +28,7 @@ import (
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
-	"github.com/cenkalti/backoff/v5"
+	"github.com/cenkalti/backoff/v7"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"

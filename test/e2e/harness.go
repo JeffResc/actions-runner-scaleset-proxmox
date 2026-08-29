@@ -83,6 +83,12 @@ type Options struct {
 	// omits the key so the orchestrator's default (destroy) applies.
 	RecycleMode string
 
+	// FirewallEnabled, when true, emits a proxmox.firewall block
+	// (enabled, security_group "gh-runner") so scenarios can assert
+	// per-clone firewall application. False omits the block entirely
+	// — the default zero-behavior-change path.
+	FirewallEnabled bool
+
 	// ScaleSetName is the runner-scale-set name (must match the fake's
 	// scale-set name; both default to "test-scaleset").
 	ScaleSetName string
@@ -249,6 +255,7 @@ func Start(t testing.TB, opts Options) *Harness {
 		WarmSize:             opts.WarmSize,
 		MaxConcurrentRunners: opts.MaxConcurrentRunners,
 		RecycleMode:          opts.RecycleMode,
+		FirewallEnabled:      opts.FirewallEnabled,
 		ObsAddr:              obsAddr,
 		AdminAddr:            adminAddr,
 	}
@@ -459,6 +466,7 @@ type configValues struct {
 	WarmSize             int
 	MaxConcurrentRunners int
 	RecycleMode          string // empty omits pool.recycle_mode (default destroy)
+	FirewallEnabled      bool   // emits the proxmox.firewall block when true
 	ObsAddr              string
 	AdminAddr            string
 
@@ -554,6 +562,11 @@ proxmox:
     vlan_tag: 0
   clone:
     linked: true
+{{- if .FirewallEnabled }}
+  firewall:
+    enabled: true
+    security_group: gh-runner
+{{- end }}
 nodes:
   strategy: single
   single_node: pve1

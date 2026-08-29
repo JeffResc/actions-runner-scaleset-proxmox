@@ -178,6 +178,23 @@ type profileState struct {
 	// goroutine writer don't contend on a mutex.
 	hotSize  atomic.Int32
 	warmSize atomic.Int32
+	// pendingClones counts this profile's clone dispatches that have
+	// left kickClone but have not yet inserted their Provisioning row.
+	// Neither of the reconciler's other headroom terms covers that
+	// window: the store row doesn't exist yet, and
+	// Provisioner.InFlightCloneCount only rises once execution reaches
+	// Clone() — several steps (semaphore acquire, goroutine scheduling,
+	// node selection, VMID minting) later. Without this term a tick
+	// firing inside the window re-computes the same deficit and
+	// dispatches the clones a second time, overshooting
+	// MaxConcurrentRunners until the surplus converges. Released the
+	// moment the row lands, so the count hands off to the
+	// Provisioning-row term rather than double-counting it.
+	//
+	// Per-profile rather than fleet-wide: a sibling profile's
+	// dispatches must not eat this profile's headroom, or the first
+	// profile reconciled in a tick would starve the rest of that tick.
+	pendingClones atomic.Int32
 	// refill is a per-profile signal channel so a profile's
 	// reconcile loop can be nudged without waking sibling loops.
 	refill chan struct{}
@@ -1447,7 +1464,7 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	hotSize := int(ps.hotSize.Load())
 	warmSize := int(ps.warmSize.Load())
 	desired := int(ps.desiredCount.Load())
-	inflight := m.prov.InFlightCloneCount()
+	inflight := m.prov.InFlightCloneCount() + int(ps.pendingClones.Load())
 	credit := m.profileReturningCredit(profile, ps.settings.VMMaxAge)
 	needHot, needWarm := computeCloneNeeds(stats, inflight,
 		hotProv, warmProv, hotSize, warmSize, desired, ps.settings.MaxConcurrentRunners, credit)
@@ -1552,10 +1569,13 @@ type returningCredit struct {
 // cover the larger of idle-replacement vs burst-response) are
 // testable in isolation.
 //
-// inflight is the fleet-wide Provisioner.InFlightCloneCount() — using
-// it for a single profile's headroom over-counts when other profiles
-// are cloning concurrently, but only in the safe direction (we
-// under-dispatch this profile's needed clones for one tick).
+// inflight is the count of clones already dispatched but not yet
+// represented by a store row: the fleet-wide
+// Provisioner.InFlightCloneCount() plus this profile's pendingClones
+// reservations (see the field comment). Using a fleet-wide number for
+// the first term over-counts a single profile's headroom when other
+// profiles are cloning concurrently, but only in the safe direction
+// (we under-dispatch this profile's needed clones for one tick).
 //
 // Recycle-mode credit placement — why bursts still scale up:
 //
@@ -1879,6 +1899,14 @@ func (m *manager) promoteN(_ context.Context, profile string, n int) {
 // name is stamped on the store row and threaded into CloneOptions so
 // the provisioner can apply per-profile tags and hardware overrides.
 // An empty profile name selects the default profile.
+//
+// The profile's pendingClones reservation is taken here —
+// synchronously, before the goroutine starts — so the very next
+// reconcile tick already sees this dispatch in its headroom math.
+// runClone releases it as soon as the Provisioning row exists; the
+// deferred release is the safety net for the paths that never get that
+// far (node selection failure, VMID exhaustion, panic). An unknown
+// profile reserves nothing — prepareClone logs and aborts it.
 func (m *manager) kickClone(ctx context.Context, profile string, kind store.PoolKind, poweredOn bool) {
 	if err := m.cloneSem.Acquire(ctx, 1); err != nil {
 		m.log.Debug("clone: dropping spawn (semaphore unavailable)", "profile", profile, "kind", kind, "err", err)
@@ -1886,13 +1914,19 @@ func (m *manager) kickClone(ctx context.Context, profile string, kind store.Pool
 	}
 	m.wg.Add(1)
 	var vmid int
+	releasePending := func() {}
+	if ps := m.profileOf(profile); ps != nil {
+		ps.pendingClones.Add(1)
+		releasePending = sync.OnceFunc(func() { ps.pendingClones.Add(-1) })
+	}
 	// runClone derives its own context from m.workerCtx; the caller's
 	// ctx scopes the reconcile pass, not the clone lifetime.
 	go func() { //nolint:contextcheck // clone outlives the reconcile-tick ctx
 		defer m.wg.Done()
+		defer releasePending()
 		defer func() { m.logRecoveredPanic("clone", vmid, recover()) }()
 		defer m.cloneSem.Release(1)
-		m.runClone(profile, kind, poweredOn, &vmid)
+		m.runClone(profile, kind, poweredOn, &vmid, releasePending)
 	}()
 }
 
@@ -1926,13 +1960,16 @@ type clonePrep struct {
 // clone with the matching tag. An empty profile name maps to the
 // manager's default profile.
 //
+// rowInserted is the caller's pendingClones reservation; prepareClone
+// invokes it once the Provisioning row exists.
+//
 // Body is the orchestration sequence only: prepare → call provisioner
 // → on success persist row + kick boot, on failure delegate to
 // handleCloneFailure. Per-step setup (profile lookup, node
 // selection, VMID + row insert, IPAM lease) lives in prepareClone;
 // the rollback paths share handleCloneFailure.
-func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int) {
-	prep := m.prepareClone(profile, kind, poweredOn, vmidRef)
+func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int, rowInserted func()) {
+	prep := m.prepareClone(profile, kind, poweredOn, vmidRef, rowInserted)
 	if prep == nil {
 		return
 	}
@@ -2047,7 +2084,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 // — invoked handleCloneFailure to mark the row Destroying and queue
 // a destroy. On success, the caller owns the returned prep and must
 // defer prep.cancel() / prep.span.End().
-func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int) *clonePrep {
+func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int, rowInserted func()) *clonePrep {
 	ps := m.profileOf(profile)
 	if ps == nil {
 		m.log.Warn("clone: unknown profile; aborting", "profile", profile)
@@ -2091,6 +2128,9 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		cancel()
 		return nil
 	}
+	// The Provisioning row now carries this dispatch's headroom; drop
+	// the reservation so the reconciler counts it exactly once.
+	rowInserted()
 	// Publish the allocated id to the caller so a panic later in this
 	// function logs the real vmid rather than 0.
 	if vmidRef != nil {

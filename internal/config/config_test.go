@@ -2457,3 +2457,71 @@ func TestParse_RecycleModeEnvOverride(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, config.RecycleModeSnapshotRollback, cfg.Pool.RecycleMode)
 }
+
+// ---------------------------------------------------------------------------
+// proxmox.firewall (per-clone VM firewall)
+// ---------------------------------------------------------------------------
+
+// TestParse_FirewallAbsentDefaultsDisabled: omitting the block must be a
+// zero-behavior-change no-op — disabled, empty group, dhcp default true.
+func TestParse_FirewallAbsentDefaultsDisabled(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Parse([]byte(validPATYAML))
+	require.NoError(t, err)
+	require.False(t, cfg.Proxmox.Firewall.Enabled)
+	require.Empty(t, cfg.Proxmox.Firewall.SecurityGroup)
+	require.True(t, cfg.Proxmox.Firewall.DHCPOrDefault(),
+		"dhcp defaults to true even when the block is absent")
+}
+
+// TestParse_FirewallEnabledParses: the happy-path block round-trips and
+// dhcp defaults to true when unset.
+func TestParse_FirewallEnabledParses(t *testing.T) {
+	t.Parallel()
+	src := strings.Replace(validPATYAML,
+		"  clone:    { linked: true }",
+		"  clone:    { linked: true }\n  firewall: { enabled: true, security_group: gh-runner }", 1)
+	cfg, err := config.Parse([]byte(src))
+	require.NoError(t, err)
+	require.True(t, cfg.Proxmox.Firewall.Enabled)
+	require.Equal(t, "gh-runner", cfg.Proxmox.Firewall.SecurityGroup)
+	require.True(t, cfg.Proxmox.Firewall.DHCPOrDefault(), "dhcp unset must default true")
+}
+
+// TestParse_FirewallExplicitDHCPFalse: `dhcp: false` must be
+// distinguishable from unset (the *bool pattern shared with
+// clone.linked).
+func TestParse_FirewallExplicitDHCPFalse(t *testing.T) {
+	t.Parallel()
+	src := strings.Replace(validPATYAML,
+		"  clone:    { linked: true }",
+		"  clone:    { linked: true }\n  firewall: { enabled: true, security_group: gh-runner, dhcp: false }", 1)
+	cfg, err := config.Parse([]byte(src))
+	require.NoError(t, err)
+	require.False(t, cfg.Proxmox.Firewall.DHCPOrDefault())
+}
+
+// TestParse_FirewallEnabledRequiresSecurityGroup: enabled without a
+// security group would either brick the runner's network (default DROP)
+// or sandbox nothing — reject at load time.
+func TestParse_FirewallEnabledRequiresSecurityGroup(t *testing.T) {
+	t.Parallel()
+	src := strings.Replace(validPATYAML,
+		"  clone:    { linked: true }",
+		"  clone:    { linked: true }\n  firewall: { enabled: true }", 1)
+	_, err := config.Parse([]byte(src))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "proxmox.firewall.security_group")
+}
+
+// TestParse_FirewallDisabledWithoutGroupIsFine: a scaffolded-but-disabled
+// block must not trip the security_group requirement.
+func TestParse_FirewallDisabledWithoutGroupIsFine(t *testing.T) {
+	t.Parallel()
+	src := strings.Replace(validPATYAML,
+		"  clone:    { linked: true }",
+		"  clone:    { linked: true }\n  firewall: { enabled: false }", 1)
+	cfg, err := config.Parse([]byte(src))
+	require.NoError(t, err)
+	require.False(t, cfg.Proxmox.Firewall.Enabled)
+}

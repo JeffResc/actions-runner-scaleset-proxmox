@@ -26,7 +26,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26.5'
+          go-version: '1.27.0'
           cache: true
 
       - name: Run go fmt
@@ -43,12 +43,17 @@ jobs:
       - name: Install golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.12.2
+          version: v2.13.2
           args: --timeout=5m
+          # The action's cache key does not include the golangci-lint or
+          # Go version, so a linter bump reuses stale per-package analysis
+          # results and can mask newly-added findings until the cache
+          # rolls over. Analyze fresh every run; Lint here is ~40s.
+          skip-cache: true
 
       - name: Run deadcode
         run: |
-          go install golang.org/x/tools/cmd/deadcode@v0.30.0
+          go install golang.org/x/tools/cmd/deadcode@v0.49.0
           # -test treats test files as call sites, which is required
           # for internal/testutil/ packages whose only consumers are
           # _test.go files. -tags=e2e is required for testutil helpers
@@ -71,7 +76,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26.5'
+          go-version: '1.27.0'
           cache: true
 
       - name: Run tests
@@ -135,7 +140,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26.5'
+          go-version: '1.27.0'
           cache: true
 
       - name: Run e2e tests
@@ -151,7 +156,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26.5'
+          go-version: '1.27.0'
           cache: true
 
       - name: Build binary
@@ -167,7 +172,7 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
-          version: v4.2.3
+          version: v4.2.4
 
       - name: Lint Helm chart
         run: helm lint deploy/chart

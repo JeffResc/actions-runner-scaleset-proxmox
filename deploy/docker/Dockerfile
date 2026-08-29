@@ -3,7 +3,7 @@
 # ---------- builder ----------
 # Digest-pinned for reproducible, tamper-evident builds (tags are
 # mutable). Tag kept inline for readability; bump both together.
-FROM golang:1.26.3-alpine@sha256:91eda9776261207ea25fd06b5b7fed8d397dd2c0a283e77f2ab6e91bfa71079d AS builder
+FROM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS builder
 WORKDIR /src
 RUN apk add --no-cache ca-certificates
 
@@ -28,7 +28,7 @@ RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
 
 # ---------- runtime ----------
 # Digest-pinned (see builder note). distroless, non-root, static, CGO off.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=builder /out/scaleset /usr/local/bin/scaleset
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
