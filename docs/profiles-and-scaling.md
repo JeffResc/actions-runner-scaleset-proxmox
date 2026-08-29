@@ -18,12 +18,49 @@ Other `pool:` knobs worth knowing:
 | Key | Purpose |
 | --- | --- |
 | `vm_max_age` | Idle hot/warm VMs older than this are recycled |
+| `recycle_mode` | `destroy` (default) or `snapshot_rollback` — reuse VMs by rolling back to a post-clone snapshot instead of destroying them. See [Recycling VMs with snapshot rollback](#recycling-vms-with-snapshot-rollback) |
 | `boot_max_attempts` | After this many guest-agent timeouts a VM is marked `poison` |
 | `power_poll_interval` | How often Proxmox is polled for the power state of assigned/running VMs — this is the end-of-job tail latency |
 | `vmid_reuse_cooldown` | Minimum wait before the allocator reissues a destroyed VMID, so a fresh clone doesn't race a still-settling `qmdestroy` |
 | `orphan_grace` | How long a Proxmox VM may exist without a local row before the orphan sweep destroys it |
 | `drain_timeout` | Maximum wait for running jobs on SIGTERM |
 | `global_max` | Optional fleet-wide ceiling on the sum of per-profile `max_concurrent_runners` |
+
+### Recycling VMs with snapshot rollback
+
+By default (`pool.recycle_mode: destroy`) every VM is torn down after its job
+and a replacement is cloned from the template. On storage without linked-clone
+support that costs a full disk copy per job — minutes of I/O.
+
+Set `pool.recycle_mode: snapshot_rollback` to reuse VMs instead. Each clone is
+snapshotted once (`scaleset-clean`) right after clone, while it is still stopped
+and before the runner's first boot. When a job finishes, the orchestrator rolls
+the VM back to that snapshot and returns it to the warm pool instead of
+destroying it — typically ~15s versus minutes for a full re-clone. The rollback
+resets the disk exactly like a fresh clone, so isolation between jobs is
+unchanged: the GitHub runner is deregistered and a new single-use JIT
+registration is minted for each job.
+
+- **Storage:** requires snapshot-capable storage (ZFS, LVM-thin, qcow2, Ceph
+  RBD, LINSTOR, ...). On storage that cannot snapshot (raw disks, raw-on-NFS),
+  the clone-time snapshot fails and the VM silently falls back to the destroy
+  path, so no recycling happens.
+- **Template updates still land:** `vm_max_age` still forces a periodic full
+  destroy + re-clone, so a recycled VM is eventually replaced and picks up new
+  template images. The VM's original clone time is preserved across recycles, so
+  age is measured from the first clone, not the last rollback.
+- **Fallback:** any rollback failure falls back to the destroy path, so the pool
+  self-heals with a fresh clone.
+- **Pool-level:** `recycle_mode` applies to every profile of the scale set;
+  there is no per-profile override.
+
+Metrics:
+
+| Metric | Meaning |
+| --- | --- |
+| `scaleset_recycles_total` | VMs returned to the warm pool via snapshot rollback instead of destroyed |
+| `scaleset_recycle_failures_total` | Rollbacks that failed and fell back to the destroy path |
+| `scaleset_clone_suppressed_total` | Replacement clones skipped because a busy VM will return to the pool via rollback |
 
 ## Runner profiles
 
