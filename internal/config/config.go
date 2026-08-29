@@ -1267,6 +1267,17 @@ const defaultProfileName = "default"
 
 // ApplyDefaults fills in sane defaults for optional fields.
 func (c *Config) ApplyDefaults() {
+	c.applyPoolDefaults()
+	c.applyObservabilityDefaults()
+	c.applyGitHubDefaults()
+	// Proxmox.Clone default is captured in CloneConfig.LinkedOrDefault.
+	c.applyClusterDefaults()
+	c.applyAdminAPIDefaults()
+	c.normalizeScalesets()
+}
+
+// applyPoolDefaults fills the global Pool timing/sizing knobs.
+func (c *Config) applyPoolDefaults() {
 	// Pool
 	c.Pool.ReconcileInterval.setDefault(10 * time.Second)
 	c.Pool.VMMaxAge.setDefault(24 * time.Hour)
@@ -1281,6 +1292,10 @@ func (c *Config) ApplyDefaults() {
 	if c.Pool.RecycleMode == "" {
 		c.Pool.RecycleMode = RecycleModeDestroy
 	}
+}
+
+// applyObservabilityDefaults fills the metrics/log defaults.
+func (c *Config) applyObservabilityDefaults() {
 	// Observability
 	if c.Observability.HTTPAddr == "" {
 		c.Observability.HTTPAddr = ":9100"
@@ -1291,13 +1306,20 @@ func (c *Config) ApplyDefaults() {
 	if c.Observability.LogFormat == "" {
 		c.Observability.LogFormat = "json"
 	}
+}
+
+// applyGitHubDefaults fills the GitHub reconciler timing knobs.
+func (c *Config) applyGitHubDefaults() {
 	// GitHub reconciler defaults — tuned around the production failure
 	// mode (over-provisioned runners that GitHub never assigns).
 	c.GitHub.PollInterval.setDefault(15 * time.Second)
 	c.GitHub.AssignedGrace.setDefault(5 * time.Minute)
 	c.GitHub.RunningIdleGrace.setDefault(30 * time.Second)
 	c.GitHub.AssignedOfflineGrace.setDefault(2 * time.Minute)
-	// Proxmox.Clone default is captured in CloneConfig.LinkedOrDefault.
+}
+
+// applyClusterDefaults fills the cluster mode and raft timing knobs.
+func (c *Config) applyClusterDefaults() {
 	// Cluster
 	if c.Cluster.Mode == "" {
 		c.Cluster.Mode = "standalone"
@@ -1305,6 +1327,10 @@ func (c *Config) ApplyDefaults() {
 	c.Cluster.Raft.HeartbeatTimeout.setDefault(1 * time.Second)
 	c.Cluster.Raft.ElectionTimeout.setDefault(1 * time.Second)
 	c.Cluster.Raft.CommitTimeout.setDefault(50 * time.Millisecond)
+}
+
+// applyAdminAPIDefaults fills the admin API trusted-proxy list.
+func (c *Config) applyAdminAPIDefaults() {
 	// Admin API: default trusted-proxy list to loopback. Operators
 	// terminating TLS via an in-cluster proxy can override; raft
 	// deployments where the Forwarder lives on the same pod are
@@ -1312,6 +1338,12 @@ func (c *Config) ApplyDefaults() {
 	if c.AdminAPI.TrustedProxies == nil {
 		c.AdminAPI.TrustedProxies = []string{"127.0.0.0/8", "::1/128"}
 	}
+}
+
+// normalizeScalesets folds the legacy singular form into the Scalesets
+// list, synthesises per-scaleset default profiles and inherits unset
+// sizing knobs, and keeps the legacy projections in sync.
+func (c *Config) normalizeScalesets() {
 	// Multi-scaleset normalisation (issue #1):
 	//   - If the operator wrote the legacy singular form
 	//     (`scaleset:` + top-level `profiles:` + `github.scope`),
@@ -1408,6 +1440,31 @@ func validateGitHubURLs(prefix, configURL, configBaseURL string, numScalesets in
 // already populated them. Resolve only checks that the required secret
 // fields are non-empty after the koanf merge.
 func (c *Config) Resolve() error {
+	if err := c.resolveGitHubAuth(); err != nil {
+		return err
+	}
+	if err := c.resolveProxmox(); err != nil {
+		return err
+	}
+	if err := c.resolveNodeSelector(); err != nil {
+		return err
+	}
+	if err := c.resolvePool(); err != nil {
+		return err
+	}
+	if err := c.resolveProfiles(); err != nil {
+		return err
+	}
+	// Cluster.
+	if err := c.resolveCluster(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolveGitHubAuth checks the PAT/App auth blocks and the legacy
+// github.scope invariant.
+func (c *Config) resolveGitHubAuth() error {
 	// GitHub PAT token — must be present when PAT auth is selected.
 	if c.GitHub.PAT != nil {
 		if c.GitHub.PAT.Token == "" {
@@ -1444,6 +1501,12 @@ func (c *Config) Resolve() error {
 			return errors.New("github.scope: exactly one of org or repo must be set (both are present)")
 		}
 	}
+	return nil
+}
+
+// resolveProxmox checks the required API token secret and the global
+// NIC bridge alphabet.
+func (c *Config) resolveProxmox() error {
 	// Proxmox API token secret — always required.
 	if c.Proxmox.Auth.TokenSecret == "" {
 		return errors.New("proxmox.auth.token_secret: required (set via yaml or SCALESET_PROXMOX_AUTH_TOKEN_SECRET)")
@@ -1455,6 +1518,12 @@ func (c *Config) Resolve() error {
 	if err := validateNIC("proxmox.network", c.Proxmox.Network.Bridge, c.Proxmox.Network.VLANTag, 0); err != nil {
 		return err
 	}
+	return nil
+}
+
+// resolveNodeSelector checks that the node-selection strategy has the
+// fields it needs.
+func (c *Config) resolveNodeSelector() error {
 	// Admin API shared secret — optional at config-load (the admin API
 	// itself refuses to start with an empty secret when HTTPAddr is
 	// set; see adminapi.Serve and #146 for the loud failure mode).
@@ -1469,6 +1538,11 @@ func (c *Config) Resolve() error {
 			return fmt.Errorf("nodes.members is required when strategy=%s", c.Nodes.Strategy)
 		}
 	}
+	return nil
+}
+
+// resolvePool checks the pool duration knobs and the recycle-mode enum.
+func (c *Config) resolvePool() error {
 	// Duration knobs that must be strictly positive. ApplyDefaults
 	// already substituted defaults for unset fields; the only way to
 	// fail here is an explicit non-positive value in YAML/env (e.g.
@@ -1510,6 +1584,12 @@ func (c *Config) Resolve() error {
 		return fmt.Errorf("pool.recycle_mode: unknown value %q (expected %q or %q)",
 			c.Pool.RecycleMode, RecycleModeDestroy, RecycleModeSnapshotRollback)
 	}
+	return nil
+}
+
+// resolveProfiles validates per-profile vm_max_age, refreshes the
+// legacy c.Profiles projection, and parses/validates profile schedules.
+func (c *Config) resolveProfiles() error {
 	// Profiles: per-profile vm_max_age must be positive when set.
 	// Empty inherits from pool (already applied in ApplyDefaults, so
 	// the inherit normally round-trips a positive default).
@@ -1539,10 +1619,6 @@ func (c *Config) Resolve() error {
 		if err := resolveSchedules(p.Schedules, fmt.Sprintf("profiles[%d] %q", i, p.Name)); err != nil {
 			return err
 		}
-	}
-	// Cluster.
-	if err := c.resolveCluster(); err != nil {
-		return err
 	}
 	return nil
 }
@@ -1602,51 +1678,17 @@ func (c *Config) resolveCluster() error {
 // Validate runs the struct-tag validator and any cross-field checks not
 // expressible in tags.
 func (c *Config) Validate() error {
-	v := validator.New(validator.WithRequiredStructEnabled())
-	if err := v.Struct(c); err != nil {
+	if err := c.validateStruct(); err != nil {
 		return err
 	}
-	// Only meaningful for a single scaleset: c.ScaleSet is projected from
-	// Scalesets[0] only when len(Scalesets)==1, so for N>1 its
-	// MaxConcurrentRunners stays 0 and this check would degrade to
-	// "hot+warm > 0". The authoritative per-scaleset check in
-	// validateScalesets covers every entry (including the projected
-	// singular one); guard this legacy check to the single-scaleset case.
-	if len(c.Scalesets) == 1 && c.Pool.HotSize+c.Pool.WarmSize > c.ScaleSet.MaxConcurrentRunners {
-		return fmt.Errorf("pool.hot_size+pool.warm_size (%d) must not exceed scaleset.max_concurrent_runners (%d)",
-			c.Pool.HotSize+c.Pool.WarmSize, c.ScaleSet.MaxConcurrentRunners)
+	if err := c.validateSizing(); err != nil {
+		return err
 	}
-	if c.Proxmox.TemplateVMID >= c.Proxmox.VMIDRange.Min && c.Proxmox.TemplateVMID <= c.Proxmox.VMIDRange.Max {
-		return fmt.Errorf("proxmox.template_vmid (%d) must be outside vmid_range [%d, %d]",
-			c.Proxmox.TemplateVMID, c.Proxmox.VMIDRange.Min, c.Proxmox.VMIDRange.Max)
+	if err := c.validateProxmoxSecurity(); err != nil {
+		return err
 	}
-	// A firewall block that is enabled but names no security group would
-	// enable the VM firewall with an empty rule set — with PVE's default
-	// input policy DROP that bricks the runner's network, and with a
-	// permissive policy it sandboxes nothing. Reject it at load time.
-	if c.Proxmox.Firewall.Enabled && c.Proxmox.Firewall.SecurityGroup == "" {
-		return errors.New("proxmox.firewall.security_group is required when proxmox.firewall.enabled is true")
-	}
-	// The Proxmox API token is sent in a header on every request; require
-	// https:// so the credential never traverses the wire in cleartext.
-	u, err := url.Parse(c.Proxmox.Endpoint)
-	if err != nil || u.Scheme != "https" {
-		return errors.New("proxmox.endpoint must use https:// (the API token is sent on every request and would leak in cleartext over http)")
-	}
-	for _, cidr := range c.AdminAPI.TrustedProxies {
-		if _, err := netip.ParsePrefix(cidr); err != nil {
-			return fmt.Errorf("admin_api.trusted_proxies: invalid CIDR %q: %w", cidr, err)
-		}
-	}
-	if c.AdminAPI.TLS != nil {
-		if err := c.AdminAPI.TLS.validate("admin_api.tls"); err != nil {
-			return err
-		}
-	}
-	if c.Cluster.Raft.TLS != nil {
-		if err := c.Cluster.Raft.TLS.validate("cluster.raft.tls"); err != nil {
-			return err
-		}
+	if err := c.validateTLSAndProxies(); err != nil {
+		return err
 	}
 	if err := c.validateScalesets(); err != nil {
 		return err
@@ -1668,6 +1710,75 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateProfileCanaries(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateStruct runs the struct-tag validator.
+func (c *Config) validateStruct() error {
+	v := validator.New(validator.WithRequiredStructEnabled())
+	if err := v.Struct(c); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateSizing checks the legacy hot+warm vs max_concurrent_runners
+// invariant and that the template VMID sits outside the clone range.
+func (c *Config) validateSizing() error {
+	// Only meaningful for a single scaleset: c.ScaleSet is projected from
+	// Scalesets[0] only when len(Scalesets)==1, so for N>1 its
+	// MaxConcurrentRunners stays 0 and this check would degrade to
+	// "hot+warm > 0". The authoritative per-scaleset check in
+	// validateScalesets covers every entry (including the projected
+	// singular one); guard this legacy check to the single-scaleset case.
+	if len(c.Scalesets) == 1 && c.Pool.HotSize+c.Pool.WarmSize > c.ScaleSet.MaxConcurrentRunners {
+		return fmt.Errorf("pool.hot_size+pool.warm_size (%d) must not exceed scaleset.max_concurrent_runners (%d)",
+			c.Pool.HotSize+c.Pool.WarmSize, c.ScaleSet.MaxConcurrentRunners)
+	}
+	if c.Proxmox.TemplateVMID >= c.Proxmox.VMIDRange.Min && c.Proxmox.TemplateVMID <= c.Proxmox.VMIDRange.Max {
+		return fmt.Errorf("proxmox.template_vmid (%d) must be outside vmid_range [%d, %d]",
+			c.Proxmox.TemplateVMID, c.Proxmox.VMIDRange.Min, c.Proxmox.VMIDRange.Max)
+	}
+	return nil
+}
+
+// validateProxmoxSecurity checks the firewall sandbox and the https
+// endpoint requirement.
+func (c *Config) validateProxmoxSecurity() error {
+	// A firewall block that is enabled but names no security group would
+	// enable the VM firewall with an empty rule set — with PVE's default
+	// input policy DROP that bricks the runner's network, and with a
+	// permissive policy it sandboxes nothing. Reject it at load time.
+	if c.Proxmox.Firewall.Enabled && c.Proxmox.Firewall.SecurityGroup == "" {
+		return errors.New("proxmox.firewall.security_group is required when proxmox.firewall.enabled is true")
+	}
+	// The Proxmox API token is sent in a header on every request; require
+	// https:// so the credential never traverses the wire in cleartext.
+	u, err := url.Parse(c.Proxmox.Endpoint)
+	if err != nil || u.Scheme != "https" {
+		return errors.New("proxmox.endpoint must use https:// (the API token is sent on every request and would leak in cleartext over http)")
+	}
+	return nil
+}
+
+// validateTLSAndProxies checks the admin-API trusted-proxy CIDRs and
+// the admin-API / raft TLS blocks.
+func (c *Config) validateTLSAndProxies() error {
+	for _, cidr := range c.AdminAPI.TrustedProxies {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			return fmt.Errorf("admin_api.trusted_proxies: invalid CIDR %q: %w", cidr, err)
+		}
+	}
+	if c.AdminAPI.TLS != nil {
+		if err := c.AdminAPI.TLS.validate("admin_api.tls"); err != nil {
+			return err
+		}
+	}
+	if c.Cluster.Raft.TLS != nil {
+		if err := c.Cluster.Raft.TLS.validate("cluster.raft.tls"); err != nil {
+			return err
+		}
 	}
 	return nil
 }

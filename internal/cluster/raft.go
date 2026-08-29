@@ -321,44 +321,9 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 		return nil, err
 	}
 
-	var (
-		tr      raft.Transport
-		raftErr error
-	)
-	if cfg.TestTransport != nil {
-		tr = cfg.TestTransport
-	} else {
-		advertise := cfg.AdvertiseAddr
-		if advertise == "" {
-			advertise = cfg.BindAddr
-		}
-		addr, err := net.ResolveTCPAddr("tcp", advertise)
-		if err != nil {
-			return nil, fmt.Errorf("cluster: resolve advertise %q: %w", advertise, err)
-		}
-		if cfg.TLS != nil {
-			// TLS stream layer: encrypted peer-to-peer raft RPCs.
-			// Mutual TLS is enabled when the operator's tls.Config sets
-			// ClientCAs + ClientAuth=RequireAndVerifyClientCert (the
-			// shape config.TLSConfig.BuildServerTLS produces when
-			// CAFile is set).
-			ln, lnErr := tls.Listen("tcp", cfg.BindAddr, cfg.TLS)
-			if lnErr != nil {
-				return nil, fmt.Errorf("cluster: tls listen on %s: %w", cfg.BindAddr, lnErr)
-			}
-			stream := &tlsStreamLayer{ln: ln, advertise: addr, tlsCfg: cfg.TLS}
-			tr = raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
-				Stream:  stream,
-				MaxPool: 3,
-				Timeout: 10 * time.Second,
-				Logger:  newSlogHclog(log, "raft.transport"),
-			})
-		} else {
-			tr, raftErr = raft.NewTCPTransportWithLogger(cfg.BindAddr, addr, 3, 10*time.Second, newSlogHclog(log, "raft.transport"))
-			if raftErr != nil {
-				return nil, fmt.Errorf("cluster: tcp transport on %s: %w", cfg.BindAddr, raftErr)
-			}
-		}
+	tr, err := buildTransport(cfg, log)
+	if err != nil {
+		return nil, err
 	}
 
 	if cfg.Bootstrap {
@@ -398,6 +363,48 @@ func NewRaft(cfg RaftConfig, cb Callbacks, log *slog.Logger) (Coordinator, error
 		onDeposeWait:    rcfg.HeartbeatTimeout,
 		peersByRaftAddr: peersByRaftAddr,
 	}, nil
+}
+
+// buildTransport constructs the raft transport. Tests inject a
+// TestTransport and short-circuit; production resolves the advertise
+// address and then forks on whether TLS is configured: a TLS stream
+// layer for encrypted peer-to-peer RPCs, otherwise a plain TCP
+// transport.
+func buildTransport(cfg RaftConfig, log *slog.Logger) (raft.Transport, error) {
+	if cfg.TestTransport != nil {
+		return cfg.TestTransport, nil
+	}
+	advertise := cfg.AdvertiseAddr
+	if advertise == "" {
+		advertise = cfg.BindAddr
+	}
+	addr, err := net.ResolveTCPAddr("tcp", advertise)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: resolve advertise %q: %w", advertise, err)
+	}
+	if cfg.TLS != nil {
+		// TLS stream layer: encrypted peer-to-peer raft RPCs.
+		// Mutual TLS is enabled when the operator's tls.Config sets
+		// ClientCAs + ClientAuth=RequireAndVerifyClientCert (the
+		// shape config.TLSConfig.BuildServerTLS produces when
+		// CAFile is set).
+		ln, lnErr := tls.Listen("tcp", cfg.BindAddr, cfg.TLS)
+		if lnErr != nil {
+			return nil, fmt.Errorf("cluster: tls listen on %s: %w", cfg.BindAddr, lnErr)
+		}
+		stream := &tlsStreamLayer{ln: ln, advertise: addr, tlsCfg: cfg.TLS}
+		return raft.NewNetworkTransportWithConfig(&raft.NetworkTransportConfig{
+			Stream:  stream,
+			MaxPool: 3,
+			Timeout: 10 * time.Second,
+			Logger:  newSlogHclog(log, "raft.transport"),
+		}), nil
+	}
+	tr, err := raft.NewTCPTransportWithLogger(cfg.BindAddr, addr, 3, 10*time.Second, newSlogHclog(log, "raft.transport"))
+	if err != nil {
+		return nil, fmt.Errorf("cluster: tcp transport on %s: %w", cfg.BindAddr, err)
+	}
+	return tr, nil
 }
 
 func (k *raftCoord) Run(ctx context.Context) error {

@@ -1125,45 +1125,56 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 			continue
 		}
 		for _, v := range vms {
-			vmid := int(v.VMID) // #nosec G115 -- VMIDs are bounded by VMIDRange (typically 10000..19999); overflow unreachable.
-			owned := tags.IsOwnedBy(v.Tags, p.scaleSetName)
-			// Untagged orphan detection — both predicates must hold so
-			// we never reap a human-created VM that just happens to
-			// sit in our range.
-			untaggedOrphan := !owned &&
-				p.vmNamePrefix != "" &&
-				strings.HasPrefix(v.Name, p.vmNamePrefix) &&
-				vmid >= p.cfg.VMIDRange.Min &&
-				vmid <= p.cfg.VMIDRange.Max
-			if !owned && !untaggedOrphan {
-				continue
+			if vm, keep := p.classifyVM(v, ns.Node); keep {
+				out = append(out, vm)
 			}
-			if untaggedOrphan {
-				// Suppress the warning when this VMID is currently
-				// inside a Clone() call between qmclone returning and
-				// the follow-up qmconfig tag-apply: the orchestrator
-				// already knows it owns this VM, so the "missing tag"
-				// observation is expected, not anomalous.
-				if p.inFlightClones.Has(vmid) {
-					p.log.Debug("list-owned: vm seen mid-clone; tag-apply pending",
-						"vmid", vmid, "node", ns.Node, "name", v.Name)
-				} else {
-					p.log.Warn("list-owned: untagged orphan detected (likely crash mid-clone)",
-						"vmid", vmid, "node", ns.Node, "name", v.Name)
-				}
-			}
-			// Decode the profile tag now so the adoption path can
-			// route the VM into the right per-profile pool without
-			// re-parsing the wire format. Empty string falls back to
-			// the default profile via tags.ProfileOf semantics.
-			profile := ""
-			if owned {
-				profile = tags.ProfileOf(v.Tags)
-			}
-			out = append(out, &VM{VMID: vmid, Node: ns.Node, Name: v.Name, Profile: profile})
 		}
 	}
 	return out, nil
+}
+
+// classifyVM decides whether a single scanned VM belongs to the
+// orchestrator and, when it does, builds the *VM to adopt. It returns
+// (vm, true) for a VM we own (tagged) or an untagged orphan in our
+// range, and (nil, false) for everything else. Factored out of
+// ListOwnedVMs so the node→VM sweep reads linearly.
+func (p *pmox) classifyVM(v *proxmox.VirtualMachine, node string) (*VM, bool) {
+	vmid := int(v.VMID) // #nosec G115 -- VMIDs are bounded by VMIDRange (typically 10000..19999); overflow unreachable.
+	owned := tags.IsOwnedBy(v.Tags, p.scaleSetName)
+	// Untagged orphan detection — both predicates must hold so
+	// we never reap a human-created VM that just happens to
+	// sit in our range.
+	untaggedOrphan := !owned &&
+		p.vmNamePrefix != "" &&
+		strings.HasPrefix(v.Name, p.vmNamePrefix) &&
+		vmid >= p.cfg.VMIDRange.Min &&
+		vmid <= p.cfg.VMIDRange.Max
+	if !owned && !untaggedOrphan {
+		return nil, false
+	}
+	if untaggedOrphan {
+		// Suppress the warning when this VMID is currently
+		// inside a Clone() call between qmclone returning and
+		// the follow-up qmconfig tag-apply: the orchestrator
+		// already knows it owns this VM, so the "missing tag"
+		// observation is expected, not anomalous.
+		if p.inFlightClones.Has(vmid) {
+			p.log.Debug("list-owned: vm seen mid-clone; tag-apply pending",
+				"vmid", vmid, "node", node, "name", v.Name)
+		} else {
+			p.log.Warn("list-owned: untagged orphan detected (likely crash mid-clone)",
+				"vmid", vmid, "node", node, "name", v.Name)
+		}
+	}
+	// Decode the profile tag now so the adoption path can
+	// route the VM into the right per-profile pool without
+	// re-parsing the wire format. Empty string falls back to
+	// the default profile via tags.ProfileOf semantics.
+	profile := ""
+	if owned {
+		profile = tags.ProfileOf(v.Tags)
+	}
+	return &VM{VMID: vmid, Node: node, Name: v.Name, Profile: profile}, true
 }
 
 // getVM resolves *VM into the library's *proxmox.VirtualMachine.
