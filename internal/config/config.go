@@ -2101,6 +2101,18 @@ func resolveSchedules(schedules []ScheduleConfig, prefix string) error {
 		if err != nil {
 			return fmt.Errorf("%s.schedules[%d] %q.cron: %w", prefix, i, s.Name, err)
 		}
+		// Bind the resolved timezone to the parsed schedule. scheduleParser
+		// is built without cron.WithLocation, so a parsed SpecSchedule
+		// defaults to time.Local; correct firing today only works because
+		// callers pass now.In(loc) and SpecSchedule.Next falls back to the
+		// input's location when its own is time.Local — a load-bearing
+		// coincidence a future TZ=/CRON_TZ= prefix or WithLocation change
+		// would silently break (wrong-zone firing, no error). Binding
+		// Location here makes the schedule authoritative and the config
+		// `timezone:` field win over any spec-embedded TZ. (#364)
+		if spec, ok := sched.(*cron.SpecSchedule); ok {
+			spec.Location = loc
+		}
 		s.CronSchedule = sched
 	}
 	return nil
