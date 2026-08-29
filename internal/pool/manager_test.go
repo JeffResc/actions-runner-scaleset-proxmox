@@ -2538,6 +2538,41 @@ func TestReconcileOnce_DoesNotOverProvisionWhenClonesInFlight(t *testing.T) {
 		"reconcileOnce must NOT dispatch new clones when prov.InFlightCloneCount() == HotSize — that's the previous tick's work coming through; got %d", len(fp.clones))
 }
 
+// TestReconcileOnce_DoesNotOverProvisionBeforeRowsLand covers the
+// earlier half of that same race. A clone that kickClone has already
+// dispatched is invisible to BOTH headroom terms until its goroutine
+// inserts the Provisioning row: the store has no row, and
+// InFlightCloneCount only rises once execution reaches Clone(). A tick
+// landing inside that window re-dispatched the whole deficit, pushing
+// the live VM count past MaxConcurrentRunners until the surplus
+// converged (issue #421).
+//
+// Setup: hold allocMu so every dispatched clone parks in
+// allocateVMIDAndInsertRow — exactly the invisible window — then run
+// two ticks. Only the first tick's clones may reach the provisioner.
+func TestReconcileOnce_DoesNotOverProvisionBeforeRowsLand(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:              2,
+		MaxConcurrentRunners: 4,
+		VMIDRange:            config.VMIDRange{Min: 10000, Max: 10099},
+	})
+
+	mgr.allocMu.Lock()
+	mgr.reconcileOnce(context.Background())
+	mgr.reconcileOnce(context.Background())
+	mgr.allocMu.Unlock()
+
+	require.True(t, waitForWG(&mgr.wg, 10*time.Second),
+		"kickClone goroutines did not complete in 10s")
+
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Len(t, fp.clones, 2,
+		"the second tick must count the first tick's in-flight dispatches; got %d clones for hot_size=2", len(fp.clones))
+}
+
 // ---------------------------------------------------------------------------
 // Multi-profile tests (PR 1 — issues #2 + #3)
 // ---------------------------------------------------------------------------
