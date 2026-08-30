@@ -6,8 +6,8 @@ description: |
   election; the leader holds the GitHub WebSocket session and drives
   the pool, standbys are warm spares that take over on Lease expiry.
 type: application
-version: 0.1.0
-appVersion: 0.1.0
+version: 0.1.1
+appVersion: 0.1.1
 keywords:
   - github-actions
   - proxmox
