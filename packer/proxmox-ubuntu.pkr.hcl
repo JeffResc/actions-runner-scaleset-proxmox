@@ -52,6 +52,12 @@ source "proxmox-iso" "ubuntu_2604_runner" {
 
   scsi_controller = "virtio-scsi-single"
 
+  # Disk first so the post-install reboot comes up on the installed
+  # system; the empty disk falls through to the install CD on the first
+  # boot. Without an explicit order PVE's legacy default does not reach
+  # the CD-ROM and OVMF drops to PXE.
+  boot = "order=scsi0;ide2;net0"
+
   disks {
     type         = "scsi"
     storage_pool = var.storage_pool
@@ -65,7 +71,7 @@ source "proxmox-iso" "ubuntu_2604_runner" {
   network_adapters {
     bridge   = var.network_bridge
     model    = "virtio"
-    vlan_tag = var.network_vlan_tag != 0 ? tostring(var.network_vlan_tag) : ""
+    vlan_tag = var.network_vlan_tag != 0 ? "${var.network_vlan_tag}" : ""
     firewall = false # firewall is orchestrator-level; runner VM is ephemeral
   }
 
@@ -77,13 +83,24 @@ source "proxmox-iso" "ubuntu_2604_runner" {
   # Present in the template so clones can receive (minimal) per-clone
   # configuration if needed. The orchestrator's hot/warm path injects
   # the JIT config via guest-agent file-write, not cloud-init userdata.
+  # The cloud-init drive is an `images` volume, not a snippet: it must
+  # live on the same image-capable pool as the OS disk. Pointing it at a
+  # snippets-only store makes every clone fail to start with
+  # "storage '<pool>' does not support content-type 'images'".
   cloud_init              = true
-  cloud_init_storage_pool = var.snippets_pool
+  cloud_init_storage_pool = var.storage_pool
+
+  # PVE's ciupgrade defaults to 1, which injects `package_upgrade: true`
+  # into the generated user-data. Datasource user-data merges over
+  # /etc/cloud/cloud.cfg.d, so it would override the guest-side
+  # 99-no-apt-update.cfg drop-in and apt-upgrade every clone on boot.
+  cloud_init_disable_upgrade_packages = true
 
   # ---- ISO + autoinstall ----
   # Exactly one of iso_url / iso_file must be set; Packer rejects both.
   boot_iso {
-    type             = "scsi"
+    type             = "ide"
+    index            = "2"
     iso_url          = var.iso_url
     iso_file         = var.iso_file
     iso_checksum     = var.iso_checksum
@@ -92,11 +109,23 @@ source "proxmox-iso" "ubuntu_2604_runner" {
     unmount          = true
   }
 
-  http_directory = "http"
+  # ---- autoinstall seed ----
+  # The seed rides in on a CD labelled `cidata` rather than Packer's
+  # built-in HTTP server: `nocloud-net` needs the installer VM to reach
+  # back to the machine running Packer, which does not hold when PVE is
+  # remote. Packer builds this ISO locally and uploads it.
+  additional_iso_files {
+    type             = "ide"
+    index            = "0"
+    cd_files         = ["./http/meta-data", "./http/user-data"]
+    cd_label         = "cidata"
+    iso_storage_pool = var.iso_storage_pool
+    unmount          = true
+  }
 
   boot_command = [
     "c<wait>",
-    "linux /casper/vmlinuz --- autoinstall ds=\"nocloud-net;s=http://{{ .HTTPIP }}:{{ .HTTPPort }}/\"",
+    "linux /casper/vmlinuz --- autoinstall ds=nocloud",
     "<enter><wait>",
     "initrd /casper/initrd",
     "<enter><wait>",

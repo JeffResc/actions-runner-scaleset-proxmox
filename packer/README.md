@@ -24,6 +24,7 @@ ephemeral GitHub Actions runners.
 | SSH | **Removed** — `openssh-server` is purged. Operator access via Proxmox console or `qm guest exec`. |
 | Build user | Locked + removed from `sudo` group as the final provisioning step. |
 | Runner user | Non-root (`runner`), no password, NOPASSWD sudo restricted to that account. |
+| Runner service sandbox | **None** — the isolation boundary is the single-use VM. systemd sandboxing (`NoNewPrivileges`, `ProtectSystem`, `Protect*Kernel*`) breaks `sudo` and ordinary CI toolchain installers for no real containment gain. |
 | Network firewall | Off (ephemeral VMs; firewall is enforced at the Proxmox/network level). |
 | Kernel sysctls | rp_filter, no redirects, syncookies, kptr_restrict=2, dmesg_restrict, BPF lockdown, protected hardlinks/symlinks/fifos/regular. |
 | Snap / unattended-upgrades / iscsi / multipath / ModemManager | Removed or masked. |
@@ -84,9 +85,10 @@ security updates land — ephemeral VMs deliberately have no
 - The Subiquity password hash in [http/user-data](http/user-data) corresponds to
   the literal string `ubuntu`. It's only valid during the Packer build window;
   the build user is locked before the template is finalized.
-- Tighten `gh-runner.service` (in [files/](files/)) further if your workflows
-  don't need namespace/SUID flexibility (Docker-in-Docker, podman, mount, etc.
-  routinely need them).
+- `gh-runner.service` (in [files/](files/)) runs the runner unsandboxed, the
+  same posture as a GitHub-hosted runner. Add systemd hardening back only if
+  you know your workflows never need `sudo`, kernel modules, cgroup writes, or
+  writes outside the runner's own tree.
 - If you need a `arm64` template, set `runner_arch = "arm64"` and switch the
   ISO URL/checksum to the arm64 release; ensure your Proxmox node supports
   arm64 emulation (or runs on arm64 hardware).
