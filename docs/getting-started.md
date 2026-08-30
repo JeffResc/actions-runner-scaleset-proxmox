@@ -150,7 +150,8 @@ observability:
 
 **The config file must be mode `0600` and owned by the user the orchestrator
 runs as.** It holds credentials, so the loader refuses to read a file that is
-group- or world-readable:
+world-readable, or that the process can reach neither as owner nor through
+one of its groups:
 
 ```sh
 chmod 600 config.yaml
@@ -227,11 +228,12 @@ connected and crash recovery finished. Check the logs for GitHub auth failures
 PVE uses a self-signed certificate, either trust the CA or set
 `proxmox.insecure_skip_verify: true`.
 
-**`config: fileperm: ... has insecure mode 0644`.** The config file is
-group- or world-readable. `chmod 600 config.yaml`. The same check rejects a
-file owned by a different UID than the process — under Docker the image runs
-as `nonroot` (UID 65532), so a bind-mounted config must be owned by that UID
-or you must run the container as your own UID with `--user "$(id -u):$(id -g)"`.
+**`config: fileperm: ... is accessible by other`.** The config file grants
+access to "other". `chmod 600 config.yaml`. The same check rejects a file the
+process can reach neither as owner nor through one of its groups — under
+Docker the image runs as `nonroot` (UID 65532), so a bind-mounted config must
+be owned by that UID or you must run the container as your own UID with
+`--user "$(id -u):$(id -g)"`.
 
 **Config rejected at startup.** Validation is strict and runs before anything
 connects, so the error names the offending key. Also watch for the warning

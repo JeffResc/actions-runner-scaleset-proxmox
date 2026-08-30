@@ -27,6 +27,12 @@ For anything beyond a dev cluster, use a `values.yaml` file. See [values.yaml](v
 
 Set `secrets.existingSecret` to a Secret name you provision separately (SealedSecrets, external-secrets, etc.). The chart will then skip its convenience Secret. Required keys: `SCALESET_GITHUB_PAT_TOKEN`, `SCALESET_PROXMOX_AUTH_TOKEN_SECRET`, and (when `admin_api` is enabled) `SCALESET_ADMIN_API_SHARED_SECRET`. These are the canonical koanf env-override names — the orchestrator picks them up automatically from the matching `SCALESET_<yaml.path.uppercased>` env var, no yaml change needed.
 
+## Config file permissions
+
+The orchestrator refuses to read a `config.yaml` that grants any access to "other", and it must be able to reach the file as the owner or through one of its groups. Kubernetes cannot set the owner UID of a projected volume, so the chart mounts the ConfigMap with `defaultMode: 0440` and relies on `podSecurityContext.fsGroup` to make the pod's group the file's group owner.
+
+Those two settings only work as a pair. Dropping `fsGroup`, or overriding `defaultMode` back to Kubernetes' `0644` default, makes the pod fail at startup with a `config: fileperm:` error before it contacts Proxmox or GitHub.
+
 ## Rollouts and draining
 
 The default `RollingUpdate` strategy (`maxSurge: 1`, `maxUnavailable: 0`) brings the new pod up and waits for it to become ready before tearing the old one down. The old pod receives SIGTERM and drains — no new jobs accepted, running jobs allowed to finish, idle pool VMs destroyed. `terminationGracePeriodSeconds` must exceed `scalesetConfig.pool.drain_timeout`; the default values keep both aligned at 30 minutes.

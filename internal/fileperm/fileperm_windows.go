@@ -9,3 +9,8 @@ import "os"
 // the POSIX UID model used by the unix implementation. CheckMode is
 // still applied by callers and bounds the blast radius.
 func CheckOwnership(_ os.FileInfo, _ string) error { return nil }
+
+// CheckAccess is a no-op on Windows for the same reason as
+// CheckOwnership: the unix implementation reasons about POSIX UIDs,
+// GIDs, and mode bits, none of which map onto Windows ACLs.
+func CheckAccess(_ os.FileInfo, _ string) error { return nil }

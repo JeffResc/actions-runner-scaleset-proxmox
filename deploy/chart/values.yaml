@@ -78,6 +78,10 @@ resources:
     cpu: 500m
     memory: 512Mi
 
+# fsGroup is load-bearing: the config ConfigMap is mounted 0440 and the
+# kubelet applies fsGroup as its group owner. Without fsGroup the file
+# is root:root 0440, the container user cannot open it, and the pod
+# crash-loops. Change runAsUser/fsGroup together, never one alone.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532                # nobody-equivalent; image must support it

@@ -1021,18 +1021,16 @@ type ClusterRaftPeer struct {
 func Load(path string) (*Config, error) {
 	// The config file holds the Proxmox API token, GitHub webhook
 	// secret, and admin bearer — the same class of credential the App
-	// PEM already protects. Refuse to read when the file is world- or
-	// group-readable (mode > 0o600) or owned by a UID other than the
-	// process's effective UID. Surfacing the misconfiguration at
-	// startup is better than after the secret has been exfiltrated.
+	// PEM already protects. Refuse to read when the file grants any
+	// access to "other", or when this process can reach it neither as
+	// its owner nor through a group it belongs to. Surfacing the
+	// misconfiguration at startup is better than after the secret has
+	// been exfiltrated.
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: stat %s: %w", path, err)
 	}
-	if err := fileperm.CheckMode(info, path, 0o600); err != nil {
-		return nil, fmt.Errorf("config: %w", err)
-	}
-	if err := fileperm.CheckOwnership(info, path); err != nil {
+	if err := fileperm.CheckAccess(info, path); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	// koanf's file provider re-reads the file inside k.Load. The
