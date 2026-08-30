@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.1](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.0...actions-runner-scaleset-proxmox-v0.1.1) (2026-08-30)
+
+
+### Bug Fixes
+
+* **config:** accept group-reachable secret files so Kubernetes ConfigMap mounts load ([54ae0f8](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/54ae0f89a3cd0e8b689b5719611b1d5c974aa917))
+* **config:** accept group-reachable secret files so Kubernetes ConfigMap mounts load ([ada6bab](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/ada6babfb0298f6266081902fb35056b942b34eb))
+* **packer:** remove sandboxing, update/upgrade on install, provision … ([43477c6](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/43477c626b369695c18feb3e8e284a1f3eb4ccff))
+* **packer:** remove sandboxing, update/upgrade on install, provision without local networking ([9277903](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/92779036d4aae9122a9595b6a689dd42155ba541))
+
 ## 0.1.0 (2026-08-29)
 
 
