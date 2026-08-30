@@ -39,8 +39,9 @@ is all that's needed. See
 [deploy/docker/Dockerfile](../deploy/docker/Dockerfile).
 
 The image is distroless and runs as `nonroot` (UID 65532). The config loader
-requires the file to be mode `0600` and owned by the running UID, so either
-`chown` the file to 65532 or override the container's user as above.
+refuses a file that grants any access to "other", and the running UID must
+reach it as the owner or through one of its groups — so either `chown` the
+file to 65532 or override the container's user as above.
 
 ## systemd
 
@@ -59,7 +60,8 @@ sudo systemctl enable --now scaleset
 
 The config file must be mode `0600` and owned by the user in the unit's
 `User=` — it holds credentials, and the loader refuses to read a file that is
-group- or world-readable or owned by another UID.
+world-readable or that the running user can reach neither as owner nor
+through one of its groups.
 
 Secrets go in `/etc/scaleset/env` (also 0600, never committed):
 
@@ -89,14 +91,6 @@ the bundled `helm test` smoke tests.
 > `cluster.mode: standalone`, in which every process believes it is leader.
 > Raising the replica count would have each replica drive the pool
 > independently. See below for what real HA requires.
-
-> **Known issue:** the chart mounts `config.yaml` from a ConfigMap without a
-> `defaultMode`, so the file lands at mode `0644` owned by UID 0, while the
-> container runs as UID 65532. The config loader requires mode `0600` and an
-> owner matching the running UID, so the pod fails at startup with
-> `config: fileperm: ... has insecure mode 0644`. Until the chart is fixed,
-> deploy via Docker or systemd, or supply your own pod spec that stages the
-> config into an `emptyDir` with the correct mode and ownership.
 
 ## High availability with Raft
 

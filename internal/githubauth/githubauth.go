@@ -388,10 +388,7 @@ func NewAppFromFileWithConfig(c AppConfig, pemPath string) (Auth, error) {
 	if err != nil {
 		return nil, fmt.Errorf("githubauth: stat private key %s: %w", pemPath, err)
 	}
-	if err := fileperm.CheckMode(info, pemPath, 0o600); err != nil {
-		return nil, fmt.Errorf("githubauth: private key: %w", err)
-	}
-	if err := fileperm.CheckOwnership(info, pemPath); err != nil {
+	if err := fileperm.CheckAccess(info, pemPath); err != nil {
 		return nil, fmt.Errorf("githubauth: private key: %w", err)
 	}
 	pem, err := io.ReadAll(f)

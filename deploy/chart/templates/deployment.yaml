@@ -123,6 +123,14 @@ spec:
         - name: config
           configMap:
             name: {{ include "scaleset.fullname" . }}-config
+            # config.yaml carries no secrets (those arrive as env vars from
+            # the Secret), but the orchestrator still refuses to read a
+            # config file that grants access to "other". The kubelet writes
+            # projected files owned by root and applies fsGroup as the group
+            # owner, so 0440 + podSecurityContext.fsGroup is the only shape
+            # a non-root container can both reach and pass the check with.
+            # Leaving this at the 0644 default makes the pod crash-loop.
+            defaultMode: 0440
         - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}
