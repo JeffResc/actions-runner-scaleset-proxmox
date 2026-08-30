@@ -35,24 +35,17 @@ ExecStopPost=+/usr/bin/systemctl poweroff
 Restart=no
 TimeoutStartSec=0
 
-# Hardening — these are conservative enough that most CI workloads still
-# work. Loosen on a per-deployment basis if a specific workflow needs
-# more (e.g. mounting block devices, modifying kernel modules).
-NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=/opt/actions-runner /home/runner /tmp /var/tmp
-PrivateTmp=true
-ProtectKernelTunables=true
-ProtectKernelLogs=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-# docker/podman in CI need access to namespaces.
-RestrictNamespaces=false
-# Some build tools legitimately use setuid/setgid binaries.
-RestrictSUIDSGID=false
-LockPersonality=true
-SystemCallArchitectures=native
+# No systemd sandboxing. The isolation boundary for this design is the
+# single-use VM, which is destroyed after one job — a sandbox around the
+# runner process adds no meaningful containment while breaking ordinary
+# CI. In particular NoNewPrivileges=true makes the setuid transition
+# impossible, so the runner user's NOPASSWD sudo (installed by
+# provision.sh) can never escalate and every `sudo` in a workflow fails
+# with "the 'no new privileges' flag is set"; ProtectSystem/ProtectHome
+# and the Protect*Kernel* family block the /etc, /nix, kernel-module and
+# cgroup writes that toolchain installers and container runtimes make.
+# This matches how GitHub-hosted runners behave: an unprivileged user
+# with passwordless sudo, no sandbox.
 
 [Install]
 # Triggered by the path unit, not WantedBy=multi-user.target.

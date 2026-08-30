@@ -42,6 +42,14 @@ export DEBIAN_FRONTEND=noninteractive
 # -----------------------------------------------------------------------------
 log "updating apt cache + installing baseline packages"
 apt-get update
+
+# Bake the updates in here rather than paying for them on every clone's
+# first boot. Clones deliberately run no apt at boot (cloud-init apt is
+# disabled below, ciupgrade=0 on the template, apt-daily masked), so the
+# template rebuild is the only place updates land.
+log "upgrading base image packages"
+apt-get dist-upgrade -y
+
 apt-get install -y --no-install-recommends \
     qemu-guest-agent \
     ca-certificates \
