@@ -84,6 +84,11 @@ All metrics are namespaced `scaleset_`. Every per-scale-set metric carries
   queue with no other symptom: the listener stays connected, the pool stays
   idle, and `/readyz` stays green.
 
+- `rate(scaleset_pool_destroy_backlog_full_total[5m]) > 0` — destroys are being
+  dropped and VMs will leak until the orphan sweep catches them.
+- `scaleset_canary_reverted_total` increasing — a bad template candidate.
+- `scaleset_gh_rate_limit_remaining` trending toward zero.
+
 ### Changing a scale set's labels
 
 GitHub cannot change the labels of a registered runner scale set. The update
@@ -108,11 +113,6 @@ What that means for an operator:
   it through the normal create path. Jobs queue until it comes back.
 - An entry with no `labels:` is left alone entirely — that is how you adopt a
   scale set whose labels you manage elsewhere.
-- `rate(scaleset_pool_destroy_backlog_full_total[5m]) > 0` — destroys are being
-  dropped and VMs will leak until the orphan sweep catches them.
-- `scaleset_canary_reverted_total` increasing — a bad template candidate.
-- `scaleset_gh_rate_limit_remaining` trending toward zero.
-
 ## Tracing
 
 OTLP/HTTP tracing is opt-in:

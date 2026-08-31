@@ -70,6 +70,13 @@ type Options struct {
 	// to the right entry via the URL {id} param.
 	Scalesets []ScaleSetOptions
 
+	// RunnerGroupLookupID, when non-zero, is the ID the runner-group
+	// lookup answers with, whatever group the configured scale sets
+	// sit in. Tests that care which group a create posts to need the
+	// two to differ; by default the lookup echoes the first scale
+	// set's group, so they cannot.
+	RunnerGroupLookupID int
+
 	// PageSize, when > 0, makes the runner-list endpoint paginate: each
 	// response returns at most PageSize runners and, when more remain,
 	// sets a GitHub-style `Link: ...; rel="next"` header so the
@@ -89,6 +96,10 @@ type Server struct {
 
 	// pageSize mirrors Options.PageSize: 0 = single-page (back-compat).
 	pageSize int
+
+	// runnerGroupLookupID mirrors Options.RunnerGroupLookupID: 0 means
+	// "echo the first scale set's group".
+	runnerGroupLookupID int
 
 	// listFault, when count > 0, makes the next `count` runner-list
 	// calls return `status` (typically 429) with a Retry-After header,
@@ -154,11 +165,12 @@ func New(t testing.TB, opts Options) *Server {
 	t.Helper()
 	specs := normaliseScalesetOptions(opts)
 	s := &Server{
-		runners:       map[int64]Runner{},
-		scalesets:     make(map[string]*scalesetEntry, len(specs)),
-		scalesetsByID: make(map[int]*scalesetEntry, len(specs)),
-		adminToken:    mintAdminJWT(),
-		pageSize:      opts.PageSize,
+		runners:             map[int64]Runner{},
+		scalesets:           make(map[string]*scalesetEntry, len(specs)),
+		scalesetsByID:       make(map[int]*scalesetEntry, len(specs)),
+		adminToken:          mintAdminJWT(),
+		pageSize:            opts.PageSize,
+		runnerGroupLookupID: opts.RunnerGroupLookupID,
 	}
 	for _, spec := range specs {
 		entry := &scalesetEntry{spec: spec, jitMintsByName: map[string]int{}}
@@ -252,10 +264,18 @@ func normaliseScalesetOptions(opts Options) []fakeRunnerScaleSet {
 		if len(labels) == 0 {
 			labels = []runnerScaleSetLabel{{ID: 1, Name: name, Type: "system"}}
 		}
+		// github.com always answers the scale-set lookup with a
+		// populated statistics object, so the fake does too; nil
+		// options mean an idle scale set, not an absent field.
 		var stats *fakeRunnerScaleSetStatistic
-		if ss.Statistics != nil {
+		switch {
+		case ss.OmitStatistics:
+			stats = nil
+		case ss.Statistics != nil:
 			s := fakeRunnerScaleSetStatistic(*ss.Statistics)
 			stats = &s
+		default:
+			stats = &fakeRunnerScaleSetStatistic{}
 		}
 		out = append(out, fakeRunnerScaleSet{
 			ID:            id,
@@ -279,14 +299,22 @@ func (s *Server) ConfigURL(org string) string { return s.URL + "/" + org }
 // single registered scaleset. Panics in multi-scaleset configs — use
 // ScaleSetIDFor(name) instead.
 func (s *Server) ScaleSetID() int {
-	return s.onlyEntry("ScaleSetID").spec.ID
+	entry := s.onlyEntry("ScaleSetID")
+	// spec.ID is mutable: a create after a delete re-registers the
+	// scale set under a fresh ID.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return entry.spec.ID
 }
 
 // ScaleSetIDFor returns the ID for the named scaleset (multi-scaleset
 // tests). Panics on unknown names so test sequencing bugs surface
 // loudly.
 func (s *Server) ScaleSetIDFor(name string) int {
-	return s.entryFor(name, "ScaleSetIDFor").spec.ID
+	entry := s.entryFor(name, "ScaleSetIDFor")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return entry.spec.ID
 }
 
 // RESTBaseURL returns the URL suitable for passing as

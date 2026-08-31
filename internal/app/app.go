@@ -1030,7 +1030,7 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 		return nil, fmt.Errorf("lookup runner scale set %q: %w", entry.Name, err)
 	}
 	if existing != nil {
-		rss, rerr := reconcileScaleSetLabels(ctx, gh, entry, existing, metrics, log)
+		rss, rerr := reconcileScaleSetLabels(ctx, gh, entry, existing, groupID, metrics, log)
 		if rerr != nil {
 			return nil, fmt.Errorf("reconcile runner scale set labels: %w", rerr)
 		}
@@ -1070,7 +1070,8 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 // fire on it. The returned scale set is the updated one on success and
 // the existing one otherwise — never nil.
 func reconcileScaleSetLabels(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
-	existing *scaleset.RunnerScaleSet, metrics *observability.Metrics, log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
+	existing *scaleset.RunnerScaleSet, groupID int, metrics *observability.Metrics,
+	log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
 	if len(entry.Labels) == 0 {
 		setLabelDrift(metrics, entry.Name, 0)
 		return existing, nil
@@ -1083,7 +1084,7 @@ func reconcileScaleSetLabels(ctx context.Context, gh *scaleset.Client, entry con
 	}
 	log.Info("runner scale set labels differ from config; recreating it on GitHub",
 		"scaleset", entry.Name, "github", have, "config", want)
-	return recreateScaleSetForLabels(ctx, gh, entry, existing, want, metrics, log)
+	return recreateScaleSetForLabels(ctx, gh, entry, existing, want, groupID, metrics, log)
 }
 
 // scalesetsRecreated records the scale sets this process already tried
@@ -1105,26 +1106,37 @@ var scalesetsRecreated sync.Map // scaleset name -> struct{}
 // This is destructive: the new scale set has a new ID, and every runner
 // registration and JIT config issued against the old one is void. It
 // therefore runs only when GitHub reports the scale set idle, and at
-// most once per scale set per process.
+// most once per scale set per process. The idle check reads the
+// statistics on the lookup response — github.com populates them there
+// (probed: the list-by-name and get-by-id responses both carry a full
+// statistics object), and a response without them is treated as "cannot
+// tell", which refuses rather than proceeds.
+//
+// The scale set is re-registered into groupID — the runner group the
+// config resolves to, not the one the old scale set happened to sit in,
+// so changing runner_group and labels together lands in the right
+// place.
 //
 // A delete that succeeds followed by a create that fails leaves GitHub
 // with no scale set at all; that returns an error so the worker's
 // supervisor retries, where the lookup misses and the create path
 // re-registers it.
 func recreateScaleSetForLabels(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
-	existing *scaleset.RunnerScaleSet, want []string, metrics *observability.Metrics,
+	existing *scaleset.RunnerScaleSet, want []string, groupID int, metrics *observability.Metrics,
 	log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
-	if busy := scaleSetWorkInFlight(existing); busy != "" {
+	if existing.Statistics == nil {
+		log.Warn("not recreating the runner scale set: GitHub returned no statistics for it, "+
+			"so there is no way to tell whether a job is in flight",
+			"scaleset", entry.Name, "config", want)
+		setLabelDrift(metrics, entry.Name, 1)
+		return existing, nil
+	}
+	if busy := scaleSetWorkInFlight(existing.Statistics); busy != "" {
 		log.Warn("not recreating the runner scale set: GitHub reports work in flight "+
 			"— labels stay as they are until the next start finds it idle",
 			"scaleset", entry.Name, "in_flight", busy, "config", want)
 		setLabelDrift(metrics, entry.Name, 1)
 		return existing, nil
-	}
-	if existing.Statistics == nil {
-		log.Warn("recreating the runner scale set without confirming it is idle: "+
-			"GitHub returned no statistics for it",
-			"scaleset", entry.Name)
 	}
 	if _, done := scalesetsRecreated.Load(entry.Name); done {
 		log.Warn("labels still differ after recreating this scale set once; leaving it alone "+
@@ -1146,7 +1158,7 @@ func recreateScaleSetForLabels(ctx context.Context, gh *scaleset.Client, entry c
 	scalesetsRecreated.Store(entry.Name, struct{}{})
 	created, err := gh.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
 		Name:          entry.Name,
-		RunnerGroupID: existing.RunnerGroupID,
+		RunnerGroupID: groupID,
 		Labels:        labelsWithTypes(want, existing.Labels),
 	})
 	if err != nil {
@@ -1167,14 +1179,10 @@ func recreateScaleSetForLabels(ctx context.Context, gh *scaleset.Client, entry c
 }
 
 // scaleSetWorkInFlight returns a description of the work GitHub reports
-// against the scale set, or "" when it reports none. Statistics are
-// absent on some responses; that reads as "cannot tell", not "idle",
-// and the caller says so before acting.
-func scaleSetWorkInFlight(rss *scaleset.RunnerScaleSet) string {
-	s := rss.Statistics
-	if s == nil {
-		return ""
-	}
+// against the scale set, or "" when it reports none. Callers handle a
+// nil statistics object themselves: absent counters mean "cannot tell",
+// which is not the same as idle.
+func scaleSetWorkInFlight(s *scaleset.RunnerScaleSetStatistic) string {
 	busy := []string{}
 	for _, c := range []struct {
 		name string

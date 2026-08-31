@@ -387,6 +387,60 @@ func TestEnsureScaleSetForEntry_BusyScaleSetIsNotRecreated(t *testing.T) {
 		"labels the orchestrator declined to repair are still drift")
 }
 
+// TestEnsureScaleSetForEntry_NoStatisticsIsNotIdle pins that a lookup
+// response without statistics refuses the recreate. github.com always
+// sends them, so this is the "something is different from what we
+// probed" case — and guessing idle there would delete a scale set with
+// a job on it.
+func TestEnsureScaleSetForEntry_NoStatisticsIsNotIdle(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{
+			ID: 77, Name: "drift-no-stats", Labels: []string{"proxmox"}, OmitStatistics: true,
+		},
+	})
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{Name: "drift-no-stats", Labels: []string{"proxmox", "mem-4g"}}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, 77, rss.ID, "a scale set whose idleness cannot be confirmed must be left alone")
+	require.Equal(t, []string{"proxmox"}, srv.ScaleSetLabels())
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-no-stats")))
+}
+
+// TestEnsureScaleSetForEntry_RecreateUsesConfiguredRunnerGroup pins that
+// the recreated scale set is registered into the runner group the config
+// resolves to, not the one the old scale set sat in. An operator that
+// changes runner_group and labels in one edit would otherwise have the
+// scale set put back in the old group.
+func TestEnsureScaleSetForEntry_RecreateUsesConfiguredRunnerGroup(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{
+			ID: 77, Name: "drift-group", RunnerGroupID: 9, Labels: []string{"proxmox"},
+		},
+		// The scale set currently sits in group 9; the config's
+		// runner_group resolves to 42. The recreate must post 42.
+		RunnerGroupLookupID: 42,
+	})
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{
+		Name:        "drift-group",
+		RunnerGroup: "prod-group",
+		Labels:      []string{"proxmox", "mem-4g"},
+	}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, 42, rss.RunnerGroupID,
+		"the recreate must post the runner group the lookup resolved by name, not the old one")
+	require.ElementsMatch(t, entry.Labels, srv.ScaleSetLabels())
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-group")))
+}
+
 // TestEnsureScaleSetForEntry_LabelsInSyncNoRecreate pins that matching
 // labels touch nothing — the injected delete failure would surface as
 // drift if the reconciliation fired on every start.

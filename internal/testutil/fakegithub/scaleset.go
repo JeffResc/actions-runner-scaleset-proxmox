@@ -118,10 +118,18 @@ type ScaleSetOptions struct {
 	// seed a set that differs from the config's.
 	Labels []string
 
-	// Statistics is what the fake reports on the scale set itself
-	// (not the session). The orchestrator reads it to decide whether
-	// a scale set is idle enough to recreate.
+	// Statistics is what the fake reports on the scale set itself (not
+	// the session). The orchestrator reads it to decide whether a
+	// scale set is idle enough to recreate. Nil means all-zero — an
+	// idle scale set — because github.com always carries a populated
+	// statistics object on the scale-set lookup.
 	Statistics *Statistics
+
+	// OmitStatistics drops the statistics object from the scale-set
+	// responses entirely. github.com does not do this; it exists to
+	// drive the orchestrator's "cannot confirm idle, so refuse to
+	// recreate" branch.
+	OmitStatistics bool
 }
 
 // isZero reports whether the caller left ScaleSetOptions untouched.
@@ -129,7 +137,7 @@ type ScaleSetOptions struct {
 // non-comparable.
 func (o ScaleSetOptions) isZero() bool {
 	return o.ID == 0 && o.Name == "" && o.RunnerGroupID == 0 && len(o.Labels) == 0 &&
-		o.Statistics == nil
+		o.Statistics == nil && !o.OmitStatistics
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +274,9 @@ func (s *Server) handleRunnerGroupLookup(w http.ResponseWriter, r *http.Request)
 		groupID = entry.spec.RunnerGroupID
 		break
 	}
+	if s.runnerGroupLookupID != 0 {
+		groupID = s.runnerGroupLookupID
+	}
 	writeJSON(w, http.StatusOK, struct {
 		Count int               `json:"count"`
 		Value []runnerGroupResp `json:"value"`
@@ -324,6 +335,9 @@ func (s *Server) handleScaleSetCreate(w http.ResponseWriter, r *http.Request) {
 				labels = append(labels, runnerScaleSetLabel{ID: i + 1, Name: l.Name, Type: typ})
 			}
 			entry.spec.Labels = labels
+		}
+		if body.RunnerGroupID != 0 {
+			entry.spec.RunnerGroupID = body.RunnerGroupID
 		}
 		if entry.deleted {
 			entry.deleted = false
