@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -651,16 +652,6 @@ func buildGitHubAuth(cfg *config.Config, override githubauth.Auth) (githubauth.A
 	return nil, fmt.Errorf("unknown github.auth_mode %q", cfg.GitHub.AuthMode)
 }
 
-// ensureScaleSet locates an existing scale set by name or creates one.
-//
-// The scaleset library's contract for GetRunnerScaleSet:
-//   - (rss, nil) — found
-//   - (nil, nil) — not found (clean "doesn't exist" signal)
-//   - (nil, err) — actual failure (auth, network, multiple-match, etc.)
-//
-// We must distinguish the last case from the second one. A previous
-// implementation silently fell through to CreateRunnerScaleSet on any
-// non-nil error, turning a 5xx into a misleading "create failed".
 // scalesetState is the per-scaleset runtime state shared
 // between the leader-plane fan-out and the admin server's
 // per-scaleset accessors (issue #1). The atomic.Pointer pair
@@ -719,7 +710,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		return fmt.Errorf("build github rest client: %w", err)
 	}
 
-	rss, err := ensureScaleSetForEntry(leaderCtx, ghClient, entry, log)
+	rss, err := ensureScaleSetForEntry(leaderCtx, ghClient, entry, metrics, log)
 	if err != nil {
 		return fmt.Errorf("ensure runner scale set: %w", err)
 	}
@@ -1004,12 +995,27 @@ func runScalesetAttempt(ctx context.Context, entry config.ScaleSetEntry, state *
 	return run(ctx, entry, state)
 }
 
-// ensureScaleSetForEntry is the per-entry variant of the
-// previous ensureScaleSet helper. Mirrors the same lookup-then-
-// create semantics, but reads identity (Name / Labels /
-// RunnerGroup) from the per-scaleset entry rather than the
-// legacy top-level cfg.ScaleSet block.
-func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry, log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
+// ensureScaleSetForEntry locates the entry's scale set by name or
+// creates it, then reconciles its labels with the entry's configured
+// Labels. Identity (Name / Labels / RunnerGroup) is read from the
+// per-scaleset entry rather than the legacy top-level cfg.ScaleSet
+// block.
+//
+// The scaleset library's contract for GetRunnerScaleSet:
+//   - (rss, nil) — found
+//   - (nil, nil) — not found (clean "doesn't exist" signal)
+//   - (nil, err) — actual failure (auth, network, multiple-match, etc.)
+//
+// We must distinguish the last case from the second one. A previous
+// implementation silently fell through to CreateRunnerScaleSet on any
+// non-nil error, turning a 5xx into a misleading "create failed".
+//
+// Labels used to reach GitHub on the create path only: editing
+// scaleset.labels afterwards left GitHub on the original set with no
+// warning, so jobs requesting the new label queued forever while every
+// health signal stayed green. reconcileScaleSetLabels closes that gap.
+func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
+	metrics *observability.Metrics, log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
 	groupID := 1
 	if entry.RunnerGroup != "" {
 		rg, err := gh.GetRunnerGroupByName(ctx, entry.RunnerGroup)
@@ -1023,7 +1029,7 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 		return nil, fmt.Errorf("lookup runner scale set %q: %w", entry.Name, err)
 	}
 	if existing != nil {
-		return existing, nil
+		return reconcileScaleSetLabels(ctx, gh, entry, existing, metrics, log), nil
 	}
 	log.Info("creating runner scale set", "name", entry.Name)
 	labels := make([]scaleset.Label, 0, len(entry.Labels))
@@ -1038,7 +1044,96 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 	if err != nil {
 		return nil, fmt.Errorf("create runner scale set: %w", err)
 	}
+	setLabelDrift(metrics, entry.Name, 0)
 	return created, nil
+}
+
+// reconcileScaleSetLabels makes the scale set's labels on GitHub agree
+// with the entry's configured labels, repairing a difference in place
+// with UpdateRunnerScaleSet.
+//
+// A failed update is not fatal: GitHub keeps routing the labels it
+// already knows, so the scale set stays useful for every job that does
+// not ask for a config-only label. The difference is logged with both
+// label sets and published on scaleset_labels_drift so an alert can
+// fire on it. The returned scale set is the updated one on success and
+// the existing one otherwise — never nil.
+func reconcileScaleSetLabels(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
+	existing *scaleset.RunnerScaleSet, metrics *observability.Metrics, log *slog.Logger) *scaleset.RunnerScaleSet {
+	want := desiredLabelNames(entry)
+	have := labelNames(existing.Labels)
+	if slices.Equal(want, have) {
+		setLabelDrift(metrics, entry.Name, 0)
+		return existing
+	}
+	log.Info("runner scale set labels differ from config; updating GitHub",
+		"scaleset", entry.Name, "github", have, "config", want)
+	updated, err := gh.UpdateRunnerScaleSet(ctx, existing.ID, &scaleset.RunnerScaleSet{
+		Name:          existing.Name,
+		RunnerGroupID: existing.RunnerGroupID,
+		Labels:        labelsWithTypes(want, existing.Labels),
+	})
+	if err != nil {
+		log.Warn("runner scale set label update failed; GitHub keeps its current labels "+
+			"— jobs requesting a config-only label will stay queued",
+			"scaleset", entry.Name, "github", have, "config", want, "err", err)
+		setLabelDrift(metrics, entry.Name, 1)
+		return existing
+	}
+	setLabelDrift(metrics, entry.Name, 0)
+	return updated
+}
+
+// desiredLabelNames returns the label set the config asks GitHub to
+// hold, sorted and deduplicated for comparison. An entry with no
+// configured labels mirrors the scaleset library's own create-path
+// fallback: a single label named after the scale set.
+func desiredLabelNames(entry config.ScaleSetEntry) []string {
+	if len(entry.Labels) == 0 {
+		return []string{entry.Name}
+	}
+	return sortedUnique(entry.Labels)
+}
+
+func labelNames(labels []scaleset.Label) []string {
+	names := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names = append(names, l.Name)
+	}
+	return sortedUnique(names)
+}
+
+func sortedUnique(in []string) []string {
+	out := slices.Clone(in)
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// labelsWithTypes renders want in the wire shape, carrying over the
+// Type GitHub already assigned to a label we keep — the scale set's
+// own "System" label must not be rewritten as a user label. Names
+// GitHub does not have yet go up as "User", matching the create path.
+func labelsWithTypes(want []string, existing []scaleset.Label) []scaleset.Label {
+	types := make(map[string]string, len(existing))
+	for _, l := range existing {
+		types[l.Name] = l.Type
+	}
+	out := make([]scaleset.Label, 0, len(want))
+	for _, name := range want {
+		typ := types[name]
+		if typ == "" {
+			typ = "User"
+		}
+		out = append(out, scaleset.Label{Name: name, Type: typ})
+	}
+	return out
+}
+
+func setLabelDrift(metrics *observability.Metrics, scalesetName string, v float64) {
+	if metrics == nil {
+		return
+	}
+	metrics.LabelDrift.WithLabelValues(scalesetName).Set(v)
 }
 
 // scheduleMetricsAdapter adapts the orchestrator's Prometheus

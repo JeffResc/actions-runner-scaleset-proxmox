@@ -39,6 +39,27 @@ func (s *Server) InjectDeleteFailure(status, count int) {
 	s.deleteFault = httpFault{status: status, count: count}
 }
 
+// InjectScaleSetUpdateFailure makes the next `count` scale-set PATCH
+// (label reconciliation) calls fail with the given HTTP status. Drives
+// ensureScaleSetForEntry's warn-and-continue branch, where GitHub keeps
+// labels that disagree with the config.
+func (s *Server) InjectScaleSetUpdateFailure(status, count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scaleSetUpdateFault = httpFault{status: status, count: count}
+}
+
+// takeScaleSetUpdateFaultLocked mirrors takeListFaultLocked for the
+// scale-set PATCH endpoint. Caller must hold s.mu.
+func (s *Server) takeScaleSetUpdateFaultLocked() (httpFault, bool) {
+	if s.scaleSetUpdateFault.count <= 0 {
+		return httpFault{}, false
+	}
+	f := s.scaleSetUpdateFault
+	s.scaleSetUpdateFault.count--
+	return f, true
+}
+
 // takeListFaultLocked returns the active list fault (if any) and
 // decrements its budget. Caller must hold s.mu.
 func (s *Server) takeListFaultLocked() (httpFault, bool) {

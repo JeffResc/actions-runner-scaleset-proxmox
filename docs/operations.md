@@ -46,6 +46,7 @@ All metrics are namespaced `scaleset_`. Every per-scale-set metric carries
 | Metric | Labels | Notes |
 | --- | --- | --- |
 | `scaleset_unrouted_jobs_total` | `scaleset, labels` | No profile matched the job's labels. `labels` is hashed into 64 buckets to bound cardinality |
+| `scaleset_labels_drift` | `scaleset` | 1 when the labels on GitHub disagree with `scaleset.labels` and the orchestrator could not repair them |
 | `scaleset_quota_throttled_total` | `scaleset, scope, name` | Observed over-quota jobs (observational — see [profiles-and-scaling.md](profiles-and-scaling.md#multi-tenancy-quotas-and-priority)) |
 | `scaleset_priority_acquires_total` | `scaleset, class` | Jobs paired with a VM, by priority class |
 | `scaleset_preemptions_total` | `scaleset, from_class, to_class` | Successful preempts |
@@ -78,6 +79,10 @@ All metrics are namespaced `scaleset_`. Every per-scale-set metric carries
 - `rate(scaleset_panics_recovered_total[5m]) > 0` — always a real bug.
 - `rate(scaleset_unrouted_jobs_total[15m]) > 0` — a label coverage gap; jobs
   are queueing with nothing to run them.
+- `scaleset_labels_drift > 0` — GitHub does not hold the configured labels.
+  GitHub routes no job that asks for a label it does not know, so those jobs
+  queue with no other symptom: the listener stays connected, the pool stays
+  idle, and `/readyz` stays green.
 - `rate(scaleset_pool_destroy_backlog_full_total[5m]) > 0` — destroys are being
   dropped and VMs will leak until the orphan sweep catches them.
 - `scaleset_canary_reverted_total` increasing — a bad template candidate.
