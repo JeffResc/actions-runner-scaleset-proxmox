@@ -188,6 +188,73 @@ scalesetConfig:
     boot_max_attempts: 3
     power_poll_interval: 3s
 
+    # Resource-aware admission control. Off by default: concurrency is
+    # then bounded only by max_concurrent_runners, as it always has
+    # been. Turn it on to gate clones on what actually fits on each
+    # Proxmox node — its RAM, minus a host reserve, minus the
+    # configured memory of every guest already on it (including guests
+    # this orchestrator does not own). "Configured", not "in use": an
+    # idle 16 GiB runner owns its full 16 GiB while touching almost
+    # none of it.
+    #
+    # A clone that does not fit is DEFERRED, not failed — the job waits
+    # in GitHub's queue and the next reconcile tick retries. Alert on
+    # scaleset_clone_deferred_capacity_total.
+    #
+    # REQUIRES an explicit `profiles:` block below, with memory_mb on
+    # every profile. Without one the orchestrator synthesises a single
+    # "default" profile that inherits the template's memory, which
+    # admission cannot size — config load then fails at startup with
+    # `profiles[0] "default": memory_mb must be > 0`. See
+    # ../../docs/profiles-and-scaling.md#resource-aware-admission-control.
+    #
+    # capacity:
+    #   enabled: true
+    #   # TTL on the cached /cluster/resources read. Lower tracks
+    #   # foreign VMs more tightly, higher is lighter on the Proxmox
+    #   # API. Default 15s.
+    #   refresh_interval: 15s
+    #   # Host headroom never planned into — PVE, ZFS ARC and qemu's
+    #   # per-VM overhead all live outside the guests' configured
+    #   # memory. The effective reserve is the LARGER of the two, so
+    #   # you can set a floor and a proportional reserve at once.
+    #   # Defaults to 2048 MiB / 0.0.
+    #   reserve_memory_mb: 4096
+    #   reserve_memory_fraction: 0.1
+    #   # Memory is gated hard; CPU is time-shared, so it is gated only
+    #   # if you ask. The cap is (physical cores x ratio). 0 (default)
+    #   # means vCPUs never refuse a clone.
+    #   cpu_overcommit_ratio: 0
+    #   # Let a queued job that cannot be placed anywhere reclaim
+    #   # capacity from an idle pool VM: the oldest idle one (warm
+    #   # before hot) is destroyed and the job admitted on the next
+    #   # tick. Nothing is evicted when there is room for both. Off by
+    #   # default — it trades a sibling profile's warm-start latency
+    #   # for the queued job's ability to run at all.
+    #   evict_idle_for_demand: false
+
+  # Runner profiles — named bundles of {labels, template, hardware
+  # shape, per-profile pool sizing}. Omit the block entirely and a
+  # single "default" profile is synthesised from the scaleset + pool
+  # values above (the pre-profiles behaviour).
+  #
+  # Required as soon as pool.capacity.enabled is set, since admission
+  # needs each profile's memory_mb to size a clone. With capacity on,
+  # max_concurrent_runners becomes optional — omit it and memory is the
+  # only cap.
+  #
+  # profiles:
+  #   - name: mem-4g
+  #     labels: [self-hosted, linux, x64, proxmox]
+  #     cpu: 2
+  #     memory_mb: 4096
+  #     warm_size: 2
+  #   - name: mem-16g
+  #     labels: [self-hosted, linux, x64, proxmox, mem-16g]
+  #     cpu: 8
+  #     memory_mb: 16384
+  #     warm_size: 1
+
   observability:
     http_addr: ":9100"
     log_level: info

@@ -118,6 +118,21 @@ func TestCapacity_MemoryOptionalWhenDisabled(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestCapacity_RequiresAnExplicitProfilesBlock pins the upgrade path.
+// A config with no `profiles:` gets one synthesised "default" profile
+// that inherits the template's hardware — which capacity admission
+// cannot size. Turning the feature on therefore REQUIRES declaring
+// profiles with memory_mb, and that must fail at load with a message
+// naming the synthesised profile rather than at runtime.
+func TestCapacity_RequiresAnExplicitProfilesBlock(t *testing.T) {
+	y := strings.Replace(validPATYAML, "  boot_max_attempts: 3",
+		"  boot_max_attempts: 3\n  capacity:\n    enabled: true", 1)
+	_, err := config.Parse([]byte(y))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `profiles[0] "default"`)
+	require.Contains(t, err.Error(), "memory_mb must be > 0")
+}
+
 // TestCapacity_CPURequiredOnlyWhenGated mirrors the memory rule for the
 // opt-in CPU gate.
 func TestCapacity_CPURequiredOnlyWhenGated(t *testing.T) {
