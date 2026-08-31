@@ -113,6 +113,7 @@ What that means for an operator:
   it through the normal create path. Jobs queue until it comes back.
 - An entry with no `labels:` is left alone entirely — that is how you adopt a
   scale set whose labels you manage elsewhere.
+
 ## Tracing
 
 OTLP/HTTP tracing is opt-in:

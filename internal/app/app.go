@@ -1112,10 +1112,13 @@ var scalesetsRecreated sync.Map // scaleset name -> struct{}
 // statistics object), and a response without them is treated as "cannot
 // tell", which refuses rather than proceeds.
 //
-// The scale set is re-registered into groupID — the runner group the
-// config resolves to, not the one the old scale set happened to sit in,
-// so changing runner_group and labels together lands in the right
-// place.
+// The scale set is re-registered into groupID, the runner group the
+// config resolved by name, rather than the RunnerGroupID echoed on the
+// lookup response. Both are the same group whenever this function runs
+// — GetRunnerScaleSet filters by ?runnerGroupId=, so a scale set moved
+// to another group is not found here at all and takes the create path
+// instead — but the resolved value is the authoritative one and does
+// not depend on the response echoing the field.
 //
 // A delete that succeeds followed by a create that fails leaves GitHub
 // with no scale set at all; that returns an error so the worker's

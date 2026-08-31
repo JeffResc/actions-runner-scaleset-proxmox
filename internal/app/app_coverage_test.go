@@ -411,10 +411,15 @@ func TestEnsureScaleSetForEntry_NoStatisticsIsNotIdle(t *testing.T) {
 }
 
 // TestEnsureScaleSetForEntry_RecreateUsesConfiguredRunnerGroup pins that
-// the recreated scale set is registered into the runner group the config
-// resolves to, not the one the old scale set sat in. An operator that
-// changes runner_group and labels in one edit would otherwise have the
-// scale set put back in the old group.
+// the create posts the runner group resolved from the config, not the
+// RunnerGroupID echoed on the lookup response.
+//
+// The two cannot actually diverge on github.com: the lookup filters by
+// ?runnerGroupId= (probed — a name that exists in group 1 answers
+// count=0 for any other group), so a scale set whose group changed is
+// never found here and takes the create path instead. The fake makes
+// them differ anyway, to keep the create from silently going back to
+// depending on a field the response is not obliged to echo.
 func TestEnsureScaleSetForEntry_RecreateUsesConfiguredRunnerGroup(t *testing.T) {
 	t.Parallel()
 	srv := fakegithub.New(t, fakegithub.Options{
