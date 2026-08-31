@@ -739,7 +739,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 	mgr, err := pool.NewManager(pool.Config{
 		HotSize:              cfg.Pool.HotSize,
 		WarmSize:             cfg.Pool.WarmSize,
-		MaxConcurrentRunners: entry.MaxConcurrentRunners,
+		MaxConcurrentRunners: effectiveMaxConcurrent(entry.MaxConcurrentRunners),
 		ReconcileInterval:    cfg.Pool.ReconcileInterval.D(),
 		PowerPollInterval:    cfg.Pool.PowerPollInterval.D(),
 		RecycleMode:          cfg.Pool.RecycleMode,
@@ -821,7 +821,11 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 
 	lst, err := listener.New(sessionClient, listener.Config{
 		ScaleSetID: rss.ID,
-		MaxRunners: entry.MaxConcurrentRunners,
+		// Same unlimited translation as the pool's cap: a scale set that
+		// left max_concurrent_runners off under capacity admission must
+		// advertise "no ceiling" to GitHub, not a ceiling of zero.
+		// listener.Config.Validate accepts up to MaxInt32 inclusive.
+		MaxRunners: effectiveMaxConcurrent(entry.MaxConcurrentRunners),
 		Logger:     log,
 	})
 	if err != nil {

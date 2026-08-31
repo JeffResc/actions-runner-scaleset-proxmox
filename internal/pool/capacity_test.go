@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
 )
 
@@ -436,9 +437,18 @@ func TestPlanEviction(t *testing.T) {
 
 // evictionManager builds a manager with two profiles: `small` holds idle
 // VMs on a full node, `big` has queued demand that cannot be placed.
+//
+// The selector is wrapped in the REAL capacity wrapper, because that
+// wrapper sits in front of the reservation on the clone path — a test
+// that calls reserveCapacity directly cannot see whether the wrapper
+// would have refused the dispatch before it ever got there.
 func evictionManager(t *testing.T, adm *fakeAdmitter, evict bool) (*manager, *store.Store) {
 	t.Helper()
 	st := newTestStore(t)
+	single, err := nodeselector.NewSingle("pve1")
+	require.NoError(t, err)
+	sel, err := nodeselector.NewCapacity(single, adm, []string{"pve1"})
+	require.NoError(t, err)
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity:           adm,
 		EvictIdleForDemand: evict,
@@ -446,7 +456,7 @@ func evictionManager(t *testing.T, adm *fakeAdmitter, evict bool) (*manager, *st
 			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
 			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
 		},
-	})
+	}, withSelector(sel))
 	return m, st
 }
 
@@ -537,12 +547,49 @@ func TestEvict_ParkedReservationIsConsumedByTheNextClone(t *testing.T) {
 	require.Zero(t, adm.snapshotFree("pve1"), "the eviction claimed everything it freed")
 
 	before := adm.reserveCalls
-	claim, ok := m.reserveCapacity(context.Background(), m.profileOf("big"), "pve1", store.PoolKindHot)
+	node, claim, ok := m.admitClone(context.Background(), m.profileOf("big"), store.PoolKindHot)
 	require.True(t, ok, "the parked claim admits the clone even though the node reports no free bytes")
+	require.Equal(t, "pve1", node, "the claim carries the node the eviction freed capacity on")
 	require.NotNil(t, claim.release)
 	require.Equal(t, before, adm.reserveCalls,
 		"a parked claim must be consumed, not re-reserved")
 	require.Empty(t, m.profileOf("big").evicted, "the claim is spent exactly once")
+}
+
+// TestEvict_ParkedReservationSurvivesTheSelector is the end-to-end
+// version: drive a real clone dispatch, not reserveCapacity directly.
+//
+// The capacity wrapper runs BEFORE the reservation on the clone path,
+// and after an eviction the node reports no free bytes (the parked
+// claim holds them). If the dispatch consults the wrapper first it is
+// refused with ErrNoCapacity, the parked claim is never reached, and
+// the deferral re-arms eviction — so the next tick sacrifices another
+// idle VM while the queued job still never gets one.
+func TestEvict_ParkedReservationSurvivesTheSelector(t *testing.T) {
+	t.Parallel()
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 12 * gib})
+	m, st := evictionManager(t, adm, true)
+	seedIdle(t, st, adm, 10001, "small", 4, store.StateWarm, time.Hour)
+
+	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")))
+	require.Zero(t, adm.snapshotFree("pve1"),
+		"precondition: the eviction claimed everything it freed, so the node looks full")
+
+	m.runClone("big", store.PoolKindHot, true, nil, func() {})
+
+	rows, err := st.List()
+	require.NoError(t, err)
+	var forBig int
+	for _, r := range rows {
+		if r.Profile == "big" {
+			forBig++
+		}
+	}
+	require.Equal(t, 1, forBig,
+		"the clone the eviction was performed for must actually be dispatched")
+	require.Empty(t, m.profileOf("big").evicted, "the parked claim is spent")
+	require.False(t, m.profileOf("big").capacityDeferredHot.Load(),
+		"a dispatch that succeeded must not re-arm eviction and cost another idle VM")
 }
 
 // TestEvict_ParkedReservationIsNotSpentOnWarmRefill: the victim was
@@ -556,12 +603,12 @@ func TestEvict_ParkedReservationIsNotSpentOnWarmRefill(t *testing.T) {
 	seedIdle(t, st, adm, 10001, "small", 4, store.StateWarm, time.Hour)
 	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")))
 
-	_, ok := m.reserveCapacity(context.Background(), m.profileOf("big"), "pve1", store.PoolKindWarm)
+	_, _, ok := m.admitClone(context.Background(), m.profileOf("big"), store.PoolKindWarm)
 	require.False(t, ok, "a warm refill must not raid the claim reserved for queued demand")
 	require.Len(t, m.profileOf("big").evicted, 1, "the claim must still be parked")
 
 	// ...and the hot clone it was taken for still gets it.
-	_, ok = m.reserveCapacity(context.Background(), m.profileOf("big"), "pve1", store.PoolKindHot)
+	_, _, ok = m.admitClone(context.Background(), m.profileOf("big"), store.PoolKindHot)
 	require.True(t, ok)
 }
 
@@ -592,6 +639,94 @@ func TestEvict_SkipsBusyAndTransitionalRows(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, state, row.State, "row %d must be left exactly as it was", 10100+i)
 	}
+}
+
+// TestEvict_RespectsAffinity: with a hard pin, the idle VMs on a node
+// the profile can never land on must be left alone. Destroying them
+// would free memory the queued job cannot use, and the deferral would
+// re-arm eviction — grinding the pool down a VM per tick with no
+// progress at all.
+func TestEvict_RespectsAffinity(t *testing.T) {
+	t.Parallel()
+	// Two nodes. `big` is hard-pinned to pve-gpu, which has no idle VMs
+	// and no room; pve1 is full of idle `small` VMs that are irrelevant
+	// to it.
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 12 * gib, "pve-gpu": 0})
+	st := newTestStore(t)
+	all := []string{"pve1", "pve-gpu"}
+	rr, err := nodeselector.NewRoundRobin(all)
+	require.NoError(t, err)
+	aff, err := nodeselector.NewAffinity(rr, []nodeselector.AffinityRule{{
+		Match:       nodeselector.AffinitySelector{Profile: "big"},
+		PreferNodes: []string{"pve-gpu"},
+		Require:     true,
+	}}, all)
+	require.NoError(t, err)
+	sel, err := nodeselector.NewCapacity(aff, adm, all)
+	require.NoError(t, err)
+
+	m := newTestManager(t, st, &fakeProv{}, Config{
+		Capacity:           adm,
+		EvictIdleForDemand: true,
+		Profiles: []ProfileSettings{
+			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
+			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
+		},
+	}, withSelector(sel))
+	seedIdle(t, st, adm, 10001, "small", 4, store.StateWarm, time.Hour)
+
+	require.False(t, m.evictForDemand(context.Background(), m.profileOf("big")),
+		"nothing on pve1 can help a profile pinned to pve-gpu")
+	row, err := st.Get(10001)
+	require.NoError(t, err)
+	require.Equal(t, store.StateWarm, row.State,
+		"an idle VM on an ineligible node must never be sacrificed")
+	require.Zero(t, adm.freeingCalls)
+}
+
+// TestEvict_ParkedClaimRecheckedAgainstAntiAffinity: consuming a parked
+// claim skips node SELECTION but must not skip its rules. Anti-affinity
+// is a promise about a node's current occupants ("untrusted-PR runners
+// never co-schedule with prod"), and up to parkedReservationTTL passes
+// between parking a claim and spending it — long enough for a prod VM
+// to arrive. The claim is dropped, not the promise.
+func TestEvict_ParkedClaimRecheckedAgainstAntiAffinity(t *testing.T) {
+	t.Parallel()
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 12 * gib})
+	st := newTestStore(t)
+	all := []string{"pve1"}
+	single, err := nodeselector.NewSingle("pve1")
+	require.NoError(t, err)
+	aff, err := nodeselector.NewAffinity(single, []nodeselector.AffinityRule{{
+		Match:            nodeselector.AffinitySelector{Profile: "big"},
+		AntiAffinityWith: nodeselector.AffinitySelector{Profile: "prod"},
+	}}, all)
+	require.NoError(t, err)
+	sel, err := nodeselector.NewCapacity(aff, adm, all)
+	require.NoError(t, err)
+
+	m := newTestManager(t, st, &fakeProv{}, Config{
+		Capacity:           adm,
+		EvictIdleForDemand: true,
+		Profiles: []ProfileSettings{
+			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
+			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
+			{Name: "prod", MemoryMB: 2048, MaxConcurrentRunners: 10},
+		},
+	}, withSelector(sel))
+	seedIdle(t, st, adm, 10001, "small", 4, store.StateWarm, time.Hour)
+
+	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")),
+		"pve1 hosts no prod VM yet, so the eviction is legal")
+	require.Len(t, m.profileOf("big").evicted, 1)
+
+	// A prod VM lands on pve1 before the claim is spent.
+	seedIdle(t, st, adm, 10002, "prod", 2, store.StateWarm, time.Minute)
+
+	_, _, ok := m.admitClone(context.Background(), m.profileOf("big"), store.PoolKindHot)
+	require.False(t, ok,
+		"the parked claim must not place an anti-affine VM next to prod")
+	require.Equal(t, 1, adm.released, "and the claim is handed back, not leaked")
 }
 
 // TestEvict_ParkedReservationsReleasedOnDrain: the accountant is shared

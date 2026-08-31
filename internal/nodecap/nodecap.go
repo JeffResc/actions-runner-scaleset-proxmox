@@ -27,7 +27,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -583,16 +582,6 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 		snap.nodes[node] = totals
 	}
 	return snap, nil
-}
-
-// Nodes returns the node names the accountant is tracking. Used by the
-// selector wrapper when the operator declared no explicit node list.
-func (a *Accountant) Nodes(ctx context.Context) ([]string, error) {
-	snap, err := a.resources(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return slices.Sorted(maps.Keys(snap.nodes)), nil
 }
 
 // addClamped adds a signed delta to an unsigned base, flooring at 0.

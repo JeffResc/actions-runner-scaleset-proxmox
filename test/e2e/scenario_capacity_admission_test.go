@@ -121,6 +121,44 @@ func TestE2E_CapacityAdmission_RefusesToOvercommit(t *testing.T) {
 		"committed + available must stay within the node, net of the host reserve")
 }
 
+// TestE2E_CapacityAdmission_MemoryIsTheOnlyCap runs the shape the docs
+// advertise: `max_concurrent_runners` omitted entirely, so nothing
+// bounds the fleet except what fits on the node. The orchestrator must
+// start and provision against memory alone — a zero cap must not reach
+// the pool manager (which rejects it) or the store's acquire path
+// (which would refuse every acquire).
+func TestE2E_CapacityAdmission_MemoryIsTheOnlyCap(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+	// 20 GiB, 4 GiB reserved => 16 GiB admissible: four mem-4g VMs.
+	fp.SetNodeCapacity("pve1", 20*gib, 16)
+
+	h := Start(t, Options{
+		FakeProxmox:              fp,
+		HotSize:                  0,
+		OmitMaxConcurrentRunners: true,
+		Profiles: []ProfileSpec{
+			{Name: "mem-4g", CPUCores: 2, MemoryMB: 4096, WarmSize: 6},
+		},
+		Capacity: &CapacitySpec{ReserveMemoryMB: 4096},
+	})
+
+	// Reaching this point at all proves startup survived the missing
+	// cap; the pool then fills to the memory ceiling and stops.
+	require.Eventually(t, func() bool {
+		_, mb := ownedAllocationMB(t, h)
+		return mb >= 16*1024
+	}, 20*time.Second, 200*time.Millisecond,
+		"with no static cap, the pool should fill the node's 16 GiB")
+	time.Sleep(2 * time.Second)
+
+	count, allocatedMB := ownedAllocationMB(t, h)
+	require.Equal(t, 16*1024, allocatedMB,
+		"memory alone should bound the fleet at exactly 16 GiB; saw %d MiB across %d VMs",
+		allocatedMB, count)
+	require.Equal(t, 4, count, "16 GiB / 4 GiB = 4 VMs")
+}
+
 // TestE2E_CapacityAdmission_CountsForeignVMs: the node hosts guests this
 // orchestrator does not own, and their allocation is just as real as
 // ours. Planning against only our own store would oversubscribe the node

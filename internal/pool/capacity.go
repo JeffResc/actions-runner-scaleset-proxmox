@@ -2,11 +2,13 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/store"
 )
 
@@ -53,36 +55,135 @@ func (c capacityClaim) bind(vmid int) {
 	}
 }
 
-// reserveCapacity admits (or defers) one clone of ps onto node.
+// admitClone decides where one clone of ps goes and claims the capacity
+// for it. It is the whole admission decision for a dispatch: a false
+// bool means "not now", and the caller abandons the dispatch before
+// anything is persisted.
+//
+// Order matters. A reservation parked by an earlier eviction is
+// consumed BEFORE the node selector is consulted, because that claim
+// already names a node and is itself holding that node's free bytes.
+// Asking the capacity wrapper first would get ErrNoCapacity for the
+// very dispatch the eviction was performed for — and the resulting
+// deferral would re-arm eviction, so each tick would sacrifice another
+// idle VM while the queued job still never got one.
+//
+// Skipping the selector does NOT skip its rules: eviction picked the
+// parked node through the same selector (see evictionNode), and
+// stillEligible re-checks it here, because up to parkedReservationTTL
+// passes in between and anti-affinity is a promise about the node's
+// CURRENT occupants ("untrusted-PR runners never co-schedule with
+// prod"). A node that stopped being eligible in that window loses the
+// claim rather than the promise.
+func (m *manager) admitClone(ctx context.Context, ps *profileState, kind store.PoolKind) (string, capacityClaim, bool) {
+	// Only a HOT clone may consume a parked reservation. Eviction
+	// destroys a sibling's idle VM specifically so a queued job can run;
+	// letting this profile's own warm refill spend that memory instead
+	// would sacrifice the victim for nothing and leave the job waiting.
+	if m.cfg.Capacity != nil && kind == store.PoolKindHot {
+		if parked := ps.popEvicted(); parked != nil {
+			if m.stillEligible(ctx, ps, parked.node) {
+				m.log.Debug("clone: consuming reservation parked by an earlier eviction",
+					"profile", ps.settings.Name, "node", parked.node)
+				return parked.node, claimFor(parked.res), true
+			}
+			m.log.Info("clone: discarding parked eviction claim; node is no longer an eligible placement",
+				"profile", ps.settings.Name, "node", parked.node)
+			parked.res.Release()
+		}
+	}
+
+	node, ok := m.selectNode(ctx, ps, kind)
+	if !ok {
+		return "", capacityClaim{}, false
+	}
+	claim, ok := m.reserveCapacity(ctx, ps, node, kind)
+	if !ok {
+		return "", capacityClaim{}, false
+	}
+	return node, claim, true
+}
+
+// stillEligible reports whether node is (still) a legal placement for a
+// clone of ps, ignoring capacity.
+//
+// It asks the ordinary selector, with every OTHER node in the avoid
+// list, so the answer comes from the same affinity rules and strategy
+// that govern a normal dispatch — no second copy of that logic to drift.
+// The Shape is left zero, which makes the capacity wrapper a
+// pass-through: the caller already holds a reservation for this node, so
+// "is there room" is not the question being asked.
+func (m *manager) stillEligible(ctx context.Context, ps *profileState, node string) bool {
+	if m.cfg.LinkedClones {
+		// Placement isn't the selector's to make in this mode.
+		return node == m.cfg.TemplateNode
+	}
+	states, err := m.cfg.Capacity.Snapshot(ctx)
+	if err != nil {
+		return false
+	}
+	avoid := make([]string, 0, len(states))
+	for n := range states {
+		if n != node {
+			avoid = append(avoid, n)
+		}
+	}
+	got, err := m.sel.Select(ctx, nodeselector.Hint{
+		Profile:     ps.settings.Name,
+		ExistingVMs: m.snapshotExistingVMsForAffinity(),
+		Avoid:       avoid,
+	})
+	return err == nil && got == node
+}
+
+// selectNode runs node selection for a clone of ps, translating a
+// capacity refusal into a counted deferral rather than an error.
+func (m *manager) selectNode(ctx context.Context, ps *profileState, kind store.PoolKind) (string, bool) {
+	// Profile + existing-row context lets the affinity wrapper apply
+	// prefer_nodes / anti_affinity_with; Shape lets the capacity wrapper
+	// skip nodes without room. The plain single / round_robin /
+	// least_loaded selectors ignore all three. The row snapshot is
+	// bounded by MaxConcurrentRunners, so building it per clone is cheap.
+	node, err := m.sel.Select(ctx, nodeselector.Hint{
+		Profile:     ps.settings.Name,
+		ExistingVMs: m.snapshotExistingVMsForAffinity(),
+		Shape:       shapeOf(ps.settings),
+	})
+	if err != nil {
+		// A capacity refusal is expected backpressure, not a fault: the
+		// nodes are simply full. Log at Debug and count it, so a
+		// saturated fleet doesn't drown the log in warnings.
+		if errors.Is(err, nodeselector.ErrNoCapacity) {
+			m.recordCapacityDeferral(ps, "none", kind)
+			m.log.Debug("clone: deferred, no node has capacity",
+				"profile", ps.settings.Name, "kind", kind, "err", err)
+			return "", false
+		}
+		m.log.Warn("clone: node selection failed", "profile", ps.settings.Name, "err", err)
+		return "", false
+	}
+	if m.cfg.LinkedClones {
+		// A linked clone must stay on the template's node, so the
+		// selector's answer is discarded — and the reservation is taken
+		// against THIS node, since charging the node we selected but
+		// will not use would account for the clone in the wrong place.
+		node = m.cfg.TemplateNode
+	}
+	return node, true
+}
+
+// reserveCapacity claims capacity for one clone of ps on node.
 //
 // The returned bool is the admission decision: false means "no room
 // right now", which is ordinary backpressure — the caller abandons this
 // dispatch, nothing is persisted, and the next reconcile tick retries.
 // It is never an error the operator needs to see, so it is logged at
 // Debug and counted rather than warned.
-//
-// A reservation parked by a previous tick's eviction is consumed in
-// preference to taking a fresh one: that is the whole point of parking
-// it, since the memory it covers was freed specifically for this
-// profile.
 func (m *manager) reserveCapacity(ctx context.Context, ps *profileState, node string, kind store.PoolKind) (capacityClaim, bool) {
 	if m.cfg.Capacity == nil {
 		return capacityClaim{release: func() {}}, true
 	}
 	profileName := ps.settings.Name
-
-	// Only a HOT clone may consume a parked reservation. Eviction
-	// destroys a sibling's idle VM specifically so a queued job can run;
-	// letting this profile's own warm refill spend that memory instead
-	// would sacrifice the victim for nothing and leave the job still
-	// waiting.
-	if kind == store.PoolKindHot {
-		if parked := ps.popEvicted(node); parked != nil {
-			m.log.Debug("clone: consuming reservation parked by an earlier eviction",
-				"profile", profileName, "node", node)
-			return claimFor(parked.res), true
-		}
-	}
 
 	res, ok, err := m.cfg.Capacity.Reserve(ctx, node, shapeOf(ps.settings))
 	if err != nil {
@@ -122,10 +223,13 @@ func (m *manager) recordCapacityDeferral(ps *profileState, node string, kind sto
 		WithLabelValues(m.cfg.ScaleSetName, metricsProfile(ps.settings.Name), node, string(kind)).Inc()
 }
 
-// popEvicted removes and returns a parked reservation for node, or nil.
+// popEvicted removes and returns one parked reservation, or nil. The
+// handle carries the node the eviction freed capacity on, so the caller
+// takes the node from it rather than choosing one first.
+//
 // Expired handles are dropped on the way past — the capacity they
 // covered has long since been reclaimed by the accountant's own TTL.
-func (ps *profileState) popEvicted(node string) *parkedReservation {
+func (ps *profileState) popEvicted() *parkedReservation {
 	ps.evictMu.Lock()
 	defer ps.evictMu.Unlock()
 	now := time.Now()
@@ -135,7 +239,7 @@ func (ps *profileState) popEvicted(node string) *parkedReservation {
 		switch {
 		case now.After(p.expires):
 			p.res.Release()
-		case found == nil && p.node == node:
+		case found == nil:
 			found = p
 		default:
 			kept = append(kept, p)
@@ -244,34 +348,60 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 		}
 	}
 
+	// Evict only on the node this profile would actually be placed on.
+	// Scanning every node instead would let a profile pinned by an
+	// affinity rule (or by linked clones) destroy idle VMs on a node it
+	// can never land on — repeating every tick, with no progress and a
+	// steadily shrinking pool.
+	node, ok := m.evictionNode(ctx, ps)
+	if !ok {
+		return false
+	}
+	st, known := states[node]
+	if !known {
+		m.log.Debug("evict: target node not in the capacity snapshot; skipping",
+			"profile", ps.settings.Name, "node", node)
+		return false
+	}
+
 	byNode, err := m.idleCandidatesByNode()
 	if err != nil {
 		m.log.Warn("evict: listing idle rows failed", "profile", ps.settings.Name, "err", err)
 		return false
 	}
 
-	// Deterministic node order so a tie between two equally-full nodes
-	// doesn't oscillate between reconcile passes.
-	nodes := make([]string, 0, len(byNode))
-	for node := range byNode {
-		nodes = append(nodes, node)
+	victims, freed := planEviction(byNode[node], shape.MemoryBytes, st.AvailableBytes)
+	if len(victims) == 0 {
+		return false
 	}
-	sort.Strings(nodes)
+	return m.startEviction(ctx, ps, node, shape, victims, freed)
+}
 
-	for _, node := range nodes {
-		st, known := states[node]
-		if !known {
-			continue
-		}
-		victims, freed := planEviction(byNode[node], shape.MemoryBytes, st.AvailableBytes)
-		if len(victims) == 0 {
-			continue
-		}
-		if m.startEviction(ctx, ps, node, shape, victims, freed) {
-			return true
-		}
+// evictionNode returns the node a clone of ps would be placed on if
+// capacity were not a constraint — which is exactly the question worth
+// asking, since capacity is what the eviction is about to free.
+//
+// It reuses the ordinary selector with a ZERO Shape: the capacity
+// wrapper is a pass-through for a zero shape, so affinity rules, the
+// underlying strategy and the linked-clone override all still apply
+// while the "every node is full" verdict that triggered this eviction
+// does not veto the answer.
+func (m *manager) evictionNode(ctx context.Context, ps *profileState) (string, bool) {
+	node, err := m.sel.Select(ctx, nodeselector.Hint{
+		Profile:     ps.settings.Name,
+		ExistingVMs: m.snapshotExistingVMsForAffinity(),
+	})
+	if err != nil {
+		// Typically an unsatisfiable hard pin. Nothing to evict for: no
+		// amount of freed memory would make this profile placeable.
+		m.log.Debug("evict: no placeable node for profile; nothing to evict for",
+			"profile", ps.settings.Name, "err", err)
+		return "", false
 	}
-	return false
+	if m.cfg.LinkedClones {
+		node = m.cfg.TemplateNode
+	}
+	return node, true
 }
 
 // planEviction picks the smallest set of idle VMs whose combined memory

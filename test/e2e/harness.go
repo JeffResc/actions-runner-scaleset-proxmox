@@ -74,6 +74,12 @@ type Options struct {
 	// MaxConcurrentRunners gates total runner provisioning. Defaults to 8.
 	MaxConcurrentRunners int
 
+	// OmitMaxConcurrentRunners leaves max_concurrent_runners out of the
+	// generated config entirely. Only valid alongside Capacity: without
+	// capacity admission the static cap is the only bound on the fleet
+	// and config validation requires it.
+	OmitMaxConcurrentRunners bool
+
 	// Org is the GitHub org slug the orchestrator registers under.
 	// Defaults to "octocat". The fake accepts any value.
 	Org string
@@ -298,6 +304,8 @@ func Start(t testing.TB, opts Options) *Harness {
 		AdminAddr:            adminAddr,
 		Profiles:             opts.Profiles,
 		Capacity:             opts.Capacity,
+
+		OmitMaxConcurrentRunners: opts.OmitMaxConcurrentRunners,
 	}
 	if multi {
 		const (
@@ -520,6 +528,10 @@ type configValues struct {
 	Profiles []ProfileSpec
 	Capacity *CapacitySpec
 
+	// OmitMaxConcurrentRunners drops the scaleset's static cap from the
+	// rendered config — the "let memory be the only cap" shape.
+	OmitMaxConcurrentRunners bool
+
 	// Cluster mode plumbing. When ClusterMode is "raft" the template
 	// emits the cluster.raft block; otherwise it's omitted
 	// (default = standalone).
@@ -590,7 +602,9 @@ scaleset:
   name: {{.ScaleSetName}}
   labels: [self-hosted, linux, x64, e2e]
   runner_group: default
+{{- if not .OmitMaxConcurrentRunners }}
   max_concurrent_runners: {{.MaxConcurrentRunners}}
+{{- end }}
 {{- end }}
 proxmox:
   endpoint: {{.ProxmoxURL}}

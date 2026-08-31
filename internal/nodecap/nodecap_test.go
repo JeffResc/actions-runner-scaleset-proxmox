@@ -405,9 +405,16 @@ func TestNodesOptionRestrictsAccounting(t *testing.T) {
 	})
 	a := newAccountant(t, rs, func(o *Options) { o.Nodes = []string{"pve1"} })
 
-	nodes, err := a.Nodes(context.Background())
+	states, err := a.Snapshot(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, []string{"pve1"}, nodes)
+	require.Contains(t, states, "pve1")
+	require.NotContains(t, states, "pve2",
+		"a node outside the operator's declared list must not be accounted for")
+
+	fits, err := a.Fits(context.Background(), Shape{MemoryBytes: gib}, []string{"pve1", "pve2"})
+	require.NoError(t, err)
+	require.True(t, fits["pve1"])
+	require.False(t, fits["pve2"], "...nor placed onto")
 }
 
 // TestStaleSnapshotBeatsFailingClosed: after one good read, a Proxmox

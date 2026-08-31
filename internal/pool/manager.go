@@ -2110,12 +2110,20 @@ type clonePrep struct {
 	// releaseCapacity drops this clone's capacity reservation. Always
 	// non-nil (a no-op when admission is disabled) and idempotent.
 	//
-	// Called ONLY on the paths where no live Proxmox VM survives to
-	// carry the allocation — a successful clone deliberately keeps its
-	// reservation, which the accountant retires once it observes the VM
-	// at full size. Releasing early would open a window in which the VM
-	// is accounted for by neither the reservation nor the (lagging)
-	// cluster snapshot.
+	// Called only on the failure paths. A SUCCESSFUL clone deliberately
+	// keeps its reservation, which the accountant retires once it
+	// observes the VM at full size; releasing early would open a window
+	// in which the VM is accounted for by neither the reservation nor
+	// the (lagging) cluster snapshot.
+	//
+	// On the failure paths the row is marked Destroying and a destroy is
+	// queued, so the reservation is released before the VM is actually
+	// gone. If the clone had already created a VM that the snapshot
+	// hasn't picked up yet, that briefly under-counts the node by one
+	// clone until the next refresh. Accepted deliberately: the
+	// alternative is holding the claim for a destroy we cannot observe
+	// the completion of, which would withhold the memory for the whole
+	// reservation TTL every time a clone fails.
 	releaseCapacity func()
 }
 
@@ -2270,47 +2278,13 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		attribute.Bool("powered_on", poweredOn),
 	))
 
-	// Build the Hint with profile + existing-row context so the
-	// affinity wrapper (issue #8) can apply prefer_nodes /
-	// anti_affinity_with rules. The non-affinity selectors ignore
-	// these fields; the snapshot is small (bounded by
-	// MaxConcurrentRunners) so building it on every clone is cheap.
-	hint := nodeselector.Hint{
-		Profile:     profileName,
-		ExistingVMs: m.snapshotExistingVMsForAffinity(),
-		Shape:       shapeOf(ps.settings),
-	}
-	node, err := m.sel.Select(ctx, hint)
-	if err != nil {
-		// A capacity refusal is expected backpressure, not a fault: the
-		// nodes are simply full. Log it at Debug and count it, so a
-		// saturated fleet doesn't drown the log in warnings.
-		if errors.Is(err, nodeselector.ErrNoCapacity) {
-			m.recordCapacityDeferral(ps, "none", kind)
-			m.log.Debug("clone: deferred, no node has capacity", "profile", profileName, "kind", kind, "err", err)
-		} else {
-			m.log.Warn("clone: node selection failed", "profile", profileName, "err", err)
-		}
-		span.End()
-		cancel()
-		return nil
-	}
-	if m.cfg.LinkedClones {
-		// A linked clone must stay on the template's node, so the
-		// selector's answer is discarded. The reservation below is
-		// therefore taken against THIS node — the capacity wrapper's
-		// filtering could not have helped here, and reserving against
-		// the node we selected but will not use would account for the
-		// clone in the wrong place.
-		node = m.cfg.TemplateNode
-	}
-
-	// Admission. The selector's capacity wrapper only narrowed the
-	// candidates; this reservation is the atomic gate that makes
-	// concurrent dispatches unable to spend the same memory twice.
-	// Taken BEFORE the VMID mint and row insert so a refusal leaves
-	// nothing to roll back.
-	claim, admitted := m.reserveCapacity(ctx, ps, node, kind)
+	// Node selection + capacity admission. The selector's capacity
+	// wrapper only narrows the candidate nodes; the reservation
+	// admitClone takes is the atomic gate that makes concurrent
+	// dispatches unable to spend the same memory twice. Both happen
+	// BEFORE the VMID mint and row insert, so a refusal leaves nothing
+	// to roll back.
+	node, claim, admitted := m.admitClone(ctx, ps, kind)
 	if !admitted {
 		span.End()
 		cancel()

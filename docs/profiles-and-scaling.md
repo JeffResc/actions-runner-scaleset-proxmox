@@ -195,6 +195,15 @@ destroying each other's VMs forever. Count it with
 `scaleset_capacity_evictions_total{profile,victim_profile}`; a high rate between
 two profiles means the node is too small for both pools to sit warm at once.
 
+Eviction respects [node placement](node-placement.md): it only sacrifices VMs on
+the node the requesting profile would actually be placed on. A profile pinned by
+an affinity rule (or by linked clones) will not destroy idle VMs on a node it
+could never land on, and a profile with no placeable node at all evicts nothing —
+no amount of freed memory would help it. The freed capacity is re-checked against
+those same rules before the replacement clone consumes it, so an
+`anti_affinity_with` guarantee still holds even if the node's occupants changed
+while the claim was parked.
+
 Two limits worth knowing:
 
 - Eviction is scoped to one scale set's own VMs. A scale set cannot reclaim
