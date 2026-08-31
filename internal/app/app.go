@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -1029,7 +1030,11 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 		return nil, fmt.Errorf("lookup runner scale set %q: %w", entry.Name, err)
 	}
 	if existing != nil {
-		return reconcileScaleSetLabels(ctx, gh, entry, existing, metrics, log), nil
+		rss, rerr := reconcileScaleSetLabels(ctx, gh, entry, existing, groupID, metrics, log)
+		if rerr != nil {
+			return nil, fmt.Errorf("reconcile runner scale set labels: %w", rerr)
+		}
+		return rss, nil
 	}
 	log.Info("creating runner scale set", "name", entry.Name)
 	labels := make([]scaleset.Label, 0, len(entry.Labels))
@@ -1065,47 +1070,164 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 // fire on it. The returned scale set is the updated one on success and
 // the existing one otherwise — never nil.
 func reconcileScaleSetLabels(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
-	existing *scaleset.RunnerScaleSet, metrics *observability.Metrics, log *slog.Logger) *scaleset.RunnerScaleSet {
+	existing *scaleset.RunnerScaleSet, groupID int, metrics *observability.Metrics,
+	log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
 	if len(entry.Labels) == 0 {
 		setLabelDrift(metrics, entry.Name, 0)
-		return existing
+		return existing, nil
 	}
 	want := desiredLabelNames(entry, existing.Labels)
 	have := labelNames(existing.Labels)
 	if slices.Equal(want, have) {
 		setLabelDrift(metrics, entry.Name, 0)
-		return existing
+		return existing, nil
 	}
-	log.Info("runner scale set labels differ from config; updating GitHub",
+	log.Info("runner scale set labels differ from config; recreating it on GitHub",
 		"scaleset", entry.Name, "github", have, "config", want)
-	updated, err := gh.UpdateRunnerScaleSet(ctx, existing.ID, &scaleset.RunnerScaleSet{
-		Name:          existing.Name,
-		RunnerGroupID: existing.RunnerGroupID,
+	return recreateScaleSetForLabels(ctx, gh, entry, existing, want, groupID, metrics, log)
+}
+
+// scalesetsRecreated records the scale sets this process already tried
+// to repair by recreation. A supervisor restart re-runs
+// ensureScaleSetForEntry, so without this a service that never applies
+// labels would drive an endless delete/create loop.
+var scalesetsRecreated sync.Map // scaleset name -> struct{}
+
+// recreateScaleSetForLabels deletes the scale set and creates it again
+// with the desired labels. Recreation is not a fallback: it is the only
+// mechanism that works. PATCH /_apis/runtime/runnerscalesets/{id}
+// answers 200 and leaves the labels untouched — probed against
+// github.com with three body shapes (the {name, runnerGroupId, labels}
+// one this orchestrator shipped in v0.1.4, the same plus the scale
+// set's own id, and labels alone); every one read back unchanged.
+// Create applies labels, and delete works, so delete+create it is. ARC
+// carries the same open bug (actions/actions-runner-controller#4424).
+//
+// This is destructive: the new scale set has a new ID, and every runner
+// registration and JIT config issued against the old one is void. It
+// therefore runs only when GitHub reports the scale set idle, and at
+// most once per scale set per process. The idle check reads the
+// statistics on the lookup response — github.com populates them there
+// (probed: the list-by-name and get-by-id responses both carry a full
+// statistics object), and a response without them is treated as "cannot
+// tell", which refuses rather than proceeds.
+//
+// The scale set is re-registered into groupID, the runner group the
+// config resolved by name, rather than the RunnerGroupID echoed on the
+// lookup response. Both are the same group whenever this function runs
+// — GetRunnerScaleSet filters by ?runnerGroupId=, so a scale set moved
+// to another group is not found here at all and takes the create path
+// instead — but the resolved value is the authoritative one and does
+// not depend on the response echoing the field.
+//
+// A delete that succeeds followed by a create that fails leaves GitHub
+// with no scale set at all; that returns an error so the worker's
+// supervisor retries, where the lookup misses and the create path
+// re-registers it.
+func recreateScaleSetForLabels(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
+	existing *scaleset.RunnerScaleSet, want []string, groupID int, metrics *observability.Metrics,
+	log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
+	if existing.Statistics == nil {
+		log.Warn("not recreating the runner scale set: GitHub returned no statistics for it, "+
+			"so there is no way to tell whether a job is in flight",
+			"scaleset", entry.Name, "config", want)
+		setLabelDrift(metrics, entry.Name, 1)
+		return existing, nil
+	}
+	if busy := scaleSetWorkInFlight(existing.Statistics); busy != "" {
+		log.Warn("not recreating the runner scale set: GitHub reports work in flight "+
+			"— labels stay as they are until the next start finds it idle",
+			"scaleset", entry.Name, "in_flight", busy, "config", want)
+		setLabelDrift(metrics, entry.Name, 1)
+		return existing, nil
+	}
+	if _, done := scalesetsRecreated.Load(entry.Name); done {
+		log.Warn("labels still differ after recreating this scale set once; leaving it alone "+
+			"— repeating the delete/create would churn GitHub without fixing anything",
+			"scaleset", entry.Name, "github", labelNames(existing.Labels), "config", want)
+		setLabelDrift(metrics, entry.Name, 1)
+		return existing, nil
+	}
+	log.Info("recreating runner scale set to apply the configured labels",
+		"scaleset", entry.Name, "id", existing.ID, "config", want)
+	if err := gh.DeleteRunnerScaleSet(ctx, existing.ID); err != nil {
+		// Nothing was mutated, so this attempt does not burn the
+		// once-per-process budget.
+		log.Warn("runner scale set delete failed; GitHub keeps its current labels",
+			"scaleset", entry.Name, "err", err)
+		setLabelDrift(metrics, entry.Name, 1)
+		return existing, nil
+	}
+	scalesetsRecreated.Store(entry.Name, struct{}{})
+	created, err := gh.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
+		Name:          entry.Name,
+		RunnerGroupID: groupID,
 		Labels:        labelsWithTypes(want, existing.Labels),
 	})
 	if err != nil {
-		log.Warn("runner scale set label update failed; GitHub keeps its current labels "+
-			"— jobs requesting a config-only label will stay queued",
-			"scaleset", entry.Name, "github", have, "config", want, "err", err)
 		setLabelDrift(metrics, entry.Name, 1)
-		return existing
+		return nil, fmt.Errorf("recreate runner scale set %q: deleted id %d but create failed: %w",
+			entry.Name, existing.ID, err)
 	}
+	if applied := labelNames(created.Labels); !slices.Equal(want, applied) {
+		log.Warn("recreated runner scale set still does not carry the configured labels",
+			"scaleset", entry.Name, "github", applied, "config", want)
+		setLabelDrift(metrics, entry.Name, 1)
+		return created, nil
+	}
+	log.Info("runner scale set recreated with the configured labels",
+		"scaleset", entry.Name, "old_id", existing.ID, "id", created.ID)
 	setLabelDrift(metrics, entry.Name, 0)
-	return updated
+	return created, nil
+}
+
+// scaleSetWorkInFlight returns a description of the work GitHub reports
+// against the scale set, or "" when it reports none. Callers handle a
+// nil statistics object themselves: absent counters mean "cannot tell",
+// which is not the same as idle.
+func scaleSetWorkInFlight(s *scaleset.RunnerScaleSetStatistic) string {
+	busy := []string{}
+	for _, c := range []struct {
+		name string
+		n    int
+	}{
+		{"available_jobs", s.TotalAvailableJobs},
+		{"acquired_jobs", s.TotalAcquiredJobs},
+		{"assigned_jobs", s.TotalAssignedJobs},
+		{"running_jobs", s.TotalRunningJobs},
+		{"registered_runners", s.TotalRegisteredRunners},
+	} {
+		if c.n > 0 {
+			busy = append(busy, fmt.Sprintf("%s=%d", c.name, c.n))
+		}
+	}
+	return strings.Join(busy, " ")
 }
 
 // desiredLabelNames returns the label set the config asks GitHub to
 // hold, sorted and deduplicated for comparison.
 //
-// Labels GitHub assigned itself ("System" type — a scale set created
-// without labels gets one named after the scale set) are carried over
-// rather than deleted: they are not the operator's to declare, and
-// dropping one would either break routing by scale-set name or, if the
-// service re-adds it, leave the reconciler patching on every start.
+// Labels GitHub assigned itself are carried over rather than deleted:
+// they are not the operator's to declare, and a scale set registered
+// without labels gets a system label named after itself, which is what
+// routing by scale-set name matches on.
+//
+// The type comparison is case-insensitive on purpose: the library sends
+// "System" but github.com returns "system", so an exact match here
+// silently protected nothing.
+//
+// Carrying the label over converges in one recreate rather than looping,
+// because github.com stores a client-supplied system type as system
+// instead of coercing it to user. Probed end to end: create labelless
+// (GitHub adds {name, system}), delete, create again with the config's
+// labels plus that label typed "System", then look it up the way the
+// next start does — the label reads back as system, so want still
+// contains it and matches have. A labelled create also adds no system
+// label of its own, so there is nothing new to diverge on.
 func desiredLabelNames(entry config.ScaleSetEntry, existing []scaleset.Label) []string {
 	want := slices.Clone(entry.Labels)
 	for _, l := range existing {
-		if l.Type == "System" {
+		if strings.EqualFold(l.Type, "System") {
 			want = append(want, l.Name)
 		}
 	}

@@ -39,24 +39,45 @@ func (s *Server) InjectDeleteFailure(status, count int) {
 	s.deleteFault = httpFault{status: status, count: count}
 }
 
-// InjectScaleSetUpdateFailure makes the next `count` scale-set PATCH
-// (label reconciliation) calls fail with the given HTTP status. Drives
-// ensureScaleSetForEntry's warn-and-continue branch, where GitHub keeps
-// labels that disagree with the config.
-func (s *Server) InjectScaleSetUpdateFailure(status, count int) {
+// InjectScaleSetDeleteFailure makes the next `count` scale-set DELETE
+// calls fail with the given HTTP status. Drives the label-recreate
+// path's first failure branch, where nothing was mutated and GitHub
+// keeps the labels it has.
+func (s *Server) InjectScaleSetDeleteFailure(status, count int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.scaleSetUpdateFault = httpFault{status: status, count: count}
+	s.scaleSetDeleteFault = httpFault{status: status, count: count}
 }
 
-// takeScaleSetUpdateFaultLocked mirrors takeListFaultLocked for the
-// scale-set PATCH endpoint. Caller must hold s.mu.
-func (s *Server) takeScaleSetUpdateFaultLocked() (httpFault, bool) {
-	if s.scaleSetUpdateFault.count <= 0 {
+// InjectScaleSetCreateFailure makes the next `count` scale-set POST
+// calls fail with the given HTTP status. Paired with a successful
+// delete it produces the one state the orchestrator cannot paper over:
+// the scale set is gone from GitHub and could not be re-registered.
+func (s *Server) InjectScaleSetCreateFailure(status, count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scaleSetCreateFault = httpFault{status: status, count: count}
+}
+
+// takeScaleSetDeleteFaultLocked mirrors takeListFaultLocked for the
+// scale-set DELETE endpoint. Caller must hold s.mu.
+func (s *Server) takeScaleSetDeleteFaultLocked() (httpFault, bool) {
+	if s.scaleSetDeleteFault.count <= 0 {
 		return httpFault{}, false
 	}
-	f := s.scaleSetUpdateFault
-	s.scaleSetUpdateFault.count--
+	f := s.scaleSetDeleteFault
+	s.scaleSetDeleteFault.count--
+	return f, true
+}
+
+// takeScaleSetCreateFaultLocked mirrors takeListFaultLocked for the
+// scale-set POST endpoint. Caller must hold s.mu.
+func (s *Server) takeScaleSetCreateFaultLocked() (httpFault, bool) {
+	if s.scaleSetCreateFault.count <= 0 {
+		return httpFault{}, false
+	}
+	f := s.scaleSetCreateFault
+	s.scaleSetCreateFault.count--
 	return f, true
 }
 

@@ -245,23 +245,24 @@ func TestEnsureScaleSetForEntry_FoundDefaultGroup(t *testing.T) {
 	require.Equal(t, 42, rss.ID)
 }
 
-// TestEnsureScaleSetForEntry_LabelDriftRepaired drives the case the
+// TestEnsureScaleSetForEntry_LabelDriftRecreated drives the case the
 // early return used to skip: the scale set already exists on GitHub
-// with fewer labels than the config now lists. The orchestrator must
-// PATCH GitHub into agreement, otherwise jobs asking for the new label
-// queue forever with every health signal green.
-func TestEnsureScaleSetForEntry_LabelDriftRepaired(t *testing.T) {
+// with fewer labels than the config now lists. Recreation is the only
+// mechanism that changes a registered scale set's labels — the update
+// endpoint answers 200 and ignores them — so the scale set must come
+// back under a new ID carrying the configured set.
+func TestEnsureScaleSetForEntry_LabelDriftRecreated(t *testing.T) {
 	t.Parallel()
 	srv := fakegithub.New(t, fakegithub.Options{
 		ScaleSet: fakegithub.ScaleSetOptions{
 			ID:     77,
-			Name:   "linux-x64",
+			Name:   "drift-recreated",
 			Labels: []string{"self-hosted", "linux", "x64", "proxmox"},
 		},
 	})
 	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
 	entry := config.ScaleSetEntry{
-		Name:   "linux-x64",
+		Name:   "drift-recreated",
 		Labels: []string{"self-hosted", "linux", "x64", "proxmox", "mem-4g"},
 	}
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
@@ -271,103 +272,252 @@ func TestEnsureScaleSetForEntry_LabelDriftRepaired(t *testing.T) {
 	require.NotNil(t, rss)
 	require.ElementsMatch(t, entry.Labels, srv.ScaleSetLabels(),
 		"the configured labels must reach GitHub on an already-existing scale set")
-	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")),
+	require.NotEqual(t, 77, rss.ID,
+		"a recreated scale set has a new ID, and the caller must be handed it")
+	require.Equal(t, srv.ScaleSetID(), rss.ID)
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-recreated")),
 		"a repaired difference is not drift")
 }
 
-// TestEnsureScaleSetForEntry_LabelDriftUpdateFailureWarns pins the
-// fallback: when the PATCH is rejected, startup continues with the
-// labels GitHub already knows (they still route jobs) and the
-// unrepaired difference is published for alerting.
-func TestEnsureScaleSetForEntry_LabelDriftUpdateFailureWarns(t *testing.T) {
+// TestEnsureScaleSetForEntry_DeleteFailureWarns pins the non-destructive
+// failure: the delete is rejected, so nothing changed on GitHub. Startup
+// continues with the labels GitHub already knows (they still route every
+// job that does not ask for a config-only label) and the unrepaired
+// difference is published for alerting.
+func TestEnsureScaleSetForEntry_DeleteFailureWarns(t *testing.T) {
 	t.Parallel()
 	srv := fakegithub.New(t, fakegithub.Options{
-		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "linux-x64", Labels: []string{"proxmox"}},
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "drift-delete-fails", Labels: []string{"proxmox"}},
 	})
-	srv.InjectScaleSetUpdateFailure(http.StatusInternalServerError, 1)
+	srv.InjectScaleSetDeleteFailure(http.StatusInternalServerError, 1)
 	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
-	entry := config.ScaleSetEntry{Name: "linux-x64", Labels: []string{"proxmox", "mem-4g"}}
+	entry := config.ScaleSetEntry{Name: "drift-delete-fails", Labels: []string{"proxmox", "mem-4g"}}
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 
 	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
-	require.NoError(t, err, "a failed label update must not stop the scale set from starting")
+	require.NoError(t, err, "a failed repair must not stop the scale set from starting")
 	require.NotNil(t, rss)
 	require.Equal(t, 77, rss.ID)
 	require.Equal(t, []string{"proxmox"}, srv.ScaleSetLabels())
-	require.Equal(t, float64(1), testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")),
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-delete-fails")),
 		"an unrepaired difference must be visible on scaleset_labels_drift")
 }
 
-// TestEnsureScaleSetForEntry_LabelsInSyncNoUpdate pins that matching
-// labels issue no PATCH — the injected failure would surface as drift
-// if the reconciliation fired on every start.
-func TestEnsureScaleSetForEntry_LabelsInSyncNoUpdate(t *testing.T) {
+// TestEnsureScaleSetForEntry_DeletedThenCreateFailsSurfaces pins the one
+// state that cannot be papered over: the delete succeeded and the create
+// did not, so GitHub now hosts no scale set at all. Returning the stale
+// pre-delete scale set would hand the listener a dead ID; the error
+// sends the worker back through its supervisor, where the lookup misses
+// and the create path re-registers it.
+func TestEnsureScaleSetForEntry_DeletedThenCreateFailsSurfaces(t *testing.T) {
 	t.Parallel()
 	srv := fakegithub.New(t, fakegithub.Options{
-		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "linux-x64", Labels: []string{"proxmox", "linux"}},
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "drift-create-fails", Labels: []string{"proxmox"}},
 	})
-	srv.InjectScaleSetUpdateFailure(http.StatusInternalServerError, 1)
+	srv.InjectScaleSetCreateFailure(http.StatusInternalServerError, 1)
 	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
-	// Same set, different order — order is not drift.
-	entry := config.ScaleSetEntry{Name: "linux-x64", Labels: []string{"linux", "proxmox"}}
+	entry := config.ScaleSetEntry{Name: "drift-create-fails", Labels: []string{"proxmox", "mem-4g"}}
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 
-	_, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.Error(t, err, "a scale set deleted but not recreated must not look like success")
+	require.Nil(t, rss)
+	require.Contains(t, err.Error(), "deleted id 77")
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-create-fails")))
+
+	// The supervisor's retry finds no scale set and creates it — with
+	// the configured labels, since that is the path that works.
+	rss, err = ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
 	require.NoError(t, err)
-	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")))
+	require.ElementsMatch(t, entry.Labels, srv.ScaleSetLabels())
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-create-fails")))
+	require.Equal(t, srv.ScaleSetID(), rss.ID)
+}
+
+// TestEnsureScaleSetForEntry_RecreatesAtMostOncePerProcess pins the loop
+// guard. If GitHub ever hands back a scale set whose labels still do not
+// match, a second pass must not delete and recreate it again — that
+// would churn GitHub forever without converging.
+func TestEnsureScaleSetForEntry_RecreatesAtMostOncePerProcess(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "drift-once", Labels: []string{"proxmox"}},
+	})
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{Name: "drift-once", Labels: []string{"proxmox", "mem-4g"}}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	first, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	recreatedID := first.ID
+
+	// Drive a second pass whose labels differ again. The guard must
+	// leave GitHub alone and report drift instead of recreating.
+	entry.Labels = append(entry.Labels, "mem-8g")
+	second, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, recreatedID, second.ID, "the scale set must not be recreated twice")
+	require.NotContains(t, srv.ScaleSetLabels(), "mem-8g")
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-once")))
+}
+
+// TestEnsureScaleSetForEntry_BusyScaleSetIsNotRecreated pins the safety
+// interlock. Recreating voids every runner registration and JIT config
+// issued against the old scale set, so a scale set GitHub reports as
+// working keeps its labels until a later start finds it idle.
+func TestEnsureScaleSetForEntry_BusyScaleSetIsNotRecreated(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{
+			ID:         77,
+			Name:       "drift-busy",
+			Labels:     []string{"proxmox"},
+			Statistics: &fakegithub.Statistics{TotalRunningJobs: 1, TotalRegisteredRunners: 2},
+		},
+	})
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{Name: "drift-busy", Labels: []string{"proxmox", "mem-4g"}}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, 77, rss.ID, "a busy scale set must be left registered as it is")
+	require.Equal(t, []string{"proxmox"}, srv.ScaleSetLabels())
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-busy")),
+		"labels the orchestrator declined to repair are still drift")
+}
+
+// TestEnsureScaleSetForEntry_NoStatisticsIsNotIdle pins that a lookup
+// response without statistics refuses the recreate. github.com always
+// sends them, so this is the "something is different from what we
+// probed" case — and guessing idle there would delete a scale set with
+// a job on it.
+func TestEnsureScaleSetForEntry_NoStatisticsIsNotIdle(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{
+			ID: 77, Name: "drift-no-stats", Labels: []string{"proxmox"}, OmitStatistics: true,
+		},
+	})
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{Name: "drift-no-stats", Labels: []string{"proxmox", "mem-4g"}}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, 77, rss.ID, "a scale set whose idleness cannot be confirmed must be left alone")
+	require.Equal(t, []string{"proxmox"}, srv.ScaleSetLabels())
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-no-stats")))
+}
+
+// TestEnsureScaleSetForEntry_RecreateUsesConfiguredRunnerGroup pins that
+// the create posts the runner group resolved from the config, not the
+// RunnerGroupID echoed on the lookup response.
+//
+// The two cannot actually diverge on github.com: the lookup filters by
+// ?runnerGroupId= (probed — a name that exists in group 1 answers
+// count=0 for any other group), so a scale set whose group changed is
+// never found here and takes the create path instead. The fake makes
+// them differ anyway, to keep the create from silently going back to
+// depending on a field the response is not obliged to echo.
+func TestEnsureScaleSetForEntry_RecreateUsesConfiguredRunnerGroup(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{
+			ID: 77, Name: "drift-group", RunnerGroupID: 9, Labels: []string{"proxmox"},
+		},
+		// The scale set currently sits in group 9; the config's
+		// runner_group resolves to 42. The recreate must post 42.
+		RunnerGroupLookupID: 42,
+	})
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{
+		Name:        "drift-group",
+		RunnerGroup: "prod-group",
+		Labels:      []string{"proxmox", "mem-4g"},
+	}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, 42, rss.RunnerGroupID,
+		"the recreate must post the runner group the lookup resolved by name, not the old one")
+	require.ElementsMatch(t, entry.Labels, srv.ScaleSetLabels())
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("drift-group")))
+}
+
+// TestEnsureScaleSetForEntry_LabelsInSyncNoRecreate pins that matching
+// labels touch nothing — the injected delete failure would surface as
+// drift if the reconciliation fired on every start.
+func TestEnsureScaleSetForEntry_LabelsInSyncNoRecreate(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "in-sync", Labels: []string{"proxmox", "linux"}},
+	})
+	srv.InjectScaleSetDeleteFailure(http.StatusInternalServerError, 1)
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	// Same set, different order — order is not drift.
+	entry := config.ScaleSetEntry{Name: "in-sync", Labels: []string{"linux", "proxmox"}}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, 77, rss.ID)
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("in-sync")))
 }
 
 // TestEnsureScaleSetForEntry_NoConfiguredLabelsLeavesGitHubAlone pins
 // that an entry without `labels:` does not manage labels at all.
-// Reconciling one to "just the scale set's name" would wipe the label
-// set of a scale set adopted from ARC or created by hand — the failure
-// this reconciliation exists to prevent, in the opposite direction.
+// Reconciling one to "just the scale set's name" would delete and
+// recreate a scale set adopted from ARC or created by hand, dropping
+// every label it carried.
 func TestEnsureScaleSetForEntry_NoConfiguredLabelsLeavesGitHubAlone(t *testing.T) {
 	t.Parallel()
 	adopted := []string{"self-hosted", "linux", "x64", "proxmox"}
 	srv := fakegithub.New(t, fakegithub.Options{
-		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "linux-x64", Labels: adopted},
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "unmanaged-labels", Labels: adopted},
 	})
-	srv.InjectScaleSetUpdateFailure(http.StatusInternalServerError, 1)
+	srv.InjectScaleSetDeleteFailure(http.StatusInternalServerError, 1)
 	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
-	entry := config.ScaleSetEntry{Name: "linux-x64"} // no Labels
+	entry := config.ScaleSetEntry{Name: "unmanaged-labels"} // no Labels
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 
-	_, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	rss, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
 	require.NoError(t, err)
+	require.Equal(t, 77, rss.ID)
 	require.Equal(t, adopted, srv.ScaleSetLabels(),
 		"an empty labels: must leave GitHub's label set untouched")
-	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")))
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("unmanaged-labels")))
 }
 
-// TestEnsureScaleSetForEntry_SystemLabelPreserved pins that GitHub's
-// own "System" label survives reconciliation. A scale set created
-// without labels carries one named after itself; deleting it would
-// break routing by scale-set name, and a service that re-added it
-// would leave the reconciler patching on every restart.
+// TestEnsureScaleSetForEntry_SystemLabelPreserved pins that the label
+// GitHub assigns itself survives a recreate. A scale set registered
+// without labels carries a "system" label named after itself, which is
+// what routing by scale-set name matches on — and the type comes back
+// lowercase, so the carry-over must not compare case-sensitively.
 func TestEnsureScaleSetForEntry_SystemLabelPreserved(t *testing.T) {
 	t.Parallel()
-	// No seeded labels — the fake mirrors GitHub's create-path default
-	// of one System label named after the scale set.
+	// No seeded labels — the fake mirrors github.com's create-path
+	// default of one lowercase "system" label named after the scale set.
 	srv := fakegithub.New(t, fakegithub.Options{
-		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "linux-x64"},
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "system-label"},
 	})
 	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
-	entry := config.ScaleSetEntry{Name: "linux-x64", Labels: []string{"proxmox", "mem-4g"}}
+	entry := config.ScaleSetEntry{Name: "system-label", Labels: []string{"proxmox", "mem-4g"}}
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 
 	_, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"linux-x64", "proxmox", "mem-4g"}, srv.ScaleSetLabels(),
-		"the configured labels must be added without dropping GitHub's System label")
+	require.ElementsMatch(t, []string{"system-label", "proxmox", "mem-4g"}, srv.ScaleSetLabels(),
+		"the configured labels must be added without dropping GitHub's own label")
 
 	// Second pass over the reconciled state must be a no-op: the
-	// injected failure would surface as drift if it patched again.
-	srv.InjectScaleSetUpdateFailure(http.StatusInternalServerError, 1)
+	// injected failure would surface as drift if it recreated again.
+	srv.InjectScaleSetDeleteFailure(http.StatusInternalServerError, 1)
 	_, err = ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
 	require.NoError(t, err)
-	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")),
-		"reconciliation must converge, not patch on every start")
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("system-label")),
+		"reconciliation must converge, not recreate on every start")
 }
 
 // TestEnsureScaleSetForEntry_CreateFailureSurfaces pins that a scale

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -40,10 +41,11 @@ type runnerScaleSetLabel struct {
 }
 
 type fakeRunnerScaleSet struct {
-	ID            int                   `json:"id"`
-	Name          string                `json:"name"`
-	RunnerGroupID int                   `json:"runnerGroupId"`
-	Labels        []runnerScaleSetLabel `json:"labels,omitempty"`
+	ID            int                          `json:"id"`
+	Name          string                       `json:"name"`
+	RunnerGroupID int                          `json:"runnerGroupId"`
+	Labels        []runnerScaleSetLabel        `json:"labels,omitempty"`
+	Statistics    *fakeRunnerScaleSetStatistic `json:"statistics,omitempty"`
 }
 
 type runnerScaleSetList struct {
@@ -115,13 +117,27 @@ type ScaleSetOptions struct {
 	// set. Tests that drive the orchestrator's label reconciliation
 	// seed a set that differs from the config's.
 	Labels []string
+
+	// Statistics is what the fake reports on the scale set itself (not
+	// the session). The orchestrator reads it to decide whether a
+	// scale set is idle enough to recreate. Nil means all-zero — an
+	// idle scale set — because github.com always carries a populated
+	// statistics object on the scale-set lookup.
+	Statistics *Statistics
+
+	// OmitStatistics drops the statistics object from the scale-set
+	// responses entirely. github.com does not do this; it exists to
+	// drive the orchestrator's "cannot confirm idle, so refuse to
+	// recreate" branch.
+	OmitStatistics bool
 }
 
 // isZero reports whether the caller left ScaleSetOptions untouched.
 // A plain `==` comparison stopped working once Labels made the struct
 // non-comparable.
 func (o ScaleSetOptions) isZero() bool {
-	return o.ID == 0 && o.Name == "" && o.RunnerGroupID == 0 && len(o.Labels) == 0
+	return o.ID == 0 && o.Name == "" && o.RunnerGroupID == 0 && len(o.Labels) == 0 &&
+		o.Statistics == nil && !o.OmitStatistics
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +199,12 @@ func (s *Server) entryByURLID(w http.ResponseWriter, r *http.Request) *scalesetE
 		http.Error(w, "bad scaleset id "+raw, http.StatusBadRequest)
 		return nil
 	}
+	s.mu.Lock()
 	entry, ok := s.scalesetsByID[id]
+	if ok && entry.deleted {
+		ok = false
+	}
+	s.mu.Unlock()
 	if !ok {
 		http.Error(w, fmt.Sprintf("scaleset %d not found", id), http.StatusNotFound)
 		return nil
@@ -202,7 +223,9 @@ func (s *Server) entryByURLSSID(w http.ResponseWriter, r *http.Request) *scalese
 		http.Error(w, "bad scaleset id "+raw, http.StatusBadRequest)
 		return nil
 	}
+	s.mu.Lock()
 	entry, ok := s.scalesetsByID[id]
+	s.mu.Unlock()
 	if !ok {
 		http.Error(w, fmt.Sprintf("scaleset %d not found", id), http.StatusNotFound)
 		return nil
@@ -251,6 +274,9 @@ func (s *Server) handleRunnerGroupLookup(w http.ResponseWriter, r *http.Request)
 		groupID = entry.spec.RunnerGroupID
 		break
 	}
+	if s.runnerGroupLookupID != 0 {
+		groupID = s.runnerGroupLookupID
+	}
 	writeJSON(w, http.StatusOK, struct {
 		Count int               `json:"count"`
 		Value []runnerGroupResp `json:"value"`
@@ -267,7 +293,7 @@ func (s *Server) handleScaleSetLookup(w http.ResponseWriter, r *http.Request) {
 	// spec needs the lock even though the map itself is fixed.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !ok {
+	if !ok || entry.deleted {
 		// Even when no name matches, the scaleset library treats
 		// `count:0` as "not found" (returns nil rather than error)
 		// and the orchestrator follows up with a CreateRunnerScaleSet.
@@ -288,20 +314,37 @@ func (s *Server) handleScaleSetCreate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if f, ok := s.takeScaleSetCreateFaultLocked(); ok {
+		http.Error(w, "scaleset create rejected", f.status)
+		return
+	}
 	if entry, ok := s.scalesets[body.Name]; ok {
-		// Real GitHub stores the labels the create request carried;
-		// keeping them here lets a later lookup (and ScaleSetLabels)
-		// agree with what the orchestrator asked for.
-		//
-		// No test reaches this today: a create only follows a lookup
-		// miss, and the lookup answers for every name this branch
-		// accepts. Reaching it needs a lookup-miss injection knob.
+		// github.com stores exactly the labels the create request
+		// carried, lowercasing each type, and answers 200 (not 201 —
+		// CreateRunnerScaleSet rejects anything else). A create that
+		// follows a delete re-registers the scale set under a fresh
+		// ID, which is what makes the orchestrator's label recreate
+		// observable.
 		if len(body.Labels) > 0 {
-			entry.spec.Labels = body.Labels
+			labels := make([]runnerScaleSetLabel, 0, len(body.Labels))
+			for i, l := range body.Labels {
+				typ := strings.ToLower(l.Type)
+				if typ == "" {
+					typ = "user"
+				}
+				labels = append(labels, runnerScaleSetLabel{ID: i + 1, Name: l.Name, Type: typ})
+			}
+			entry.spec.Labels = labels
 		}
-		// 200, not 201: CreateRunnerScaleSet rejects anything else as
-		// "unexpected status code", which made this whole branch
-		// unreachable.
+		if body.RunnerGroupID != 0 {
+			entry.spec.RunnerGroupID = body.RunnerGroupID
+		}
+		if entry.deleted {
+			entry.deleted = false
+			entry.spec.ID = s.nextScaleSetID
+			s.nextScaleSetID++
+			s.scalesetsByID[entry.spec.ID] = entry
+		}
 		writeJSON(w, http.StatusOK, entry.spec)
 		return
 	}
@@ -311,30 +354,40 @@ func (s *Server) handleScaleSetCreate(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, fmt.Sprintf("scaleset %q not configured on fake", body.Name), http.StatusUnprocessableEntity)
 }
 
-// handleScaleSetUpdate applies a PATCH to an existing scale set. Only
-// the labels are mutable here — that is the field the orchestrator
-// reconciles — and an omitted `labels` leaves the current set alone,
-// matching PATCH semantics.
+// handleScaleSetUpdate answers a scale-set PATCH the way github.com
+// does: 200 with the scale set unchanged. Labels in particular are
+// accepted and silently ignored — probed against the live API with the
+// {name, runnerGroupId, labels} body, that body plus the scale set's
+// id, and labels alone; all three read back unchanged. Modelling the
+// no-op is the point: an orchestrator that trusts a 200 here reports a
+// repair that never happened.
 func (s *Server) handleScaleSetUpdate(w http.ResponseWriter, r *http.Request) {
 	entry := s.entryByURLID(w, r)
 	if entry == nil {
 		return
 	}
-	var body fakeRunnerScaleSet
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "bad scaleset patch body", http.StatusBadRequest)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	writeJSON(w, http.StatusOK, entry.spec)
+}
+
+// handleScaleSetDelete removes a scale set. The entry stays behind so a
+// create can re-register the name under a new ID; until then the lookup
+// answers "not found".
+func (s *Server) handleScaleSetDelete(w http.ResponseWriter, r *http.Request) {
+	entry := s.entryByURLID(w, r)
+	if entry == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if f, ok := s.takeScaleSetUpdateFaultLocked(); ok {
-		http.Error(w, "scaleset update rejected", f.status)
+	if f, ok := s.takeScaleSetDeleteFaultLocked(); ok {
+		http.Error(w, "scaleset delete rejected", f.status)
 		return
 	}
-	if body.Labels != nil {
-		entry.spec.Labels = body.Labels
-	}
-	writeJSON(w, http.StatusOK, entry.spec)
+	delete(s.scalesetsByID, entry.spec.ID)
+	entry.deleted = true
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
