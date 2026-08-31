@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.2](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.1...actions-runner-scaleset-proxmox-v0.1.2) (2026-08-31)
+
+
+### Bug Fixes
+
+* **chart:** drop the github.scope.org default so a repo-scoped install renders exactly one scope ([0726f40](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/0726f402b0cdfb95b71b9e32a673ca6f4e5265fe))
+* **chart:** drop the github.scope.org default so a repo-scoped install renders exactly one scope ([91aab85](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/91aab852f50a6762c59da5f299704c28e53296c8))
+* **ci:** publish semver container image tags instead of sha tags ([b9b8d6c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/b9b8d6c60a04a77263be9ec2f563b7befd1727d5))
+* **ci:** publish semver container image tags instead of sha tags ([5373a86](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/5373a868629031f981a8753953098743321f2df1))
+
 ## [0.1.1](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.0...actions-runner-scaleset-proxmox-v0.1.1) (2026-08-30)
 
 
