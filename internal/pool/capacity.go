@@ -485,6 +485,15 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 	for _, node := range eligible {
 		plan := planEviction(byNode[node], shape, states[node])
 		if len(plan.victims) == 0 {
+			// The interesting half of a stuck job: this node is eligible
+			// and short, but its idle VMs cannot close the gap (or there
+			// are none). Logging the gap per node is what turns "the job
+			// never starts" into "pve1 is 8 GiB short and holds nothing
+			// idle".
+			m.log.Debug("evict: no viable victim set on eligible node",
+				"profile", ps.settings.Name, "node", node,
+				"gap_bytes", plan.memGap, "gap_vcpu", plan.vcpuGap,
+				"idle_candidates", len(byNode[node]))
 			continue
 		}
 		if m.startEviction(ctx, ps, node, shape, plan) {
