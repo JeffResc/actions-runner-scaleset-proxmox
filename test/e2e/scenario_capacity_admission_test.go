@@ -215,12 +215,20 @@ func TestE2E_CapacityAdmission_IgnoresDormantForeignVMs(t *testing.T) {
 	fp.SeedVM("pve1", 500, "someone-elses-database", false /* stopped */, nil)
 	require.NoError(t, fp.SetVMConfig(500, "memory", 24*1024))
 
+	// Warm pools deliberately want MORE than the node can admit: 4x4 +
+	// 3x8 + 2x16 = 72 GiB against 28 GiB admissible. Without that excess
+	// the upper bound below would just be restating the configured pool
+	// size and could not fail.
 	h := Start(t, Options{
 		FakeProxmox:          fp,
 		HotSize:              0,
-		MaxConcurrentRunners: 8,
-		Profiles:             homelabProfiles(),
-		Capacity:             &CapacitySpec{ReserveMemoryMB: 4096},
+		MaxConcurrentRunners: 20,
+		Profiles: []ProfileSpec{
+			{Name: "mem-4g", CPUCores: 2, MemoryMB: 4096, WarmSize: 4},
+			{Name: "mem-8g", CPUCores: 4, MemoryMB: 8192, WarmSize: 3},
+			{Name: "mem-16g", CPUCores: 8, MemoryMB: 16384, WarmSize: 2},
+		},
+		Capacity: &CapacitySpec{ReserveMemoryMB: 4096},
 	})
 
 	// 32 GiB - 4 GiB reserve = 28 GiB admissible, so the pool should get
@@ -232,14 +240,22 @@ func TestE2E_CapacityAdmission_IgnoresDormantForeignVMs(t *testing.T) {
 		"a powered-off neighbour must not withhold capacity it isn't using")
 	time.Sleep(2 * time.Second)
 
+	// Admission still bounds the pool: it wants 72 GiB of warm VMs and
+	// may have 28.
+	//
+	// Note what this does NOT prove. It would hold even if holdsMemory
+	// stopped counting our own warm VMs, because a skipped guest never
+	// satisfies the retirement rule (observed >= reserved, and observed
+	// would be 0), so its clone's RESERVATION never retires and keeps
+	// accounting for it in full — for the whole clone_inflight_grace.
+	// The ledger stays correct for far longer than a scenario runs, so
+	// the ownership carve-out cannot be covered from here; the
+	// deterministic test for it is TestStoppedOwnedGuestStillCounts in
+	// internal/nodecap.
 	count, allocatedMB := ownedAllocationMB(t, h)
 	require.LessOrEqual(t, allocatedMB, 28*1024,
-		"still bounded by what the node can actually admit; saw %d MiB across %d VMs",
+		"the pool wants 72 GiB of warm VMs; only 28 GiB may be admitted. saw %d MiB across %d VMs",
 		allocatedMB, count)
-
-	// Our own warm VMs are stopped too — and they DO count, or the pool
-	// would clone without limit. The bound above is the proof.
-	require.Positive(t, count)
 }
 
 // TestE2E_CapacityAdmission_DisabledKeepsLegacyBehaviour is the

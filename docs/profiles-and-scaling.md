@@ -95,7 +95,8 @@ A clone is now admitted only if it also fits in the target node's remaining
 **allocated** memory:
 
 ```
-available = node RAM − host reserve − Σ configured memory of every guest on the node
+available = node RAM − host reserve − Σ configured memory of every guest holding memory
+            (every running guest, plus our own guests whatever their power state)
 ```
 
 Three things about that sum are load-bearing:

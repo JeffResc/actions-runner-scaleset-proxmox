@@ -16,6 +16,8 @@ import (
 
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
 const gib = 1024 * 1024 * 1024
@@ -85,6 +87,16 @@ func guestRow(vmid int, node string, memBytes uint64, vcpus int) map[string]any 
 		"id": fmt.Sprintf("qemu/%d", vmid), "type": "qemu", "node": node,
 		"vmid": vmid, "status": "running", "maxmem": memBytes, "maxcpu": vcpus,
 	}
+}
+
+// ownerTags renders the wire tag string PVE would report for a guest
+// owned by the named scale set. Built through the tags package so the
+// fixture cannot drift from the real encoding.
+func ownerTags(t *testing.T, scaleSet string) string {
+	t.Helper()
+	owner, err := tags.OwnerTag(scaleSet)
+	require.NoError(t, err)
+	return tags.Marker + ";" + owner
 }
 
 // stoppedGuestRow is a powered-off guest. It holds nothing, so whether
@@ -212,6 +224,49 @@ func TestStoppedOwnedGuestStillCounts(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(16*gib), states["pve1"].CommittedBytes,
 		"both warm VMs count; the foreign dormant one does not")
+}
+
+// TestStoppedOwnedGuestCountsByTagOutsideTheRange. Ownership by VMID
+// range alone is not enough: the rest of the orchestrator owns VMs by
+// TAG — provisioner.classifyVM adopts any tagged VM whatever its VMID —
+// so a range repartition leaves owned VMs sitting outside the new
+// ranges. Their stopped warm capacity must keep counting, or the pool
+// clones a node's worth of runners on top of them and oversubscribes
+// the moment one is promoted.
+func TestStoppedOwnedGuestCountsByTagOutsideTheRange(t *testing.T) {
+	t.Parallel()
+	// 9001 is ours by tag but predates the current 10000-10999 range.
+	legacy := stoppedGuestRow(9001, "pve1", 16*gib, 8)
+	legacy["tags"] = ownerTags(t, "prod")
+
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 64*gib, 16),
+		legacy,
+		stoppedGuestRow(400, "pve1", 8*gib, 4), // genuinely foreign
+	})
+	a := newAccountant(t, rs, func(o *Options) { o.OwnerScaleSets = []string{"prod"} })
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(16*gib), states["pve1"].CommittedBytes,
+		"an owned VM outside the VMID range still holds its warm allocation")
+}
+
+// TestStoppedGuestWithForeignTagIsNotOurs guards the other direction:
+// a tag belonging to some other tool, or another orchestrator's scale
+// set, must not be mistaken for ours.
+func TestStoppedGuestWithForeignTagIsNotOurs(t *testing.T) {
+	t.Parallel()
+	other := stoppedGuestRow(400, "pve1", 16*gib, 8)
+	other["tags"] = ownerTags(t, "someone-else")
+
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 16), other})
+	a := newAccountant(t, rs, func(o *Options) { o.OwnerScaleSets = []string{"prod"} })
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, states["pve1"].CommittedBytes,
+		"another owner's dormant VM holds no memory of ours to plan around")
 }
 
 // TestUnknownGuestStatusCountsConservatively: only an explicit "stopped"

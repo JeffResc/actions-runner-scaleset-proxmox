@@ -566,11 +566,14 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 		// outliving its clone is the same question, so it reuses the
 		// same knob rather than adding a near-duplicate one.
 		ReservationTTL: cfg.Pool.CloneInflightGrace.D(),
-		// Every scale set's clone range. Guests inside them count even
+		// How the accountant recognises our own guests, which count even
 		// when powered off — the warm tier is stopped by design — while
 		// foreign guests count only while they actually hold memory.
-		OwnedVMIDs: ownedVMIDRanges(cfg),
-		Log:        log,
+		// Ranges catch a clone before its tags land; tags catch an owned
+		// VM that sits outside the current ranges.
+		OwnedVMIDs:     ownedVMIDRanges(cfg),
+		OwnerScaleSets: scalesetNames(cfg),
+		Log:            log,
 	})
 	if err != nil {
 		return nil, err
@@ -1205,6 +1208,16 @@ func ownedVMIDRanges(cfg *config.Config) []nodecap.VMIDRange {
 	for _, entry := range cfg.Scalesets {
 		r := entryVMIDRange(entry, cfg.Proxmox.VMIDRange)
 		out = append(out, nodecap.VMIDRange{Min: r.Min, Max: r.Max})
+	}
+	return out
+}
+
+// scalesetNames lists every declared scale set, so the shared capacity
+// accountant can recognise any of their owner tags as "ours".
+func scalesetNames(cfg *config.Config) []string {
+	out := make([]string, 0, len(cfg.Scalesets))
+	for _, entry := range cfg.Scalesets {
+		out = append(out, entry.Name)
 	}
 	return out
 }
