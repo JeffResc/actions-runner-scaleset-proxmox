@@ -204,10 +204,14 @@ scalesetConfig:
     # then bounded only by max_concurrent_runners, as it always has
     # been. Turn it on to gate clones on what actually fits on each
     # Proxmox node — its RAM, minus a host reserve, minus the
-    # configured memory of every guest already on it (including guests
+    # configured memory of every RUNNING guest on it (including guests
     # this orchestrator does not own). "Configured", not "in use": an
     # idle 16 GiB runner owns its full 16 GiB while touching almost
     # none of it.
+    #
+    # Powered-off foreign guests are ignored — they hold no host
+    # memory. This orchestrator's own VMs always count, whatever their
+    # power state, because the warm tier is stopped by design.
     #
     # A clone that does not fit is DEFERRED, not failed — the job waits
     # in GitHub's queue and the next reconcile tick retries. Alert on

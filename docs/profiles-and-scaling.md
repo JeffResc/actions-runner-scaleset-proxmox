@@ -103,8 +103,22 @@ Three things about that sum are load-bearing:
 - **Allocated, not used.** A booted-but-idle 16 GiB runner reports almost no
   resident memory while owning its full 16 GiB. Planning against usage would
   admit VMs the node cannot actually back.
-- **Every guest counts**, including VMs and LXC containers this orchestrator
-  does not own. A node's capacity is a property of the node, not of the pool.
+- **Every *running* guest counts**, including VMs and LXC containers this
+  orchestrator does not own. A node's capacity is a property of the node, not of
+  the pool.
+
+  Powered-off foreign guests do **not** count: Proxmox reserves nothing for
+  them, so withholding their configured memory would refuse clones over
+  capacity that physically exists. A host with two dormant VMs is otherwise
+  enough to stall the pool indefinitely.
+
+  The orchestrator's own VMs are the exception — they count whatever their
+  power state, because the warm tier is stopped by design and its memory is
+  genuinely spoken for. Ownership is decided by `vmid_range`.
+
+  The residual risk is someone booting a large dormant VM while runners hold
+  the memory it wants. If you have one you expect to wake, cover it with
+  `reserve_memory_mb`.
 - **The host reserve is not optional.** PVE itself, ZFS ARC and qemu's per-VM
   overhead all live outside the guests' configured memory. The effective reserve
   is the larger of `reserve_memory_mb` and `reserve_memory_fraction × node RAM`,
