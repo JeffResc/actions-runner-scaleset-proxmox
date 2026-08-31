@@ -649,10 +649,14 @@ type PoolConfig struct {
 // With it disabled (the default) the orchestrator behaves exactly as it
 // always has: concurrency is bounded only by the static per-profile
 // max_concurrent_runners counts. With it enabled, every clone must also
-// fit in a node's remaining ALLOCATED memory — the sum of the configured
-// maxmem of every guest on that node, foreign guests included, versus
-// the node's physical RAM minus a host reserve. The two gates are
-// independent, so when both are configured the stricter one binds.
+// fit in a node's remaining ALLOCATED memory: the node's physical RAM,
+// minus a host reserve, minus the configured maxmem of every guest that
+// actually holds memory there. That means every RUNNING guest, foreign
+// ones included, plus this orchestrator's own guests whatever their
+// power state — the warm tier is stopped by design and its memory is
+// spoken for. A powered-off foreign guest holds nothing and is
+// excluded. The two gates are independent, so when both are configured
+// the stricter one binds.
 //
 // Memory is gated hard because it cannot be overcommitted safely. CPU is
 // time-shared and therefore gated only when the operator opts in via

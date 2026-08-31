@@ -226,11 +226,18 @@ pool:
   #
   # With it on, a clone is dispatched only if it also fits in the target
   # node's remaining ALLOCATED memory: the node's physical RAM, minus a
-  # host reserve, minus the configured memory of every guest already on
+  # host reserve, minus the configured memory of every RUNNING guest on
   # it — including guests this orchestrator does not own. "Allocated",
   # not "used": a booted-but-idle 16 GiB runner reports almost no RSS
   # while owning its full 16 GiB, so usage is the wrong number to plan
   # against.
+  #
+  # Powered-off foreign guests are ignored — they hold no host memory,
+  # and counting them would refuse clones over capacity that physically
+  # exists. This orchestrator's own VMs always count (the warm tier is
+  # stopped by design); ownership is decided by vmid_range. If you keep
+  # a large VM shut down that you expect to boot, cover it with
+  # reserve_memory_mb below.
   #
   # This lets a node be filled with whatever mix of profile shapes turns
   # up, instead of reserving each profile's worst case up front. A clone

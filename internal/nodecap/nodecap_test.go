@@ -16,6 +16,8 @@ import (
 
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
 const gib = 1024 * 1024 * 1024
@@ -79,11 +81,30 @@ func nodeRow(name string, memBytes uint64, cpus int) map[string]any {
 	}
 }
 
+// guestRow is a RUNNING guest — one that actually holds host memory.
 func guestRow(vmid int, node string, memBytes uint64, vcpus int) map[string]any {
 	return map[string]any{
 		"id": fmt.Sprintf("qemu/%d", vmid), "type": "qemu", "node": node,
-		"vmid": vmid, "status": "stopped", "maxmem": memBytes, "maxcpu": vcpus,
+		"vmid": vmid, "status": "running", "maxmem": memBytes, "maxcpu": vcpus,
 	}
+}
+
+// ownerTags renders the wire tag string PVE would report for a guest
+// owned by the named scale set. Built through the tags package so the
+// fixture cannot drift from the real encoding.
+func ownerTags(t *testing.T, scaleSet string) string {
+	t.Helper()
+	owner, err := tags.OwnerTag(scaleSet)
+	require.NoError(t, err)
+	return tags.Marker + ";" + owner
+}
+
+// stoppedGuestRow is a powered-off guest. It holds nothing, so whether
+// it counts depends entirely on whether it is one of ours.
+func stoppedGuestRow(vmid int, node string, memBytes uint64, vcpus int) map[string]any {
+	r := guestRow(vmid, node, memBytes, vcpus)
+	r["status"] = "stopped"
+	return r
 }
 
 func newAccountant(t *testing.T, rs *resourceServer, mutate func(*Options)) *Accountant {
@@ -92,7 +113,14 @@ func newAccountant(t *testing.T, rs *resourceServer, mutate func(*Options)) *Acc
 	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12} //nolint:gosec // plain-http test server
 	cli := proxmox.NewClient(rs.URL, proxmox.WithHTTPClient(&http.Client{Transport: tr}))
 
-	opts := Options{Refresh: time.Millisecond, ReservationTTL: time.Minute, Log: quietLogger()}
+	opts := Options{
+		Refresh:        time.Millisecond,
+		ReservationTTL: time.Minute,
+		// The orchestrator's own clone range, as app.Run wires it. VMIDs
+		// outside this are foreign; the fixtures use 100-999 for those.
+		OwnedVMIDs: []VMIDRange{{Min: 10000, Max: 10999}},
+		Log:        quietLogger(),
+	}
 	if mutate != nil {
 		mutate(&opts)
 	}
@@ -107,15 +135,15 @@ func newAccountant(t *testing.T, rs *resourceServer, mutate func(*Options)) *Acc
 func settle() { time.Sleep(5 * time.Millisecond) }
 
 // TestCommittedCountsAllocationNotUsage is the premise of the whole
-// package: a stopped 16 GiB VM owns its full allocation even though it
-// is using nothing. Reporting it as free is exactly the overcommit this
-// feature exists to prevent.
+// package: a RUNNING 16 GiB VM owns its full allocation even while it
+// sits idle touching almost none of it. Sizing against its resident set
+// instead is exactly the overcommit this feature exists to prevent.
 func TestCommittedCountsAllocationNotUsage(t *testing.T) {
 	t.Parallel()
 	rs := newResourceServer(t, []map[string]any{
 		nodeRow("pve1", 32*gib, 16),
-		// Stopped, so PVE reports mem=0 / cpu=0 — but maxmem is from
-		// the config and that is what must bind.
+		// Running but idle: PVE would report a small mem/cpu here.
+		// maxmem comes from the config, and that is what must bind.
 		guestRow(101, "pve1", 16*gib, 8),
 	})
 	a := newAccountant(t, rs, nil)
@@ -124,7 +152,7 @@ func TestCommittedCountsAllocationNotUsage(t *testing.T) {
 	require.NoError(t, err)
 	st := states["pve1"]
 	require.Equal(t, uint64(16*gib), st.CommittedBytes,
-		"a stopped VM's configured memory must count as committed")
+		"an idle running VM's configured memory must count as committed")
 	// 32 GiB total, no host reserve configured in this test, minus the
 	// 16 GiB the idle guest owns.
 	require.Equal(t, uint64(16*gib), st.AvailableBytes)
@@ -152,6 +180,113 @@ func TestForeignAndTemplateGuests(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(12*gib), states["pve1"].CommittedBytes,
 		"foreign qemu + lxc guests count; the template does not")
+}
+
+// TestStoppedForeignGuestHoldsNothing: a powered-off VM occupies no
+// host memory and Proxmox reserves nothing for it, so counting its
+// configured size withholds capacity that physically exists. On a host
+// with a few dormant VMs that is the difference between a working pool
+// and one that refuses every clone forever.
+func TestStoppedForeignGuestHoldsNothing(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		guestRow(101, "pve1", 8*gib, 4),         // running: holds its 8 GiB
+		stoppedGuestRow(400, "pve1", 16*gib, 8), // powered off: holds nothing
+	})
+	a := newAccountant(t, rs, nil)
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(8*gib), states["pve1"].CommittedBytes,
+		"only the running guest's allocation is real")
+	require.Equal(t, uint64(24*gib), states["pve1"].AvailableBytes,
+		"the dormant VM's 16 GiB must not be withheld")
+}
+
+// TestStoppedOwnedGuestStillCounts is the other half, and the reason
+// this cannot simply be "skip stopped guests": the warm tier is stopped
+// BY DESIGN. A warm VM is pre-cloned and powered off precisely so it can
+// boot on demand, so its memory is spoken for. Skip those and the pool
+// would clone warm VMs without limit — none counting — then oversubscribe
+// the node the instant they start.
+func TestStoppedOwnedGuestStillCounts(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 8*gib, 4), // our warm VM
+		stoppedGuestRow(10002, "pve1", 8*gib, 4), // our warm VM
+		stoppedGuestRow(400, "pve1", 16*gib, 8),  // someone else's, dormant
+	})
+	a := newAccountant(t, rs, nil) // OwnedVMIDs defaults to 10000-10999
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(16*gib), states["pve1"].CommittedBytes,
+		"both warm VMs count; the foreign dormant one does not")
+}
+
+// TestStoppedOwnedGuestCountsByTagOutsideTheRange. Ownership by VMID
+// range alone is not enough: the rest of the orchestrator owns VMs by
+// TAG — provisioner.classifyVM adopts any tagged VM whatever its VMID —
+// so a range repartition leaves owned VMs sitting outside the new
+// ranges. Their stopped warm capacity must keep counting, or the pool
+// clones a node's worth of runners on top of them and oversubscribes
+// the moment one is promoted.
+func TestStoppedOwnedGuestCountsByTagOutsideTheRange(t *testing.T) {
+	t.Parallel()
+	// 9001 is ours by tag but predates the current 10000-10999 range.
+	legacy := stoppedGuestRow(9001, "pve1", 16*gib, 8)
+	legacy["tags"] = ownerTags(t, "prod")
+
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 64*gib, 16),
+		legacy,
+		stoppedGuestRow(400, "pve1", 8*gib, 4), // genuinely foreign
+	})
+	a := newAccountant(t, rs, func(o *Options) { o.OwnerScaleSets = []string{"prod"} })
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(16*gib), states["pve1"].CommittedBytes,
+		"an owned VM outside the VMID range still holds its warm allocation")
+}
+
+// TestStoppedGuestWithForeignTagIsNotOurs guards the other direction:
+// a tag belonging to some other tool, or another orchestrator's scale
+// set, must not be mistaken for ours.
+func TestStoppedGuestWithForeignTagIsNotOurs(t *testing.T) {
+	t.Parallel()
+	other := stoppedGuestRow(400, "pve1", 16*gib, 8)
+	other["tags"] = ownerTags(t, "someone-else")
+
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 16), other})
+	a := newAccountant(t, rs, func(o *Options) { o.OwnerScaleSets = []string{"prod"} })
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, states["pve1"].CommittedBytes,
+		"another owner's dormant VM holds no memory of ours to plan around")
+}
+
+// TestUnknownGuestStatusCountsConservatively: only an explicit "stopped"
+// is treated as holding nothing. A paused guest, or a status a future
+// PVE reports that we don't recognise, must count — guessing the other
+// way would silently overcommit.
+func TestUnknownGuestStatusCountsConservatively(t *testing.T) {
+	t.Parallel()
+	paused := guestRow(101, "pve1", 8*gib, 4)
+	paused["status"] = "paused"
+	surprising := guestRow(102, "pve1", 4*gib, 2)
+	surprising["status"] = "hibernating"
+
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16), paused, surprising})
+	a := newAccountant(t, rs, nil)
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(12*gib), states["pve1"].CommittedBytes,
+		"anything that isn't definitively stopped counts")
 }
 
 // TestHostReserveTakesTheLarger pins the "absolute and/or fraction"

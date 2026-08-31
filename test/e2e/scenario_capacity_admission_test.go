@@ -199,6 +199,65 @@ func TestE2E_CapacityAdmission_CountsForeignVMs(t *testing.T) {
 		"the foreign VM's allocation must appear in the committed gauge")
 }
 
+// TestE2E_CapacityAdmission_IgnoresDormantForeignVMs. A powered-off
+// foreign VM holds no host memory, so it must not throttle the pool.
+// Counting it is how a host with a couple of dormant guests ends up
+// refusing every clone forever while the memory sits physically free.
+//
+// The twin of TestE2E_CapacityAdmission_CountsForeignVMs: same 24 GiB
+// neighbour, the only difference is whether it is running.
+func TestE2E_CapacityAdmission_IgnoresDormantForeignVMs(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+	fp.SetNodeCapacity("pve1", 32*gib, 16)
+	// Same neighbour as the running-VM scenario, but powered off. Its
+	// 24 GiB would leave only 4 GiB admissible if it were counted.
+	fp.SeedVM("pve1", 500, "someone-elses-database", false /* stopped */, nil)
+	require.NoError(t, fp.SetVMConfig(500, "memory", 24*1024))
+
+	// Warm pools deliberately want MORE than the node can admit: 4x4 +
+	// 3x8 + 2x16 = 72 GiB against 28 GiB admissible. Without that excess
+	// the upper bound below would just be restating the configured pool
+	// size and could not fail.
+	h := Start(t, Options{
+		FakeProxmox:          fp,
+		HotSize:              0,
+		MaxConcurrentRunners: 20,
+		Profiles: []ProfileSpec{
+			{Name: "mem-4g", CPUCores: 2, MemoryMB: 4096, WarmSize: 4},
+			{Name: "mem-8g", CPUCores: 4, MemoryMB: 8192, WarmSize: 3},
+			{Name: "mem-16g", CPUCores: 8, MemoryMB: 16384, WarmSize: 2},
+		},
+		Capacity: &CapacitySpec{ReserveMemoryMB: 4096},
+	})
+
+	// 32 GiB - 4 GiB reserve = 28 GiB admissible, so the pool should get
+	// well past the 4 GiB a counted-dormant-VM would have allowed.
+	require.Eventually(t, func() bool {
+		_, mb := ownedAllocationMB(t, h)
+		return mb >= 12*1024
+	}, 20*time.Second, 200*time.Millisecond,
+		"a powered-off neighbour must not withhold capacity it isn't using")
+	time.Sleep(2 * time.Second)
+
+	// Admission still bounds the pool: it wants 72 GiB of warm VMs and
+	// may have 28.
+	//
+	// Note what this does NOT prove. It would hold even if holdsMemory
+	// stopped counting our own warm VMs, because a skipped guest never
+	// satisfies the retirement rule (observed >= reserved, and observed
+	// would be 0), so its clone's RESERVATION never retires and keeps
+	// accounting for it in full — for the whole clone_inflight_grace.
+	// The ledger stays correct for far longer than a scenario runs, so
+	// the ownership carve-out cannot be covered from here; the
+	// deterministic test for it is TestStoppedOwnedGuestStillCounts in
+	// internal/nodecap.
+	count, allocatedMB := ownedAllocationMB(t, h)
+	require.LessOrEqual(t, allocatedMB, 28*1024,
+		"the pool wants 72 GiB of warm VMs; only 28 GiB may be admitted. saw %d MiB across %d VMs",
+		allocatedMB, count)
+}
+
 // TestE2E_CapacityAdmission_DisabledKeepsLegacyBehaviour is the
 // back-compat guard: with the feature off, node size is irrelevant and
 // the orchestrator provisions to its static counts exactly as it always

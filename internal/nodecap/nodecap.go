@@ -11,13 +11,22 @@
 // tie-breaking placement and the wrong input for admission. The two are
 // not interchangeable.)
 //
+// "Allocated" means allocated ON THE HOST, which is not the same as
+// configured. A guest that is powered off holds nothing — Proxmox
+// reserves nothing for it — so counting its configured size would
+// withhold capacity that physically exists. Only guests that actually
+// hold memory count: every running guest, plus this orchestrator's own
+// guests whatever their power state, since the warm tier is stopped by
+// design and its memory is genuinely spoken for. See holdsMemory.
+//
 // Data source is a single GET /cluster/resources, which returns both the
 // node rows (physical RAM / cores) and every guest row (qemu and lxc,
 // including guests this orchestrator does not own) with the guest's
-// configured maxmem and vcpu count. Proxmox derives those two fields from
-// the guest CONFIG rather than from a running process, so they are
-// correct for stopped guests too — exactly the "promised" number
-// admission needs.
+// configured maxmem, vcpu count, power status and tags. Proxmox derives
+// maxmem and vcpus from the guest CONFIG rather than from a running
+// process, so they describe what a guest is entitled to rather than what
+// it is touching — which is exactly the "promised" number admission
+// needs for the guests that count.
 //
 // All exported methods are safe for concurrent use.
 package nodecap
@@ -34,6 +43,8 @@ import (
 	"github.com/jellydator/ttlcache/v3"
 	"github.com/luthermonson/go-proxmox"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
 // Shape is the resource footprint of one VM the orchestrator is about to
@@ -110,8 +121,35 @@ type Options struct {
 	// dies past the pool's panic recovery, not a normal expiry path.
 	ReservationTTL time.Duration
 
+	// OwnedVMIDs are the VMID spans this orchestrator allocates clones
+	// from — every scale set's range — and OwnerScaleSets are the scale
+	// set names whose owner tag marks a VM as ours. Guests matching
+	// EITHER count against capacity even when powered off, because the
+	// warm tier is stopped by design; other guests count only while
+	// running. See holdsMemory.
+	//
+	// Both are needed, because each covers a window the other misses.
+	// Leaving them empty makes every stopped guest look foreign, which
+	// would stop the pool's own warm VMs from counting. Callers that
+	// run a warm pool must populate them.
+	OwnedVMIDs     []VMIDRange
+	OwnerScaleSets []string
+
 	Log *slog.Logger
 }
+
+// VMIDRange is an inclusive span of Proxmox VMIDs. Mirrors
+// config.VMIDRange; redeclared here so this package stays free of the
+// config import.
+type VMIDRange struct {
+	Min int
+	Max int
+}
+
+// guestStopped is the /cluster/resources status of a powered-off guest.
+// Anything else — running, paused, or a status this version of PVE
+// reports that we don't recognise — is treated as holding memory.
+const guestStopped = "stopped"
 
 // ErrNoSnapshot is returned when the accountant has never successfully
 // read /cluster/resources. Admission fails closed in that window: with
@@ -458,6 +496,64 @@ func (a *Accountant) vcpuLimit(cores int) int {
 	return int(float64(cores) * a.opts.CPUOvercommit)
 }
 
+// holdsMemory reports whether a guest in this state occupies host
+// memory that admission must plan around.
+//
+// A POWERED-OFF guest occupies nothing. Proxmox reserves nothing for
+// it, and counting its configured memory would withhold capacity that
+// physically exists — on a host with a few dormant VMs that is enough
+// to refuse every clone forever. "Allocated, not used" is about a
+// running guest that is idle (it owns its full allocation while
+// touching little of it); a stopped guest owns nothing at all.
+//
+// The orchestrator's OWN guests are the exception and always count,
+// whatever their power state, because the warm tier is stopped BY
+// DESIGN — a warm VM is pre-cloned and powered off precisely so it can
+// boot on demand. Skipping those would let the pool clone warm VMs
+// without limit, none of them counting, and then oversubscribe the node
+// the moment they start.
+//
+// The residual risk is an operator starting a large dormant VM while
+// runners hold the memory it wants. That is what reserve_memory_mb is
+// for: withhold headroom for guests you know may wake up.
+func (a *Accountant) holdsMemory(status, guestTags string, vmid int) bool {
+	if status != guestStopped {
+		return true
+	}
+	return a.owns(guestTags, vmid)
+}
+
+// owns reports whether a guest belongs to this orchestrator.
+//
+// Two independent tests, because each covers a window the other misses:
+//
+//   - The OWNER TAG is what the rest of the orchestrator means by
+//     ownership — provisioner.classifyVM adopts any tagged VM whatever
+//     its VMID, so a range test alone would call an owned VM foreign
+//     after an operator repartitions vmid_range. Its stopped warm VMs
+//     would then stop counting, the pool would clone a node's worth of
+//     runners on top of them, and the node would be oversubscribed the
+//     moment one got promoted.
+//   - The VMID RANGE covers the opposite gap: a fresh clone carries its
+//     VMID from the instant it exists, while its tags land in a
+//     follow-up API call. During that window a tag test would call our
+//     own clone foreign — and would keep doing so after its reservation
+//     retired, which is exactly when the guest row becomes the only
+//     thing accounting for it.
+func (a *Accountant) owns(guestTags string, vmid int) bool {
+	for _, name := range a.opts.OwnerScaleSets {
+		if tags.IsOwnedBy(guestTags, name) {
+			return true
+		}
+	}
+	for _, r := range a.opts.OwnedVMIDs {
+		if vmid >= r.Min && vmid <= r.Max {
+			return true
+		}
+	}
+	return false
+}
+
 // reserveFor is the host headroom withheld on a node with the given
 // physical memory: the larger of the absolute and fractional settings.
 func (a *Accountant) reserveFor(total uint64) uint64 {
@@ -581,14 +677,17 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 				vcpus:    int(r.MaxCPU), //nolint:gosec // physical core counts are far below int range
 			}
 		case "qemu", "lxc":
-			// Templates own no memory — they are disk images. Guests we
-			// do NOT own still count: a node's real capacity is its
-			// total minus everything allocated on it, not just minus
-			// this orchestrator's own VMs.
+			// Templates own no memory — they are disk images. Foreign
+			// guests that DO hold memory still count: a node's real
+			// capacity is its total minus everything allocated on it,
+			// not just minus this orchestrator's own VMs.
 			if !want(r.Node) || r.Template != 0 {
 				continue
 			}
-			vmid := int(r.VMID)   //nolint:gosec // VMIDs are bounded well below int range
+			vmid := int(r.VMID) //nolint:gosec // VMIDs are bounded well below int range
+			if !a.holdsMemory(r.Status, r.Tags, vmid) {
+				continue
+			}
 			vcpu := int(r.MaxCPU) //nolint:gosec // vcpu counts are far below int range
 			snap.guestMem[vmid] = r.MaxMem
 			snap.guestVCPU[vmid] = vcpu

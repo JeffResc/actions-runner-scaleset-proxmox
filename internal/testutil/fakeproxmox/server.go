@@ -371,6 +371,9 @@ func (s *Server) handleClusterResources(w http.ResponseWriter, _ *http.Request) 
 			"status": "stopped",
 			"maxmem": guestMemoryBytes(v),
 			"maxcpu": guestVCPUs(v),
+			// Real PVE reports tags here, and the capacity accountant
+			// uses them to tell its own guests from foreign ones.
+			"tags": v.Tags,
 		}
 		if v.Running {
 			row["status"] = "running"

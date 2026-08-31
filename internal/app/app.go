@@ -566,6 +566,13 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 		// outliving its clone is the same question, so it reuses the
 		// same knob rather than adding a near-duplicate one.
 		ReservationTTL: cfg.Pool.CloneInflightGrace.D(),
+		// How the accountant recognises our own guests, which count even
+		// when powered off — the warm tier is stopped by design — while
+		// foreign guests count only while they actually hold memory.
+		// Ranges catch a clone before its tags land; tags catch an owned
+		// VM that sits outside the current ranges.
+		OwnedVMIDs:     ownedVMIDRanges(cfg),
+		OwnerScaleSets: scalesetNames(cfg),
 		Log:            log,
 	})
 	if err != nil {
@@ -1190,6 +1197,29 @@ func routerForScaleset(ss config.ScaleSetEntry) (*router.Router, error) {
 		})
 	}
 	return router.New(profiles)
+}
+
+// ownedVMIDRanges collects the clone range of every declared scale set,
+// applying the same per-entry inheritance the pool managers use. The
+// capacity accountant needs the union: it is shared fleet-wide, so a VM
+// belonging to ANY scale set is "ours" from its point of view.
+func ownedVMIDRanges(cfg *config.Config) []nodecap.VMIDRange {
+	out := make([]nodecap.VMIDRange, 0, len(cfg.Scalesets))
+	for _, entry := range cfg.Scalesets {
+		r := entryVMIDRange(entry, cfg.Proxmox.VMIDRange)
+		out = append(out, nodecap.VMIDRange{Min: r.Min, Max: r.Max})
+	}
+	return out
+}
+
+// scalesetNames lists every declared scale set, so the shared capacity
+// accountant can recognise any of their owner tags as "ours".
+func scalesetNames(cfg *config.Config) []string {
+	out := make([]string, 0, len(cfg.Scalesets))
+	for _, entry := range cfg.Scalesets {
+		out = append(out, entry.Name)
+	}
+	return out
 }
 
 // effectiveMaxConcurrent maps a resolved static cap into the pool's

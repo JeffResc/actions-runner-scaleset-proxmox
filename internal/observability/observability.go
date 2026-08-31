@@ -163,10 +163,14 @@ type Metrics struct {
 	CapacityEvictions *prometheus.CounterVec
 
 	// NodeMemory{Total,Committed,Available}Bytes expose the capacity
-	// ledger per Proxmox node. Committed is ALLOCATED memory (the sum
-	// of every guest's configured maxmem, including guests this
-	// orchestrator does not own, plus outstanding clone reservations)
-	// — not used memory. Available is already net of the host reserve.
+	// ledger per Proxmox node. Committed is ALLOCATED memory, not used
+	// memory: the sum of the configured maxmem of every guest that
+	// holds host memory — every RUNNING guest including ones this
+	// orchestrator does not own, plus its own guests whatever their
+	// power state (the warm tier is stopped by design) — plus
+	// outstanding clone reservations. Powered-off foreign guests hold
+	// nothing and are excluded. Available is already net of the host
+	// reserve.
 	//
 	// These three deliberately carry NO `scaleset` label: the
 	// accountant behind them is fleet-wide (a node's allocation is a
@@ -422,7 +426,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"node"}),
 		NodeMemoryCommittedBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "node_memory_committed_bytes",
-			Help: "Memory ALLOCATED on a Proxmox node (every guest's configured maxmem, foreign guests included, plus outstanding clone reservations) — not memory used. Fleet-wide: no scaleset label.",
+			Help: "Memory ALLOCATED on a Proxmox node — not memory used. Sums the configured maxmem of every running guest (foreign ones included) plus this orchestrator's own guests whatever their power state, plus outstanding clone reservations. Powered-off foreign guests hold no memory and are excluded. Fleet-wide: no scaleset label.",
 		}, []string{"node"}),
 		NodeMemoryAvailableBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: ns, Name: "node_memory_available_bytes",
