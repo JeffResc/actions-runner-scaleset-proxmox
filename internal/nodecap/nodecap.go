@@ -53,8 +53,18 @@ type NodeState struct {
 	CommittedBytes uint64 // guest allocations + outstanding reservations
 	AvailableBytes uint64
 
-	TotalVCPU     int // physical cores * cpu_overcommit_ratio (0 = ungated)
+	// CPUGated reports whether cpu_overcommit_ratio is configured. When
+	// false, CPU is never a reason to refuse a clone and the three
+	// fields below are informational only.
+	CPUGated bool
+	// LimitVCPU is the admission ceiling — physical cores x
+	// cpu_overcommit_ratio — and AvailableVCPU is what is left of it.
+	// Both are zero when CPUGated is false. (LimitVCPU is deliberately
+	// not the raw core count: a consumer comparing a Shape against it
+	// must see the same ceiling admission applies.)
+	LimitVCPU     int
 	CommittedVCPU int
+	AvailableVCPU int
 }
 
 // Reservation is a claim on a node's capacity held across a clone
@@ -374,8 +384,7 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 		for _, vmid := range extraFreeing {
 			vcpuCredit += snap.guestVCPU[vmid]
 		}
-		limit := int(float64(totals.vcpus) * a.opts.CPUOvercommit)
-		if st.CommittedVCPU-vcpuCredit+shape.VCPUs > limit {
+		if st.CommittedVCPU-vcpuCredit+shape.VCPUs > a.vcpuLimit(totals.vcpus) {
 			return false
 		}
 	}
@@ -427,13 +436,26 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 		TotalBytes:     totals.memBytes,
 		ReserveBytes:   reserve,
 		CommittedBytes: committed,
-		TotalVCPU:      totals.vcpus,
+		CPUGated:       a.opts.CPUOvercommit > 0,
 		CommittedVCPU:  committedVCPU,
 	}
 	if usable := saturatingSub(totals.memBytes, reserve); usable > committed {
 		st.AvailableBytes = usable - committed
 	}
+	if st.CPUGated {
+		st.LimitVCPU = a.vcpuLimit(totals.vcpus)
+		if st.LimitVCPU > committedVCPU {
+			st.AvailableVCPU = st.LimitVCPU - committedVCPU
+		}
+	}
 	return st
+}
+
+// vcpuLimit is the vCPU admission ceiling for a node with the given
+// physical core count. Sole definition, shared by the fit check and the
+// reported NodeState so the two cannot disagree.
+func (a *Accountant) vcpuLimit(cores int) int {
+	return int(float64(cores) * a.opts.CPUOvercommit)
 }
 
 // reserveFor is the host headroom withheld on a node with the given

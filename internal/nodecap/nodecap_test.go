@@ -367,6 +367,12 @@ func TestCPUGatedOnlyWhenOvercommitSet(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok, "with cpu_overcommit_ratio unset, vCPUs are never a reason to refuse")
 
+	states, err := ungated.Snapshot(ctx)
+	require.NoError(t, err)
+	require.False(t, states["pve1"].CPUGated,
+		"consumers must be able to tell that the vCPU fields are inert")
+	require.Zero(t, states["pve1"].LimitVCPU)
+
 	gated := newAccountant(t, rs, func(o *Options) {
 		o.ReserveBytes = 0
 		o.CPUOvercommit = 2 // 4 physical cores -> 8 vCPU ceiling
@@ -377,6 +383,17 @@ func TestCPUGatedOnlyWhenOvercommitSet(t *testing.T) {
 	_, ok, err = gated.Reserve(ctx, "pve1", Shape{MemoryBytes: gib, VCPUs: 1})
 	require.NoError(t, err)
 	require.False(t, ok, "the 9th vCPU breaches 4 cores x 2.0")
+
+	// The reported ceiling must be the one admission actually applies —
+	// cores x ratio, not the raw core count — because the pool's
+	// eviction planner sizes a vCPU gap against it.
+	states, err = gated.Snapshot(ctx)
+	require.NoError(t, err)
+	st := states["pve1"]
+	require.True(t, st.CPUGated)
+	require.Equal(t, 8, st.LimitVCPU, "4 physical cores x 2.0")
+	require.Equal(t, 8, st.CommittedVCPU)
+	require.Zero(t, st.AvailableVCPU)
 }
 
 // TestUnknownNodeNeverFits: an offline or undeclared node is capacity we

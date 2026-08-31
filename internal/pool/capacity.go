@@ -69,8 +69,8 @@ func (c capacityClaim) bind(vmid int) {
 // idle VM while the queued job still never got one.
 //
 // Skipping the selector does NOT skip its rules: eviction picked the
-// parked node through the same selector (see evictionNode), and
-// stillEligible re-checks it here, because up to parkedReservationTTL
+// parked node through the same selector (see eligibleNodes), and
+// nodeEligible re-checks it here, because up to parkedReservationTTL
 // passes in between and anti-affinity is a promise about the node's
 // CURRENT occupants ("untrusted-PR runners never co-schedule with
 // prod"). A node that stopped being eligible in that window loses the
@@ -112,15 +112,16 @@ func (m *manager) claimParked(ctx context.Context, ps *profileState) (string, ca
 		return "", capacityClaim{}, false
 	}
 	var (
-		chosen *parkedReservation
-		keep   []*parkedReservation
+		chosen   *parkedReservation
+		keep     []*parkedReservation
+		existing = m.snapshotExistingVMsForAffinity()
 	)
 	for _, p := range parked {
 		if chosen != nil {
 			keep = append(keep, p)
 			continue
 		}
-		eligible, known := m.nodeEligible(ctx, ps, p.node)
+		eligible, known := m.nodeEligible(ctx, ps, p.node, existing)
 		switch {
 		case eligible:
 			chosen = p
@@ -157,24 +158,40 @@ func (m *manager) claimParked(ctx context.Context, ps *profileState) (string, ca
 // not say". They must not be conflated: for a parked eviction claim,
 // treating a transient least_loaded read failure as a refusal would
 // throw away memory an idle VM was just destroyed to free.
-func (m *manager) nodeEligible(ctx context.Context, ps *profileState, node string) (eligible, known bool) {
+//
+// The avoid list is built from the operator-declared node universe, NOT
+// from the capacity snapshot. The probe is only sound if node is the
+// single candidate the selector can return, and the snapshot omits
+// offline nodes by design — an omitted node stays un-avoided and
+// round_robin will happily return it, making a healthy node look
+// definitively ineligible about half the time.
+//
+// existing is the caller's row snapshot, passed in so a scan over many
+// nodes doesn't re-query the store per node.
+//
+// Note that Select is not a pure query: probing advances round_robin's
+// cursor once per call. That skews distribution slightly and affects
+// nothing else — the alternative is a second copy of the placement
+// rules, which would drift from the selector's.
+func (m *manager) nodeEligible(ctx context.Context, ps *profileState, node string, existing []nodeselector.ExistingVM) (eligible, known bool) {
 	if m.cfg.LinkedClones {
 		// Placement isn't the selector's to make in this mode.
 		return node == m.cfg.TemplateNode, true
 	}
-	states, err := m.cfg.Capacity.Snapshot(ctx)
-	if err != nil {
+	if len(m.cfg.Nodes) == 0 {
+		// NewManager rejects this combination; defend anyway rather than
+		// probe against an avoid list that cannot be correct.
 		return false, false
 	}
-	avoid := make([]string, 0, len(states))
-	for n := range states {
+	avoid := make([]string, 0, len(m.cfg.Nodes))
+	for _, n := range m.cfg.Nodes {
 		if n != node {
 			avoid = append(avoid, n)
 		}
 	}
 	got, err := m.sel.Select(ctx, nodeselector.Hint{
 		Profile:     ps.settings.Name,
-		ExistingVMs: m.snapshotExistingVMsForAffinity(),
+		ExistingVMs: existing,
 		Avoid:       avoid,
 	})
 	switch {
@@ -372,6 +389,7 @@ func (m *manager) publishCapacityGauges(ctx context.Context) {
 type evictionCandidate struct {
 	row       *store.VM
 	memBytes  uint64
+	vcpus     int
 	preferred bool // Warm: cheaper to lose than a booted Hot VM
 }
 
@@ -426,7 +444,7 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 	// never use, and letting that veto the eviction would stall the
 	// queued job indefinitely rather than for a tick.
 	for _, node := range eligible {
-		if states[node].AvailableBytes >= shape.MemoryBytes {
+		if fitsNode(states[node], shape) {
 			return false
 		}
 	}
@@ -443,7 +461,7 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 	// best, which may hold none of this scale set's idle VMs while a
 	// sibling node — an equally legal placement — is full of them.
 	for _, node := range eligible {
-		victims, freed := planEviction(byNode[node], shape.MemoryBytes, states[node].AvailableBytes)
+		victims, freed := planEviction(byNode[node], shape, states[node])
 		if len(victims) == 0 {
 			continue
 		}
@@ -452,6 +470,16 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 		}
 	}
 	return false
+}
+
+// fitsNode reports whether shape would be admitted on a node in this
+// state. Mirrors the accountant's own fit rule: memory always binds,
+// vCPU only when the operator configured an overcommit ratio.
+func fitsNode(st nodecap.NodeState, shape nodecap.Shape) bool {
+	if st.AvailableBytes < shape.MemoryBytes {
+		return false
+	}
+	return !st.CPUGated || st.AvailableVCPU >= shape.VCPUs
 }
 
 // eligibleNodes returns, in sorted order, the subset of the snapshot's
@@ -465,25 +493,40 @@ func (m *manager) eligibleNodes(ctx context.Context, ps *profileState, states ma
 	}
 	sort.Strings(nodes)
 
+	// One row snapshot for the whole scan rather than one per node.
+	existing := m.snapshotExistingVMsForAffinity()
 	out := nodes[:0]
 	for _, node := range nodes {
-		if eligible, known := m.nodeEligible(ctx, ps, node); known && eligible {
+		if eligible, known := m.nodeEligible(ctx, ps, node, existing); known && eligible {
 			out = append(out, node)
 		}
 	}
 	return out
 }
 
-// planEviction picks the smallest set of idle VMs whose combined memory
-// closes the gap between what is available on a node and what the clone
-// needs. Returns nil when the node's idle VMs cannot close it — evicting
-// a partial set would destroy useful capacity and still not admit the
-// job.
-func planEviction(candidates []evictionCandidate, need, available uint64) ([]evictionCandidate, uint64) {
-	if need <= available {
+// planEviction picks the smallest set of idle VMs that closes the gap
+// between what a node has available and what the clone needs. Returns
+// nil when the node's idle VMs cannot close it — evicting a partial set
+// would destroy useful capacity and still not admit the job.
+//
+// Both dimensions the accountant gates on are closed. A node can be
+// saturated on vCPU with memory to spare (idle pool VMs are cheap on RAM
+// and not on cores), and planning only against memory there would find
+// no gap to close, so the queued job would be deferred every tick with
+// nothing ever reclaiming capacity for it. vCPU is only considered when
+// the operator turned that gate on.
+func planEviction(candidates []evictionCandidate, shape nodecap.Shape, st nodecap.NodeState) ([]evictionCandidate, uint64) {
+	if fitsNode(st, shape) {
 		return nil, 0 // nothing to do; the clone should have fit
 	}
-	gap := need - available
+	var memGap uint64
+	if shape.MemoryBytes > st.AvailableBytes {
+		memGap = shape.MemoryBytes - st.AvailableBytes
+	}
+	var vcpuGap int
+	if st.CPUGated && shape.VCPUs > st.AvailableVCPU {
+		vcpuGap = shape.VCPUs - st.AvailableVCPU
+	}
 
 	// Warm before Hot (no boot invested, and Hot serves job-start
 	// latency), then oldest first within a kind — the same preference
@@ -499,12 +542,14 @@ func planEviction(candidates []evictionCandidate, need, available uint64) ([]evi
 	})
 
 	var picked []evictionCandidate
-	var freed uint64
+	var freedMem uint64
+	var freedVCPU int
 	for _, c := range ordered {
 		picked = append(picked, c)
-		freed += c.memBytes
-		if freed >= gap {
-			return picked, freed
+		freedMem += c.memBytes
+		freedVCPU += c.vcpus
+		if freedMem >= memGap && freedVCPU >= vcpuGap {
+			return picked, freedMem
 		}
 	}
 	return nil, 0
@@ -598,9 +643,11 @@ func (m *manager) idleCandidatesByNode() (map[string][]evictionCandidate, error)
 		if ps == nil || ps.settings.MemoryMB <= 0 {
 			continue
 		}
+		shape := shapeOf(ps.settings)
 		out[r.Node] = append(out[r.Node], evictionCandidate{
 			row:       r,
-			memBytes:  shapeOf(ps.settings).MemoryBytes,
+			memBytes:  shape.MemoryBytes,
+			vcpus:     shape.VCPUs,
 			preferred: r.State == store.StateWarm,
 		})
 	}

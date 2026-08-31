@@ -362,6 +362,16 @@ func TestPublishCapacityGauges(t *testing.T) {
 
 // ---------- planEviction ----------
 
+// memShape / memState express a memory-only scenario: CPU gating off,
+// so the vCPU dimension is inert.
+func memShape(gibNeeded uint64) nodecap.Shape {
+	return nodecap.Shape{MemoryBytes: gibNeeded * gib}
+}
+
+func memState(gibAvailable uint64) nodecap.NodeState {
+	return nodecap.NodeState{AvailableBytes: gibAvailable * gib}
+}
+
 func candidate(vmid int, memGiB uint64, warm bool, age time.Duration) evictionCandidate {
 	return evictionCandidate{
 		row: &store.VM{
@@ -381,7 +391,7 @@ func TestPlanEviction(t *testing.T) {
 	t.Run("nothing to do when the clone already fits", func(t *testing.T) {
 		t.Parallel()
 		victims, _ := planEviction(
-			[]evictionCandidate{candidate(1, 16, true, time.Hour)}, 8*gib, 8*gib)
+			[]evictionCandidate{candidate(1, 16, true, time.Hour)}, memShape(8), memState(8))
 		require.Empty(t, victims, "capacity for both means evict nothing")
 	})
 
@@ -389,7 +399,7 @@ func TestPlanEviction(t *testing.T) {
 		t.Parallel()
 		hot := candidate(1, 16, false, 2*time.Hour) // older, but booted
 		warm := candidate(2, 16, true, time.Minute) // newer, but parked
-		victims, freed := planEviction([]evictionCandidate{hot, warm}, 16*gib, 0)
+		victims, freed := planEviction([]evictionCandidate{hot, warm}, memShape(16), memState(0))
 		require.Len(t, victims, 1)
 		require.Equal(t, 2, victims[0].row.VMID, "a parked warm VM is cheaper to lose than a booted hot one")
 		require.Equal(t, uint64(16*gib), freed)
@@ -399,7 +409,7 @@ func TestPlanEviction(t *testing.T) {
 		t.Parallel()
 		newer := candidate(1, 16, true, time.Minute)
 		older := candidate(2, 16, true, time.Hour)
-		victims, _ := planEviction([]evictionCandidate{newer, older}, 16*gib, 0)
+		victims, _ := planEviction([]evictionCandidate{newer, older}, memShape(16), memState(0))
 		require.Len(t, victims, 1)
 		require.Equal(t, 2, victims[0].row.VMID, "the oldest VM is closest to being recycled anyway")
 	})
@@ -410,7 +420,7 @@ func TestPlanEviction(t *testing.T) {
 			candidate(1, 4, true, 3*time.Hour),
 			candidate(2, 4, true, 2*time.Hour),
 			candidate(3, 4, true, time.Hour),
-		}, 12*gib, 2*gib)
+		}, memShape(12), memState(2))
 		require.Len(t, victims, 3, "a 10 GiB gap needs all three 4 GiB VMs")
 		require.Equal(t, uint64(12*gib), freed)
 	})
@@ -419,7 +429,7 @@ func TestPlanEviction(t *testing.T) {
 		t.Parallel()
 		victims, _ := planEviction([]evictionCandidate{
 			candidate(1, 4, true, time.Hour),
-		}, 16*gib, 0)
+		}, memShape(16), memState(0))
 		require.Empty(t, victims,
 			"destroying VMs that still leave the job unplaceable is pure loss")
 	})
@@ -429,7 +439,7 @@ func TestPlanEviction(t *testing.T) {
 		victims, _ := planEviction([]evictionCandidate{
 			candidate(1, 16, true, 2*time.Hour),
 			candidate(2, 16, true, time.Hour),
-		}, 16*gib, 0)
+		}, memShape(16), memState(0))
 		require.Len(t, victims, 1, "one victim closes the gap; the second must survive")
 	})
 }
@@ -453,6 +463,7 @@ func evictionManager(t *testing.T, adm *fakeAdmitter, evict bool) (*manager, *st
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity:           adm,
 		EvictIdleForDemand: evict,
+		Nodes:              []string{"pve1"},
 		Profiles: []ProfileSettings{
 			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
 			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
@@ -669,6 +680,7 @@ func TestEvict_RespectsAffinity(t *testing.T) {
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity:           adm,
 		EvictIdleForDemand: true,
+		Nodes:              all,
 		Profiles: []ProfileSettings{
 			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
 			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
@@ -709,6 +721,7 @@ func TestEvict_ParkedClaimRecheckedAgainstAntiAffinity(t *testing.T) {
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity:           adm,
 		EvictIdleForDemand: true,
+		Nodes:              all,
 		Profiles: []ProfileSettings{
 			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
 			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
@@ -760,6 +773,7 @@ func TestEvict_ParkedClaimReleasedOnUnsatisfiableHardPin(t *testing.T) {
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity:           adm,
 		EvictIdleForDemand: true,
+		Nodes:              all,
 		Profiles: []ProfileSettings{
 			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
 			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
@@ -825,6 +839,7 @@ func TestEvict_ScansEveryEligibleNode(t *testing.T) {
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity:           adm,
 		EvictIdleForDemand: true,
+		Nodes:              all,
 		Profiles: []ProfileSettings{
 			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
 			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
@@ -867,6 +882,7 @@ func TestEvict_HardPinnedProfileIgnoresRoomElsewhere(t *testing.T) {
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity:           adm,
 		EvictIdleForDemand: true,
+		Nodes:              all,
 		Profiles: []ProfileSettings{
 			{Name: "small", MemoryMB: 16384, MaxConcurrentRunners: 10},
 			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
@@ -887,6 +903,82 @@ func TestEvict_HardPinnedProfileIgnoresRoomElsewhere(t *testing.T) {
 	row, err := st.Get(10001)
 	require.NoError(t, err)
 	require.Equal(t, store.StateDraining, row.State)
+}
+
+// TestEvict_OfflineNodeDoesNotPoisonTheEligibilityProbe.
+//
+// The probe asks the selector "could this profile go on N?" by avoiding
+// every other node, so its avoid list must match the SELECTOR's universe.
+// The capacity snapshot is not that universe: it deliberately omits
+// offline nodes, which the selector still knows about. Building the
+// avoid list from the snapshot leaves a downed node un-avoided, and
+// round_robin returns it instead of N — reporting a healthy node as
+// definitively ineligible on roughly half the probes, so eviction
+// quietly stops and parked claims get released as unplaceable.
+func TestEvict_OfflineNodeDoesNotPoisonTheEligibilityProbe(t *testing.T) {
+	t.Parallel()
+	// pve3 is configured but down: absent from the snapshot, present in
+	// the selector's universe.
+	all := []string{"pve1", "pve2", "pve3"}
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 12 * gib, "pve2": 0})
+	st := newTestStore(t)
+	rr, err := nodeselector.NewRoundRobin(all)
+	require.NoError(t, err)
+	sel, err := nodeselector.NewCapacity(rr, adm, all)
+	require.NoError(t, err)
+
+	m := newTestManager(t, st, &fakeProv{}, Config{
+		Capacity:           adm,
+		EvictIdleForDemand: true,
+		Nodes:              all,
+		Profiles: []ProfileSettings{
+			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
+			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
+		},
+	}, withSelector(sel))
+	seedIdle(t, st, adm, 10001, "small", 4, store.StateWarm, time.Hour)
+
+	// Repeat: the round-robin cursor advances on every probe, so a
+	// snapshot-derived avoid list fails only on some starting offsets.
+	for i := range 6 {
+		eligible, known := m.nodeEligible(context.Background(), m.profileOf("big"), "pve1", nil)
+		require.True(t, known, "probe %d: a healthy node's verdict must be knowable", i)
+		require.True(t, eligible, "probe %d: pve1 is up and unpinned", i)
+	}
+
+	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")),
+		"a downed sibling node must not stop eviction on a healthy one")
+}
+
+// TestEvict_ClosesAVCPUGapToo: with cpu_overcommit_ratio set, a node can
+// be saturated on vCPU while it still has memory to spare — idle pool
+// VMs are cheap on RAM and not on cores. Planning only against memory
+// finds no gap to close, so the queued job defers every tick with
+// nothing ever reclaiming capacity for it.
+func TestEvict_ClosesAVCPUGapToo(t *testing.T) {
+	t.Parallel()
+	shape := nodecap.Shape{MemoryBytes: 4 * gib, VCPUs: 8}
+	// Plenty of memory free, but the vCPU ceiling is already reached.
+	st := nodecap.NodeState{
+		AvailableBytes: 64 * gib,
+		CPUGated:       true,
+		LimitVCPU:      16,
+		CommittedVCPU:  16,
+		AvailableVCPU:  0,
+	}
+	cands := []evictionCandidate{
+		{row: &store.VM{VMID: 1, CreatedAt: time.Now().Add(-time.Hour)}, memBytes: 2 * gib, vcpus: 4, preferred: true},
+		{row: &store.VM{VMID: 2, CreatedAt: time.Now().Add(-time.Minute)}, memBytes: 2 * gib, vcpus: 4, preferred: true},
+	}
+
+	victims, _ := planEviction(cands, shape, st)
+	require.Len(t, victims, 2, "8 vCPU of headroom needs both 4-vCPU victims, memory notwithstanding")
+
+	// The same node with CPU gating off has nothing to reclaim for.
+	ungated := st
+	ungated.CPUGated = false
+	victims, _ = planEviction(cands, shape, ungated)
+	require.Empty(t, victims, "with CPU ungated the clone already fits; evict nothing")
 }
 
 // TestEvict_ParkedReservationsReleasedOnDrain: the accountant is shared

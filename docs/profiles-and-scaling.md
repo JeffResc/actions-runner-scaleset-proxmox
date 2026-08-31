@@ -143,6 +143,12 @@ pool:
 
 `0` (the default) means vCPUs are never a reason to refuse a clone.
 
+When the ratio is set, both dimensions are treated alike everywhere — including
+by idle eviction, which will reclaim vCPU as readily as memory. That matters
+because idle pool VMs are cheap on RAM and not on cores: a node can be saturated
+on vCPU with memory to spare, and an eviction that only ever looked at memory
+would find nothing to reclaim there.
+
 ### Making memory the only cap
 
 With capacity admission on, `max_concurrent_runners` becomes optional. Omit it

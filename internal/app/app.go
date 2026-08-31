@@ -758,6 +758,10 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
 		Capacity:             deps.capacity,
 		EvictIdleForDemand:   cfg.Pool.Capacity.EvictIdleForDemand,
+		// The same universe handed to the nodeselector wrappers, so the
+		// pool's placement probes ask about exactly the nodes the
+		// selector can answer for.
+		Nodes: affinityNodeUniverse(cfg),
 	}, st, state.prov, sel, log, metrics)
 	if err != nil {
 		return fmt.Errorf("init pool: %w", err)

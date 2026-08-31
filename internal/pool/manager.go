@@ -176,6 +176,17 @@ type Config struct {
 	// reconcile tick. Ignored when Capacity is nil.
 	EvictIdleForDemand bool
 
+	// Nodes is the operator-declared node universe — the same list given
+	// to the nodeselector wrappers. Required when EvictIdleForDemand is
+	// set: eviction asks the selector "could this profile be placed on
+	// node N?" by naming every OTHER node in the hint's avoid list, and
+	// that probe is only sound if the list matches the selector's own
+	// universe. Deriving it from live Proxmox state instead would omit
+	// an offline node — which the capacity accountant deliberately drops
+	// but the selector still knows about — leaving it un-avoided and
+	// free to be returned in place of the node being probed.
+	Nodes []string
+
 	// RunnerLister is consulted by Adopt to classify owner-tagged
 	// Proxmox VMs more precisely: a VM whose runner is busy on GitHub
 	// is adopted directly as Running with the right RunnerID, skipping
@@ -422,6 +433,12 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 	}
 	if err := validateConfig(cfg.HotSize, cfg.WarmSize, cfg.MaxConcurrentRunners); err != nil {
 		return nil, err
+	}
+	// Fail loudly rather than silently disabling eviction: without the
+	// node universe its placement probe cannot be made sound, and an
+	// operator who asked for eviction should not get a no-op.
+	if cfg.EvictIdleForDemand && cfg.Capacity != nil && len(cfg.Nodes) == 0 {
+		return nil, errors.New("pool: EvictIdleForDemand requires Nodes (the operator-declared node universe)")
 	}
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = 10 * time.Second
