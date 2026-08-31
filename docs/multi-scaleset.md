@@ -46,6 +46,51 @@ The legacy singular form is automatically normalised into a one-element
 Mixing the two shapes is rejected at load with an error naming the offending
 legacy keys.
 
+## Migrating from label-differentiated profiles
+
+Earlier versions accepted sibling profiles of one scale set carrying different
+labels — for example `mem-4g`, `mem-8g` and `mem-16g` under one `homelab` set.
+That shape cannot work and is now rejected at config load. A runner registers
+with a just-in-time config that has no labels, so the only labels GitHub sees
+are the scale set's; it treats every runner in the set as satisfying all of
+them and hands a `mem-16g` job to whichever runner asks for work next. The job
+then runs on the wrong hardware — typically an out-of-memory kill that GitHub
+reports as `The runner has received a shutdown signal`.
+
+Split one scale set per label set:
+
+```yaml
+scalesets:
+  - name: homelab-mem-4g
+    labels: [self-hosted, linux, x64, proxmox, mem-4g]
+    vmid_range: { min: 10000, max: 12999 }
+    profiles:
+      - name: mem-4g
+        labels: [self-hosted, linux, x64, proxmox, mem-4g]
+        cpu: 2
+        memory_mb: 4096
+  - name: homelab-mem-16g
+    labels: [self-hosted, linux, x64, proxmox, mem-16g]
+    vmid_range: { min: 13000, max: 15999 }
+    profiles:
+      - name: mem-16g
+        labels: [self-hosted, linux, x64, proxmox, mem-16g]
+        cpu: 8
+        memory_mb: 16384
+```
+
+Two things to know before you migrate:
+
+- **Workflows do not change.** `runs-on: [proxmox, mem-16g]` matched the old
+  single scale set and now matches `homelab-mem-16g` — the difference is that
+  GitHub can act on the distinction instead of ignoring it.
+- **Each entry needs its own `vmid_range`**, pairwise disjoint, per the section
+  below. Partition the range the single scale set used.
+
+Sibling profiles inside one scale set are still supported when they are
+interchangeable for any job the set accepts — a second template image, a
+different node placement or network. They must all carry the scale set's labels.
+
 ## VMID ranges must be disjoint
 
 With more than one scale set declared, **every entry must carry its own

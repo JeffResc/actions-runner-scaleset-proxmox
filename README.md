@@ -24,9 +24,9 @@ you get the isolation of a fresh VM without paying the boot cost on every run.
 - **Snapshot-rollback recycling** — optionally reuse a VM by rolling it back to
   a clean post-clone snapshot instead of destroying it, for ~15s turnaround on
   storage without linked clones. → [recycling](docs/profiles-and-scaling.md#recycling-vms-with-snapshot-rollback)
-- **Runner profiles** — per-shape bundles of hardware, labels, templates, and
-  networks. Route GPU jobs to GPU hosts and ARM jobs to ARM templates by
-  `runs-on:` labels alone. → [profiles](docs/profiles-and-scaling.md#runner-profiles)
+- **Runner profiles** — per-shape bundles of hardware, templates, and networks.
+  Send GPU jobs to GPU hosts and ARM jobs to ARM templates by `runs-on:` labels,
+  giving each shape its own scale set. → [profiles](docs/profiles-and-scaling.md#runner-profiles)
 - **Scheduled capacity** — cron-driven pool sizing, so you can run 20 warm VMs
   during business hours and 2 overnight. → [schedules](docs/profiles-and-scaling.md#scheduled-pool-sizes)
 - **Cluster-aware placement** — `single`, `round_robin`, or `least_loaded` node
@@ -167,7 +167,7 @@ Full walkthrough, including GitHub App auth and verification steps:
 | [Getting started](docs/getting-started.md) | End-to-end first run: template, tokens, config, verification, troubleshooting |
 | [Architecture](docs/architecture.md) | Job lifecycle, VM state machine, control loops, crash recovery, package map |
 | [Configuration](docs/configuration.md) | Config blocks, env-var overrides, validation rules, GHES |
-| [Profiles and scaling](docs/profiles-and-scaling.md) | Hot/warm pools, profiles, label routing, networking, schedules, canaries, quotas |
+| [Profiles and scaling](docs/profiles-and-scaling.md) | Hot/warm pools, profiles, where labels are matched, networking, schedules, canaries, quotas |
 | [Node placement](docs/node-placement.md) | Placement strategies and affinity rules on a PVE cluster |
 | [Multiple scale sets](docs/multi-scaleset.md) | Running several scale sets in one process |
 | [Deployment](docs/deployment.md) | Binary, Docker, systemd, Helm, and Raft-based HA |

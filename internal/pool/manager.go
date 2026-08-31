@@ -565,11 +565,24 @@ func (m *manager) SignalRefill() {
 
 // SetDesiredCount records the listener-side "total assigned jobs" so
 // reconcile can scale up beyond HotSize when the burst calls for it.
-// Fleet-wide aggregate. In single-profile configs (the only
-// production shape today) the value flows through to the default
-// profile's desiredCount. With multi-profile configs the per-profile
-// split is the caller's responsibility (PR 2 / #7 — label routing);
-// until that lands, the value is also applied to the default profile.
+// The signal is fleet-wide — GitHub reports one number for the whole
+// scale set and cannot attribute it to a profile, because every runner
+// in a scale set is indistinguishable to GitHub (see
+// config.validateProfileLabels). Config now enforces that all profiles
+// of a scale set carry the same labels, so any of them can serve any
+// assigned job and an even split is the honest apportionment.
+//
+// Shares are split evenly across profiles in declaration order, with
+// the remainder handed to the earliest profiles so the per-profile
+// shares always sum to exactly n. Storing n on every profile instead
+// would have each of them independently clone for the whole burst.
+//
+// Known limitation: a profile that cannot consume its share (at its
+// max_concurrent_runners, or starved by the capacity gate) does not
+// lend it to a sibling, so a burst can land short. That is bounded and
+// visible via scaleset_pool_size{profile,state}. It replaces the
+// previous behaviour, where the count reached only the first declared
+// profile and every sibling never burst at all.
 func (m *manager) SetDesiredCount(n int) {
 	if n < 0 {
 		n = 0
@@ -578,8 +591,13 @@ func (m *manager) SetDesiredCount(n int) {
 	if int(prev) != n {
 		m.log.Debug("desired count updated", "from", prev, "to", n)
 	}
-	if ps := m.profileOf(""); ps != nil {
-		ps.desiredCount.Store(int32(n)) // #nosec G115 -- see above
+	share, remainder := n/len(m.profileOrder), n%len(m.profileOrder)
+	for i, name := range m.profileOrder {
+		got := share
+		if i < remainder {
+			got++
+		}
+		m.profiles[name].desiredCount.Store(int32(got)) // #nosec G115 -- bounded by n, clamped above
 	}
 	m.SignalRefill()
 }
@@ -699,9 +717,11 @@ func (m *manager) snapshotRecycle() bool {
 //
 // Profile-agnostic: picks the oldest Hot VM across ALL profiles. The
 // per-call maxBusy clamp applies to the orchestrator-wide busy count.
-// This is the backwards-compatible single-profile entry point;
-// multi-profile callers that want per-profile scoping should use
-// AcquireForProfile.
+// That is the correct choice for the scaler, not a compromise: config
+// enforces that every profile of a scale set advertises the same labels
+// (see config.validateProfileLabels), so any profile's Hot VM serves any
+// job the set accepts. AcquireForProfile exists for callers that want to
+// scope a claim to one profile's pool; nothing in production does today.
 //
 // The cap check (busy < MaxConcurrentRunners; additionally busy <
 // maxBusy when maxBusy > 0) and the Hot→Assigned CAS happen inside
