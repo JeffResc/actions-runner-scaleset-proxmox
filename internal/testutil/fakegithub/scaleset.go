@@ -295,7 +295,10 @@ func (s *Server) handleScaleSetCreate(w http.ResponseWriter, r *http.Request) {
 		if len(body.Labels) > 0 {
 			entry.spec.Labels = body.Labels
 		}
-		writeJSON(w, http.StatusCreated, entry.spec)
+		// 200, not 201: CreateRunnerScaleSet rejects anything else as
+		// "unexpected status code", which made this whole branch
+		// unreachable.
+		writeJSON(w, http.StatusOK, entry.spec)
 		return
 	}
 	// Unknown name and we don't synthesise new scalesets at runtime

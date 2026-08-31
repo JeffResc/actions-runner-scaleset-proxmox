@@ -1052,6 +1052,12 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 // with the entry's configured labels, repairing a difference in place
 // with UpdateRunnerScaleSet.
 //
+// An entry with no configured labels is left alone: `labels:` is
+// optional, so an empty list means "this orchestrator does not manage
+// the labels", not "reset them". Reconciling it would wipe the label
+// set of any scale set adopted from ARC or created by hand — the same
+// silent-queueing failure in the opposite direction.
+//
 // A failed update is not fatal: GitHub keeps routing the labels it
 // already knows, so the scale set stays useful for every job that does
 // not ask for a config-only label. The difference is logged with both
@@ -1060,7 +1066,11 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 // the existing one otherwise — never nil.
 func reconcileScaleSetLabels(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
 	existing *scaleset.RunnerScaleSet, metrics *observability.Metrics, log *slog.Logger) *scaleset.RunnerScaleSet {
-	want := desiredLabelNames(entry)
+	if len(entry.Labels) == 0 {
+		setLabelDrift(metrics, entry.Name, 0)
+		return existing
+	}
+	want := desiredLabelNames(entry, existing.Labels)
 	have := labelNames(existing.Labels)
 	if slices.Equal(want, have) {
 		setLabelDrift(metrics, entry.Name, 0)
@@ -1085,14 +1095,21 @@ func reconcileScaleSetLabels(ctx context.Context, gh *scaleset.Client, entry con
 }
 
 // desiredLabelNames returns the label set the config asks GitHub to
-// hold, sorted and deduplicated for comparison. An entry with no
-// configured labels mirrors the scaleset library's own create-path
-// fallback: a single label named after the scale set.
-func desiredLabelNames(entry config.ScaleSetEntry) []string {
-	if len(entry.Labels) == 0 {
-		return []string{entry.Name}
+// hold, sorted and deduplicated for comparison.
+//
+// Labels GitHub assigned itself ("System" type — a scale set created
+// without labels gets one named after the scale set) are carried over
+// rather than deleted: they are not the operator's to declare, and
+// dropping one would either break routing by scale-set name or, if the
+// service re-adds it, leave the reconciler patching on every start.
+func desiredLabelNames(entry config.ScaleSetEntry, existing []scaleset.Label) []string {
+	want := slices.Clone(entry.Labels)
+	for _, l := range existing {
+		if l.Type == "System" {
+			want = append(want, l.Name)
+		}
 	}
-	return sortedUnique(entry.Labels)
+	return sortedUnique(want)
 }
 
 func labelNames(labels []scaleset.Label) []string {

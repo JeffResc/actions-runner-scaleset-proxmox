@@ -317,6 +317,59 @@ func TestEnsureScaleSetForEntry_LabelsInSyncNoUpdate(t *testing.T) {
 	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")))
 }
 
+// TestEnsureScaleSetForEntry_NoConfiguredLabelsLeavesGitHubAlone pins
+// that an entry without `labels:` does not manage labels at all.
+// Reconciling one to "just the scale set's name" would wipe the label
+// set of a scale set adopted from ARC or created by hand — the failure
+// this reconciliation exists to prevent, in the opposite direction.
+func TestEnsureScaleSetForEntry_NoConfiguredLabelsLeavesGitHubAlone(t *testing.T) {
+	t.Parallel()
+	adopted := []string{"self-hosted", "linux", "x64", "proxmox"}
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "linux-x64", Labels: adopted},
+	})
+	srv.InjectScaleSetUpdateFailure(http.StatusInternalServerError, 1)
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{Name: "linux-x64"} // no Labels
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	_, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Equal(t, adopted, srv.ScaleSetLabels(),
+		"an empty labels: must leave GitHub's label set untouched")
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")))
+}
+
+// TestEnsureScaleSetForEntry_SystemLabelPreserved pins that GitHub's
+// own "System" label survives reconciliation. A scale set created
+// without labels carries one named after itself; deleting it would
+// break routing by scale-set name, and a service that re-added it
+// would leave the reconciler patching on every restart.
+func TestEnsureScaleSetForEntry_SystemLabelPreserved(t *testing.T) {
+	t.Parallel()
+	// No seeded labels — the fake mirrors GitHub's create-path default
+	// of one System label named after the scale set.
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{ID: 77, Name: "linux-x64"},
+	})
+	cli := newFakeScaleSetClient(t, srv.ConfigURL("my-org"))
+	entry := config.ScaleSetEntry{Name: "linux-x64", Labels: []string{"proxmox", "mem-4g"}}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+
+	_, err := ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"linux-x64", "proxmox", "mem-4g"}, srv.ScaleSetLabels(),
+		"the configured labels must be added without dropping GitHub's System label")
+
+	// Second pass over the reconciled state must be a no-op: the
+	// injected failure would surface as drift if it patched again.
+	srv.InjectScaleSetUpdateFailure(http.StatusInternalServerError, 1)
+	_, err = ensureScaleSetForEntry(t.Context(), cli, entry, metrics, silentLogger())
+	require.NoError(t, err)
+	require.Zero(t, testutil.ToFloat64(metrics.LabelDrift.WithLabelValues("linux-x64")),
+		"reconciliation must converge, not patch on every start")
+}
+
 // TestEnsureScaleSetForEntry_CreateFailureSurfaces pins that a scale
 // set the fake does not host (lookup returns "not found", then the
 // create is rejected) surfaces as an error rather than a nil scale set
