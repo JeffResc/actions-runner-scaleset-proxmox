@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.3](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.2...actions-runner-scaleset-proxmox-v0.1.3) (2026-08-31)
+
+
+### Features
+
+* **pool:** gate clone admission on allocated node memory ([75aabd6](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/75aabd6ccd6234fb178d3ec84cf63b4ce6a4b9ea))
+* **pool:** gate clone admission on allocated node memory so heterogeneous profiles can fill a node without overcommitting it ([2573670](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/2573670c72192dae9b9a406d2ed1a15aa054b0a5))
+
+
+### Bug Fixes
+
+* **nodecap:** recognise owned guests by owner tag as well as vmid range ([19de0a8](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/19de0a84d9e63c57f2cd149c626b6115039eb9d2))
+* **nodecap:** stop counting powered-off foreign guests against node capacity ([e5f92b8](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/e5f92b8e383c570f02250e1a2c86a50688323575))
+* **nodecap:** stop counting powered-off foreign guests against node capacity ([e506714](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/e5067142fae3ebd0f29582fa6e0e2c1a65931f93))
+* **pool:** log the per-node capacity gap when no idle VM can be reclaimed for a queued job ([2101c5b](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/2101c5bcee9d8f0dc1201be1595534b4d445a9ea))
+* **pool:** probe node eligibility against the configured node universe and reclaim vcpu-bound capacity when evicting ([b762b85](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/b762b85bad66c661dee371b0f7c338622bd3876b))
+* **pool:** report both capacity dimensions in the eviction log so a vcpu-driven eviction is legible ([7219e08](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/7219e08b120e879f6b5bb469cf584354e217d6df))
+* **pool:** scan every eligible node when evicting and hold parked claims the selector cannot rule on ([5698809](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/5698809530f4e2b0e76b709f57f389fe42e29665))
+* **pool:** translate the unlimited runner cap at every call site and consume parked eviction claims before the capacity selector ([462dd8e](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/462dd8eebe2d75453e51aeb62090fb925879dcfd))
+
 ## [0.1.2](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.1...actions-runner-scaleset-proxmox-v0.1.2) (2026-08-31)
 
 
