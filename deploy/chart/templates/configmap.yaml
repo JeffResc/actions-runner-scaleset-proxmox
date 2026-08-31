@@ -42,6 +42,37 @@ literal secret values in the YAML before they leak.
 {{-     fail "scalesetConfig.admin_api.shared_secret must NOT be set in plaintext; supply it via the SCALESET_ADMIN_API_SHARED_SECRET env var (the chart's Secret + Deployment templates already wire this) instead" -}}
 {{-   end -}}
 {{- end -}}
+{{- /*
+github.scope carries exactly one of org / repo; the orchestrator rejects
+both-present and both-empty. Drop keys the operator blanked out before
+validating: a value of "" (or nil) means "not set", and "" is the only
+form that survives Argo CD, whose valuesObject is an
+x-kubernetes-preserve-unknown-fields field the API server strips nulls
+from. Without this, blanking a value would still read as "present".
+*/ -}}
+{{- $scope := dict -}}
+{{- if and (hasKey $cfg "github") (hasKey $cfg.github "scope") -}}
+{{-   $scope = $cfg.github.scope -}}
+{{-   range $key := list "org" "repo" -}}
+{{-     if and (hasKey $scope $key) (not (index $scope $key)) -}}
+{{-       $_ := unset $scope $key -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+{{- /*
+Only the singular form is checked. With a `scalesets:` list each entry
+carries its own scope and a top-level github.scope is legitimately
+absent — mirrors the len(c.Scalesets) <= 1 guard in internal/config.
+`required` rather than `fail` for the empty case so `helm lint` keeps
+reporting it as a warning, the way the Secret template's required calls
+already do.
+*/ -}}
+{{- if not (get $cfg "scalesets") -}}
+{{-   if and (get $scope "org") (get $scope "repo") -}}
+{{-     fail (printf "scalesetConfig.github.scope: set exactly one of org or repo, got org=%q and repo=%q; they are mutually exclusive and the orchestrator refuses to start with both. Under Argo CD blank the unwanted one with \"\" — a null is stripped from valuesObject before Helm sees it" (get $scope "org") (get $scope "repo")) -}}
+{{-   end -}}
+{{-   $_ := required "scalesetConfig.github.scope: set exactly one of org or repo (both are empty)" (or (get $scope "org") (get $scope "repo")) -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

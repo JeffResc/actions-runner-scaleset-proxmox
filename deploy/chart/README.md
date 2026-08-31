@@ -27,6 +27,12 @@ For anything beyond a dev cluster, use a `values.yaml` file. See [values.yaml](v
 
 Set `secrets.existingSecret` to a Secret name you provision separately (SealedSecrets, external-secrets, etc.). The chart will then skip its convenience Secret. Required keys: `SCALESET_GITHUB_PAT_TOKEN`, `SCALESET_PROXMOX_AUTH_TOKEN_SECRET`, and (when `admin_api` is enabled) `SCALESET_ADMIN_API_SHARED_SECRET`. These are the canonical koanf env-override names — the orchestrator picks them up automatically from the matching `SCALESET_<yaml.path.uppercased>` env var, no yaml change needed.
 
+## Selecting the GitHub scope
+
+Set exactly one of `scalesetConfig.github.scope.org` or `scalesetConfig.github.scope.repo`. They are mutually exclusive, and the orchestrator refuses to start when both are present or both are missing. The chart ships neither, so whichever one you set is the only one that reaches the ConfigMap.
+
+There is deliberately no placeholder default. Helm deep-merges your values *over* the chart's, so a default `org` would survive underneath a `repo` you set and produce the rejected pair. Helm's usual escape hatch — an explicit `null` to delete the key — is not portable here: Argo CD's `valuesObject` is an `x-kubernetes-preserve-unknown-fields` field, and the API server strips nulls from it before Helm is invoked. **Under Argo CD, blank a value with `""`, not `null`.** The chart treats an empty string as "not set".
+
 ## Config file permissions
 
 The orchestrator refuses to read a `config.yaml` that grants any access to "other", and it must be able to reach the file as the owner or through one of its groups. Kubernetes cannot set the owner UID of a projected volume, so the chart mounts the ConfigMap with `defaultMode: 0440` and relies on `podSecurityContext.fsGroup` to make the pod's group the file's group owner.
