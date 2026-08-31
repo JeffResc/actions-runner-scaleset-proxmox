@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.5](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.4...actions-runner-scaleset-proxmox-v0.1.5) (2026-08-31)
+
+
+### Bug Fixes
+
+* **app:** recreate the runner scale set to apply changed labels ([c009b2f](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/c009b2fc0e99fc57b805aab510fb53f8a3321412))
+* **app:** recreate the runner scale set to apply changed labels, since GitHub ignores them on update ([0b4a7e4](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/0b4a7e4b4c3b85c8060655bdf70084ef1e7e9e35))
+* **app:** register the recreated scale set in the configured runner group and refuse to recreate when idleness is unknown ([e7143a1](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/e7143a15e493d8170111025b7db7c4bbf4fdaff2))
+
 ## [0.1.4](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.3...actions-runner-scaleset-proxmox-v0.1.4) (2026-08-31)
 
 
