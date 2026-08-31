@@ -390,57 +390,61 @@ func TestPlanEviction(t *testing.T) {
 
 	t.Run("nothing to do when the clone already fits", func(t *testing.T) {
 		t.Parallel()
-		victims, _ := planEviction(
+		plan := planEviction(
 			[]evictionCandidate{candidate(1, 16, true, time.Hour)}, memShape(8), memState(8))
-		require.Empty(t, victims, "capacity for both means evict nothing")
+		require.Empty(t, plan.victims, "capacity for both means evict nothing")
 	})
 
 	t.Run("prefers warm over hot", func(t *testing.T) {
 		t.Parallel()
 		hot := candidate(1, 16, false, 2*time.Hour) // older, but booted
 		warm := candidate(2, 16, true, time.Minute) // newer, but parked
-		victims, freed := planEviction([]evictionCandidate{hot, warm}, memShape(16), memState(0))
-		require.Len(t, victims, 1)
-		require.Equal(t, 2, victims[0].row.VMID, "a parked warm VM is cheaper to lose than a booted hot one")
-		require.Equal(t, uint64(16*gib), freed)
+		plan := planEviction([]evictionCandidate{hot, warm}, memShape(16), memState(0))
+		require.Len(t, plan.victims, 1)
+		require.Equal(t, 2, plan.victims[0].row.VMID, "a parked warm VM is cheaper to lose than a booted hot one")
+		require.Equal(t, uint64(16*gib), plan.freedMem)
+		require.Equal(t, uint64(16*gib), plan.memGap, "the gap is reported so the log can name it")
 	})
 
 	t.Run("oldest first within a kind", func(t *testing.T) {
 		t.Parallel()
 		newer := candidate(1, 16, true, time.Minute)
 		older := candidate(2, 16, true, time.Hour)
-		victims, _ := planEviction([]evictionCandidate{newer, older}, memShape(16), memState(0))
-		require.Len(t, victims, 1)
-		require.Equal(t, 2, victims[0].row.VMID, "the oldest VM is closest to being recycled anyway")
+		plan := planEviction([]evictionCandidate{newer, older}, memShape(16), memState(0))
+		require.Len(t, plan.victims, 1)
+		require.Equal(t, 2, plan.victims[0].row.VMID, "the oldest VM is closest to being recycled anyway")
 	})
 
 	t.Run("takes several victims when one is not enough", func(t *testing.T) {
 		t.Parallel()
-		victims, freed := planEviction([]evictionCandidate{
+		plan := planEviction([]evictionCandidate{
 			candidate(1, 4, true, 3*time.Hour),
 			candidate(2, 4, true, 2*time.Hour),
 			candidate(3, 4, true, time.Hour),
 		}, memShape(12), memState(2))
-		require.Len(t, victims, 3, "a 10 GiB gap needs all three 4 GiB VMs")
-		require.Equal(t, uint64(12*gib), freed)
+		require.Len(t, plan.victims, 3, "a 10 GiB gap needs all three 4 GiB VMs")
+		require.Equal(t, uint64(12*gib), plan.freedMem)
+		require.Equal(t, uint64(10*gib), plan.memGap)
 	})
 
 	t.Run("refuses a plan that still would not fit", func(t *testing.T) {
 		t.Parallel()
-		victims, _ := planEviction([]evictionCandidate{
+		plan := planEviction([]evictionCandidate{
 			candidate(1, 4, true, time.Hour),
 		}, memShape(16), memState(0))
-		require.Empty(t, victims,
+		require.Empty(t, plan.victims,
 			"destroying VMs that still leave the job unplaceable is pure loss")
+		require.Equal(t, uint64(16*gib), plan.memGap,
+			"the unmet gap survives so the caller can report what was short")
 	})
 
 	t.Run("only takes what it needs", func(t *testing.T) {
 		t.Parallel()
-		victims, _ := planEviction([]evictionCandidate{
+		plan := planEviction([]evictionCandidate{
 			candidate(1, 16, true, 2*time.Hour),
 			candidate(2, 16, true, time.Hour),
 		}, memShape(16), memState(0))
-		require.Len(t, victims, 1, "one victim closes the gap; the second must survive")
+		require.Len(t, plan.victims, 1, "one victim closes the gap; the second must survive")
 	})
 }
 
@@ -971,14 +975,20 @@ func TestEvict_ClosesAVCPUGapToo(t *testing.T) {
 		{row: &store.VM{VMID: 2, CreatedAt: time.Now().Add(-time.Minute)}, memBytes: 2 * gib, vcpus: 4, preferred: true},
 	}
 
-	victims, _ := planEviction(cands, shape, st)
-	require.Len(t, victims, 2, "8 vCPU of headroom needs both 4-vCPU victims, memory notwithstanding")
+	plan := planEviction(cands, shape, st)
+	require.Len(t, plan.victims, 2, "8 vCPU of headroom needs both 4-vCPU victims, memory notwithstanding")
+	// The diagnostics must name the dimension that actually ran out —
+	// otherwise the eviction log reads "freed 4 GiB, needed 4 GiB" and
+	// looks like a bug.
+	require.Equal(t, 8, plan.vcpuGap)
+	require.Equal(t, 8, plan.freedVCPU)
+	require.Zero(t, plan.memGap, "memory was never short here")
 
 	// The same node with CPU gating off has nothing to reclaim for.
 	ungated := st
 	ungated.CPUGated = false
-	victims, _ = planEviction(cands, shape, ungated)
-	require.Empty(t, victims, "with CPU ungated the clone already fits; evict nothing")
+	plan = planEviction(cands, shape, ungated)
+	require.Empty(t, plan.victims, "with CPU ungated the clone already fits; evict nothing")
 }
 
 // TestEvict_ParkedReservationsReleasedOnDrain: the accountant is shared

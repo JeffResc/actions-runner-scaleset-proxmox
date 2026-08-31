@@ -385,6 +385,28 @@ func (m *manager) publishCapacityGauges(ctx context.Context) {
 // Idle eviction
 // ---------------------------------------------------------------------------
 
+// evictionPlan is the outcome of sizing an eviction on one node: which
+// idle VMs to destroy, and the gaps that made them necessary.
+//
+// The gaps are carried even when no viable victim set was found, so the
+// caller can say WHY VMs were destroyed (or why none could be). Without
+// them a vCPU-driven eviction logs a memory gap of zero beside the
+// memory it happened to free, which reads like a bug.
+type evictionPlan struct {
+	victims []evictionCandidate
+
+	// memGap / vcpuGap are how much of each dimension had to be
+	// reclaimed for the clone to fit. Either may be zero: a node can be
+	// short on one and not the other. vcpuGap is always zero when the
+	// operator left cpu_overcommit_ratio unset.
+	memGap  uint64
+	vcpuGap int
+
+	// freedMem / freedVCPU are what the chosen victims actually release.
+	freedMem  uint64
+	freedVCPU int
+}
+
 // evictionCandidate is one idle VM whose allocation could be reclaimed.
 type evictionCandidate struct {
 	row       *store.VM
@@ -461,11 +483,11 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 	// best, which may hold none of this scale set's idle VMs while a
 	// sibling node — an equally legal placement — is full of them.
 	for _, node := range eligible {
-		victims, freed := planEviction(byNode[node], shape, states[node])
-		if len(victims) == 0 {
+		plan := planEviction(byNode[node], shape, states[node])
+		if len(plan.victims) == 0 {
 			continue
 		}
-		if m.startEviction(ctx, ps, node, shape, victims, freed) {
+		if m.startEviction(ctx, ps, node, shape, plan) {
 			return true
 		}
 	}
@@ -475,6 +497,14 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 // fitsNode reports whether shape would be admitted on a node in this
 // state. Mirrors the accountant's own fit rule: memory always binds,
 // vCPU only when the operator configured an overcommit ratio.
+//
+// One edge is not mirrored exactly. For a shape with zero vCPUs on a
+// node already over its ceiling, the accountant refuses (committed + 0
+// still exceeds the limit) while this returns true (available 0 >= 0).
+// It relies on config validation requiring cpu > 0 on every profile
+// whenever cpu_overcommit_ratio is set, so a gated node never sees a
+// zero-vCPU shape. If that rule is ever relaxed, this needs the same
+// committed-vs-limit form the accountant uses.
 func fitsNode(st nodecap.NodeState, shape nodecap.Shape) bool {
 	if st.AvailableBytes < shape.MemoryBytes {
 		return false
@@ -515,17 +545,16 @@ func (m *manager) eligibleNodes(ctx context.Context, ps *profileState, states ma
 // no gap to close, so the queued job would be deferred every tick with
 // nothing ever reclaiming capacity for it. vCPU is only considered when
 // the operator turned that gate on.
-func planEviction(candidates []evictionCandidate, shape nodecap.Shape, st nodecap.NodeState) ([]evictionCandidate, uint64) {
+func planEviction(candidates []evictionCandidate, shape nodecap.Shape, st nodecap.NodeState) evictionPlan {
 	if fitsNode(st, shape) {
-		return nil, 0 // nothing to do; the clone should have fit
+		return evictionPlan{} // nothing to do; the clone should have fit
 	}
-	var memGap uint64
+	plan := evictionPlan{}
 	if shape.MemoryBytes > st.AvailableBytes {
-		memGap = shape.MemoryBytes - st.AvailableBytes
+		plan.memGap = shape.MemoryBytes - st.AvailableBytes
 	}
-	var vcpuGap int
 	if st.CPUGated && shape.VCPUs > st.AvailableVCPU {
-		vcpuGap = shape.VCPUs - st.AvailableVCPU
+		plan.vcpuGap = shape.VCPUs - st.AvailableVCPU
 	}
 
 	// Warm before Hot (no boot invested, and Hot serves job-start
@@ -541,18 +570,18 @@ func planEviction(candidates []evictionCandidate, shape nodecap.Shape, st nodeca
 		return ordered[i].row.CreatedAt.Before(ordered[j].row.CreatedAt)
 	})
 
-	var picked []evictionCandidate
-	var freedMem uint64
-	var freedVCPU int
 	for _, c := range ordered {
-		picked = append(picked, c)
-		freedMem += c.memBytes
-		freedVCPU += c.vcpus
-		if freedMem >= memGap && freedVCPU >= vcpuGap {
-			return picked, freedMem
+		plan.victims = append(plan.victims, c)
+		plan.freedMem += c.memBytes
+		plan.freedVCPU += c.vcpus
+		if plan.freedMem >= plan.memGap && plan.freedVCPU >= plan.vcpuGap {
+			return plan
 		}
 	}
-	return nil, 0
+	// The node's idle VMs cannot close the gap; destroying a partial set
+	// would be pure loss. Keep the gaps for the caller's diagnostics.
+	plan.victims, plan.freedMem, plan.freedVCPU = nil, 0, 0
+	return plan
 }
 
 // startEviction commits an eviction plan: CAS each victim out of its
@@ -565,9 +594,9 @@ func planEviction(candidates []evictionCandidate, shape nodecap.Shape, st nodeca
 // the next tick re-plans against fresh state. Abandoning is safe: any
 // victims already CAS'd in this pass are still destroyed, which only
 // frees more capacity than intended for one tick.
-func (m *manager) startEviction(ctx context.Context, ps *profileState, node string, shape nodecap.Shape, victims []evictionCandidate, freed uint64) bool {
-	committed := make([]evictionCandidate, 0, len(victims))
-	for _, v := range victims {
+func (m *manager) startEviction(ctx context.Context, ps *profileState, node string, shape nodecap.Shape, plan evictionPlan) bool {
+	committed := make([]evictionCandidate, 0, len(plan.victims))
+	for _, v := range plan.victims {
 		from := store.StateHot
 		if v.preferred {
 			from = store.StateWarm
@@ -608,10 +637,14 @@ func (m *manager) startEviction(ctx context.Context, ps *profileState, node stri
 	}
 
 	for _, v := range committed {
+		// Both dimensions are logged, because either can be the reason:
+		// a zero gap on one and a non-zero gap on the other is exactly
+		// what tells an operator which resource ran out.
 		m.log.Info("evict: destroying idle vm to admit queued demand",
 			"vmid", v.row.VMID, "victim_profile", v.row.Profile, "victim_state", v.row.State,
 			"for_profile", ps.settings.Name, "node", node,
-			"freed_bytes", freed, "needed_bytes", shape.MemoryBytes)
+			"gap_bytes", plan.memGap, "freed_bytes", plan.freedMem,
+			"gap_vcpu", plan.vcpuGap, "freed_vcpu", plan.freedVCPU)
 		if m.metrics != nil {
 			m.metrics.CapacityEvictions.WithLabelValues(
 				m.cfg.ScaleSetName, metricsProfile(ps.settings.Name), metricsProfile(v.row.Profile)).Inc()
