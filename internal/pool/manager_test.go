@@ -139,6 +139,20 @@ func (f *fakeProv) Clone(ctx context.Context, opts provisioner.CloneOptions) (*p
 	return &provisioner.VM{VMID: opts.NewVMID, Node: opts.Node, Name: opts.Name}, nil
 }
 
+// clonedProfile reports whether Clone has been called for the named
+// profile. Clone dispatch is asynchronous, so a test that polls for a
+// clone must read f.clones under the mutex Clone writes it under.
+func (f *fakeProv) clonedProfile(name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.clones {
+		if c.Profile == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *fakeProv) Start(_ context.Context, v *provisioner.VM) error {
 	f.mu.Lock()
 	f.starts = append(f.starts, v.VMID)
@@ -3266,12 +3280,7 @@ func TestProfiles_BurstClonesNonDefaultProfile(t *testing.T) {
 	require.Positive(t, int(mgr.profiles["b"].desiredCount.Load()),
 		"profile b must receive a share of the burst")
 	require.Eventually(t, func() bool {
-		for _, c := range fp.clones {
-			if c.Profile == "b" {
-				return true
-			}
-		}
-		return false
+		return fp.clonedProfile("b")
 	}, 2*time.Second, 10*time.Millisecond,
 		"a burst must clone into a non-default profile")
 }
