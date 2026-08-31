@@ -292,6 +292,10 @@ func (s *Server) handleScaleSetCreate(w http.ResponseWriter, r *http.Request) {
 		// Real GitHub stores the labels the create request carried;
 		// keeping them here lets a later lookup (and ScaleSetLabels)
 		// agree with what the orchestrator asked for.
+		//
+		// No test reaches this today: a create only follows a lookup
+		// miss, and the lookup answers for every name this branch
+		// accepts. Reaching it needs a lookup-miss injection knob.
 		if len(body.Labels) > 0 {
 			entry.spec.Labels = body.Labels
 		}
