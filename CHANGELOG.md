@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.4](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.3...actions-runner-scaleset-proxmox-v0.1.4) (2026-08-31)
+
+
+### Bug Fixes
+
+* **app:** leave unlabelled entries and GitHub's own System labels untouched during reconciliation ([2fc579c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/2fc579c371d86e7f0cbca74b2f2d2eee6a01fcc7))
+* **app:** reconcile runner scale set labels with the config on every start ([d281e87](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/d281e87da6c65a75679968fabfe7c8894c02bece))
+* **app:** reconcile runner scale set labels with the config on every start instead of only at creation ([7ce147a](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/7ce147a39c62effd840ab995c15c2d54e0e3e07c))
+
 ## [0.1.3](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.2...actions-runner-scaleset-proxmox-v0.1.3) (2026-08-31)
 
 
