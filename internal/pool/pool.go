@@ -167,6 +167,10 @@ type Manager interface {
 	// empty profile name picks the default (first declared) profile.
 	// Returns an error for unknown explicit profile names. maxBusy
 	// is enforced per-profile when profile is non-empty.
+	//
+	// The scaler deliberately uses Acquire instead: profiles within a
+	// scale set all advertise the same labels, so scoping a job's claim
+	// to one of them would only starve it. No production caller today.
 	AcquireForProfile(ctx context.Context, jobID int64, profile string, maxBusy int) (*VM, error)
 
 	// MarkRunning transitions a VM from Assigned to Running. Called from

@@ -248,24 +248,24 @@ their profile name, so crash recovery routes them back into the right pool on
 restart.
 
 ```yaml
-profiles:
+scalesets:
   - name: linux-x64
     labels: [self-hosted, linux, proxmox, x64]
-    template_vmid: 9000
-    cpu: 4
-    memory_mb: 8192
-    hot_size: 5
-    warm_size: 10
-    max_concurrent_runners: 20
-  - name: gpu
-    labels: [self-hosted, linux, proxmox, gpu]
-    template_vmid: 9100
-    cpu: 8
-    memory_mb: 32768
-    hot_size: 0            # explicit 0 — no idle pool, clone on demand
-    warm_size: 1
-    max_concurrent_runners: 4
+    profiles:
+      - name: linux-x64
+        labels: [self-hosted, linux, proxmox, x64]   # same as the scale set
+        template_vmid: 9000
+        cpu: 4
+        memory_mb: 8192
+        hot_size: 5
+        warm_size: 10
+        max_concurrent_runners: 20
 ```
+
+**Every profile must advertise exactly its scale set's labels**, and config load
+fails otherwise. Profiles are pools, not job selectors — see
+[Where labels are matched](#where-labels-are-matched) for why, and for how to
+serve a second hardware shape.
 
 Configs without a `profiles:` block keep working unchanged — the orchestrator
 synthesises a single `default` profile from the global `pool:` and `scaleset:`
@@ -279,18 +279,62 @@ Prometheus metrics are partitioned by `profile=` so dashboards can slice by
 hardware shape. See `profiles:` in
 [config.example.yaml](../config.example.yaml) for the full schema.
 
-### Label routing
+### Where labels are matched
 
-Job-to-profile routing is *best-match by labels*. A profile satisfies a job
-when its labels are a **superset** of the job's `RequestLabels`, and the
-profile with the smallest extra-label count wins. Ties resolve by declaration
-order.
+**Labels select a scale set, never a profile.** A runner registers with a
+just-in-time config that carries only a name and a work folder — it has no
+labels of its own. The only labels GitHub ever sees are the scale set's, so
+every runner inside one scale set is indistinguishable to GitHub. GitHub matches
+a job's `runs-on:` against the *scale set's* label set, then hands the job to
+whichever runner in that set asks for work next. Nothing in the orchestrator can
+influence that pairing.
 
-When no profile satisfies a job,
-`scaleset_unrouted_jobs_total{labels="..."}` increments so the coverage gap is
-visible. Config validation rejects scale sets whose declared labels aren't
-collectively covered by some profile, so that misconfiguration is caught at
-load time rather than per-job at runtime.
+So a hardware distinction you want jobs to select belongs on **separate scale
+sets**, one per shape:
+
+```yaml
+scalesets:
+  - name: linux-x64
+    labels: [self-hosted, linux, proxmox, x64]
+    vmid_range: { min: 10000, max: 14999 }
+    profiles:
+      - name: linux-x64
+        labels: [self-hosted, linux, proxmox, x64]
+        template_vmid: 9000
+        cpu: 4
+        memory_mb: 8192
+  - name: gpu
+    labels: [self-hosted, linux, proxmox, gpu]
+    vmid_range: { min: 15000, max: 19999 }
+    profiles:
+      - name: gpu
+        labels: [self-hosted, linux, proxmox, gpu]
+        template_vmid: 9100
+        cpu: 8
+        memory_mb: 32768
+        hot_size: 0            # explicit 0 — no idle pool, clone on demand
+        warm_size: 1
+        max_concurrent_runners: 4
+```
+
+`runs-on: [self-hosted, linux, proxmox, gpu]` now matches the `gpu` scale set
+and only that one. Workflow syntax is the same either way — what changes is that
+GitHub can act on it. See [multi-scaleset.md](multi-scaleset.md), including the
+disjoint `vmid_range` requirement.
+
+Declaring the shapes as sibling profiles of one scale set looks equivalent and
+is not: the set would advertise every profile's labels at once, GitHub would
+treat all of its runners as satisfying all of them, and a `gpu` job could be
+handed a 4-vCPU VM with no GPU. Config load rejects that shape rather than
+letting it fail silently at runtime.
+
+Multiple profiles in **one** scale set remain useful for pools that are
+interchangeable for any job the set accepts — a second template image, a
+different node placement or network. They must all carry the scale set's labels.
+
+`scaleset_unrouted_jobs_total{labels="..."}` still increments when a job's
+labels match no profile, which flags a coverage gap between what the scale set
+advertises to GitHub and what it can actually serve.
 
 ### Per-profile networking
 

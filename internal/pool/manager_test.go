@@ -3202,6 +3202,80 @@ func TestProfiles_AcquireForProfileScopesByName(t *testing.T) {
 	require.Equal(t, store.StateHot, x64.State)
 }
 
+// TestProfiles_SetDesiredCountSplitsAcrossProfiles pins the burst
+// apportionment. GitHub reports one assigned-job count for the whole
+// scale set and cannot attribute it to a profile, so the count is split
+// evenly with the remainder going to the earliest profiles. Previously
+// the whole count landed on the first declared profile alone, so a
+// sibling with hot_size 0 never cloned for a burst at all and its jobs
+// were served by whatever the default profile had lying around.
+func TestProfiles_SetDesiredCountSplitsAcrossProfiles(t *testing.T) {
+	t.Parallel()
+	mgr := newTestManager(t, newTestStore(t), &fakeProv{}, Config{
+		MaxConcurrentRunners: 30,
+		Profiles: []ProfileSettings{
+			{Name: "a", HotSize: 1, MaxConcurrentRunners: 10, BootMaxAttempts: 3},
+			{Name: "b", HotSize: 0, MaxConcurrentRunners: 10, BootMaxAttempts: 3},
+			{Name: "c", HotSize: 0, MaxConcurrentRunners: 10, BootMaxAttempts: 3},
+		},
+	})
+
+	shares := func() []int {
+		got := make([]int, 0, len(mgr.profileOrder))
+		for _, name := range mgr.profileOrder {
+			got = append(got, int(mgr.profiles[name].desiredCount.Load()))
+		}
+		return got
+	}
+
+	mgr.SetDesiredCount(6)
+	require.Equal(t, []int{2, 2, 2}, shares())
+
+	// Remainder goes to the earliest profiles, and the shares must sum
+	// to exactly the requested count — never more, or every profile
+	// would independently clone for the whole burst.
+	mgr.SetDesiredCount(7)
+	require.Equal(t, []int{3, 2, 2}, shares())
+
+	mgr.SetDesiredCount(0)
+	require.Equal(t, []int{0, 0, 0}, shares())
+
+	// Negative is clamped, not propagated.
+	mgr.SetDesiredCount(-1)
+	require.Equal(t, []int{0, 0, 0}, shares())
+}
+
+// TestProfiles_BurstClonesNonDefaultProfile is the regression: a burst
+// must reach a profile other than the first declared one. With the old
+// first-profile-only apportionment "b" saw desired=0 forever and never
+// cloned, no matter how many jobs GitHub had queued.
+func TestProfiles_BurstClonesNonDefaultProfile(t *testing.T) {
+	t.Parallel()
+	fp := &fakeProv{}
+	mgr := newTestManager(t, newTestStore(t), fp, Config{
+		MaxConcurrentRunners: 30,
+		Profiles: []ProfileSettings{
+			{Name: "a", HotSize: 0, WarmSize: 0, MaxConcurrentRunners: 10, BootMaxAttempts: 3},
+			{Name: "b", HotSize: 0, WarmSize: 0, MaxConcurrentRunners: 10, BootMaxAttempts: 3},
+		},
+	})
+
+	mgr.SetDesiredCount(4)
+	mgr.reconcileProfileOnce(context.Background(), "b")
+
+	require.Positive(t, int(mgr.profiles["b"].desiredCount.Load()),
+		"profile b must receive a share of the burst")
+	require.Eventually(t, func() bool {
+		for _, c := range fp.clones {
+			if c.Profile == "b" {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond,
+		"a burst must clone into a non-default profile")
+}
+
 func TestProfiles_AcquireForProfileRejectsUnknown(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
