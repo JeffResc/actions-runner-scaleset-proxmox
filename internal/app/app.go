@@ -1215,6 +1215,15 @@ func scaleSetWorkInFlight(s *scaleset.RunnerScaleSetStatistic) string {
 // The type comparison is case-insensitive on purpose: the library sends
 // "System" but github.com returns "system", so an exact match here
 // silently protected nothing.
+//
+// Carrying the label over converges in one recreate rather than looping,
+// because github.com stores a client-supplied system type as system
+// instead of coercing it to user. Probed end to end: create labelless
+// (GitHub adds {name, system}), delete, create again with the config's
+// labels plus that label typed "System", then look it up the way the
+// next start does — the label reads back as system, so want still
+// contains it and matches have. A labelled create also adds no system
+// label of its own, so there is nothing new to diverge on.
 func desiredLabelNames(entry config.ScaleSetEntry, existing []scaleset.Label) []string {
 	want := slices.Clone(entry.Labels)
 	for _, l := range existing {
