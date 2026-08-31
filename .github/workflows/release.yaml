@@ -56,11 +56,18 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/actions-runner-scaleset-proxmox
+          # tag_name is component-prefixed by release-please
+          # (actions-runner-scaleset-proxmox-vX.Y.Z), which metadata-action
+          # rejects as invalid semver — it warns and emits no tag, so every
+          # release before this fix published only sha- images. The `version`
+          # output is the bare X.Y.Z. `latest` comes free from flavor
+          # latest=auto once a semver rule matches, and is correctly
+          # suppressed for prereleases.
+          # No {{major}} rule pre-1.0: a moving `0` tag would cross breaking
+          # 0.x minor bumps. Add it at 1.0.
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.tag_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
-            type=semver,pattern={{major}},value=${{ needs.release-please.outputs.tag_name }}
-            type=sha
+            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.version }}
 
       - name: Build and push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
