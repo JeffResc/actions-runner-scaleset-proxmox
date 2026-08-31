@@ -103,30 +103,39 @@ type Server struct {
 	// decrements count.
 	deleteFault httpFault
 
-	// scaleSetUpdateFault, when count > 0, makes the next `count`
-	// scale-set PATCH calls return `status` — used to exercise the
-	// label-reconciliation failure branch, which warns and continues
-	// with GitHub's current labels.
-	scaleSetUpdateFault httpFault
+	// scaleSetDeleteFault / scaleSetCreateFault, when count > 0, make
+	// the next `count` scale-set DELETE / POST calls return `status` —
+	// the two failure branches of the label recreate path.
+	scaleSetDeleteFault httpFault
+	scaleSetCreateFault httpFault
 
 	// scalesets is the per-scaleset state, indexed by scaleset name
 	// (the operator-facing identifier). scalesetsByID is a parallel
 	// view for routing handlers that key off the URL {id} param.
-	// Both maps are populated in New and never resized afterwards,
-	// so reads happen without a write lock once construction is done
-	// (the surrounding mu guards per-entry mutable state instead).
+	// The name map is fixed after New; scalesetsByID grows when a
+	// deleted scale set is created again under a new ID, so both its
+	// reads and its writes hold mu.
 	scalesets     map[string]*scalesetEntry
 	scalesetsByID map[int]*scalesetEntry
 
 	adminToken    string
 	nextMessageID int
+
+	// nextScaleSetID hands out IDs for scale sets created after a
+	// delete, so a recreated scale set never reuses the old ID.
+	nextScaleSetID int
 }
 
 // scalesetEntry is the per-scaleset state. Each entry has its own
 // session lifecycle, statistics, and JIT mint counter so multi-
 // scaleset tests can assert on each scale set independently.
 type scalesetEntry struct {
-	spec         fakeRunnerScaleSet
+	spec fakeRunnerScaleSet
+	// deleted marks a scale set removed through the scale-set DELETE
+	// endpoint. The entry stays in the name map so a later create can
+	// re-register it (with a new ID, as github.com does), but the
+	// lookup answers "not found" until then.
+	deleted      bool
 	session      *sessionState
 	statistics   fakeRunnerScaleSetStatistic
 	jitMintCount int
@@ -155,6 +164,9 @@ func New(t testing.TB, opts Options) *Server {
 		entry := &scalesetEntry{spec: spec, jitMintsByName: map[string]int{}}
 		s.scalesets[spec.Name] = entry
 		s.scalesetsByID[spec.ID] = entry
+		if spec.ID >= s.nextScaleSetID {
+			s.nextScaleSetID = spec.ID + 1
+		}
 	}
 	for _, r := range opts.InitialRunners {
 		s.runners[r.ID] = r
@@ -231,18 +243,26 @@ func normaliseScalesetOptions(opts Options) []fakeRunnerScaleSet {
 		if rg == 0 {
 			rg = 1
 		}
+		// Types are lowercase because that is what github.com returns
+		// ("user" / "system"), whatever case the client sent.
 		labels := make([]runnerScaleSetLabel, 0, len(ss.Labels))
 		for n, l := range ss.Labels {
-			labels = append(labels, runnerScaleSetLabel{ID: n + 1, Name: l, Type: "User"})
+			labels = append(labels, runnerScaleSetLabel{ID: n + 1, Name: l, Type: "user"})
 		}
 		if len(labels) == 0 {
-			labels = []runnerScaleSetLabel{{ID: 1, Name: name, Type: "System"}}
+			labels = []runnerScaleSetLabel{{ID: 1, Name: name, Type: "system"}}
+		}
+		var stats *fakeRunnerScaleSetStatistic
+		if ss.Statistics != nil {
+			s := fakeRunnerScaleSetStatistic(*ss.Statistics)
+			stats = &s
 		}
 		out = append(out, fakeRunnerScaleSet{
 			ID:            id,
 			Name:          name,
 			RunnerGroupID: rg,
 			Labels:        labels,
+			Statistics:    stats,
 		})
 	}
 	return out
@@ -442,6 +462,7 @@ func (s *Server) routes() http.Handler {
 	r.Get("/_apis/runtime/runnerscalesets", s.handleScaleSetLookup)
 	r.Post("/_apis/runtime/runnerscalesets", s.handleScaleSetCreate)
 	r.Patch("/_apis/runtime/runnerscalesets/{id}", s.handleScaleSetUpdate)
+	r.Delete("/_apis/runtime/runnerscalesets/{id}", s.handleScaleSetDelete)
 	r.Get("/_apis/runtime/runnergroups/", s.handleRunnerGroupLookup)
 	r.Get("/_apis/runtime/runnergroups", s.handleRunnerGroupLookup)
 	r.Post("/_apis/runtime/runnerscalesets/{id}/sessions", s.handleSessionCreate)

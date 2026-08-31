@@ -46,7 +46,7 @@ All metrics are namespaced `scaleset_`. Every per-scale-set metric carries
 | Metric | Labels | Notes |
 | --- | --- | --- |
 | `scaleset_unrouted_jobs_total` | `scaleset, labels` | No profile matched the job's labels. `labels` is hashed into 64 buckets to bound cardinality |
-| `scaleset_labels_drift` | `scaleset` | 1 when the labels on GitHub disagree with `scaleset.labels` and the orchestrator could not repair them |
+| `scaleset_labels_drift` | `scaleset` | 1 when the labels on GitHub disagree with `scaleset.labels` and the orchestrator could not repair them — it was busy, already recreated once this process, or the delete/create failed |
 | `scaleset_quota_throttled_total` | `scaleset, scope, name` | Observed over-quota jobs (observational — see [profiles-and-scaling.md](profiles-and-scaling.md#multi-tenancy-quotas-and-priority)) |
 | `scaleset_priority_acquires_total` | `scaleset, class` | Jobs paired with a VM, by priority class |
 | `scaleset_preemptions_total` | `scaleset, from_class, to_class` | Successful preempts |
@@ -83,6 +83,31 @@ All metrics are namespaced `scaleset_`. Every per-scale-set metric carries
   GitHub routes no job that asks for a label it does not know, so those jobs
   queue with no other symptom: the listener stays connected, the pool stays
   idle, and `/readyz` stays green.
+
+### Changing a scale set's labels
+
+GitHub cannot change the labels of a registered runner scale set. The update
+endpoint accepts a new label set, answers `200`, and applies nothing — probed
+against the live API with three body shapes, all of which read back unchanged.
+The orchestrator therefore reconciles by **deleting the scale set and creating
+it again** with the configured labels, at startup, before the listener opens a
+session.
+
+What that means for an operator:
+
+- The scale set gets a **new ID**. Runner registrations and JIT configs issued
+  against the old one are void, so the orchestrator does this only when GitHub
+  reports the scale set idle — no queued, assigned, or running jobs and no
+  registered runners. A busy scale set keeps its labels and sets
+  `scaleset_labels_drift`; the next start retries.
+- It happens **at most once per scale set per process**. If the labels still
+  disagree afterwards, the orchestrator reports drift rather than recreating in
+  a loop.
+- If the delete succeeds and the create fails, the scale set is gone from
+  GitHub. The worker fails, its supervisor retries, and the retry re-registers
+  it through the normal create path. Jobs queue until it comes back.
+- An entry with no `labels:` is left alone entirely — that is how you adopt a
+  scale set whose labels you manage elsewhere.
 - `rate(scaleset_pool_destroy_backlog_full_total[5m]) > 0` — destroys are being
   dropped and VMs will leak until the orphan sweep catches them.
 - `scaleset_canary_reverted_total` increasing — a bad template candidate.

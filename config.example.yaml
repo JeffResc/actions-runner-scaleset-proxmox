@@ -82,7 +82,9 @@ github:
 
 scaleset:
   name: proxmox-ubuntu-x64
-  # Pushed to GitHub at every start. Omit to leave GitHub's labels alone.
+  # Reconciled onto GitHub at every start. GitHub cannot change a
+  # registered scale set's labels, so a change here recreates the scale
+  # set (new ID) while it is idle. Omit to leave GitHub's labels alone.
   labels: [self-hosted, linux, x64, proxmox]
   runner_group: default
   max_concurrent_runners: 50
