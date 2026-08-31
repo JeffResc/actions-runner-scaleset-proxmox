@@ -289,7 +289,22 @@ func TestManager_CloseCancelsWorkerCtx(t *testing.T) {
 	mgr.Close() // idempotent — must not panic
 }
 
-func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner, cfg Config) *manager {
+// testManagerOpt tweaks the collaborators newTestManager builds. Kept
+// variadic so the ~100 existing call sites stay untouched.
+type testManagerOpt func(*testManagerOpts)
+
+type testManagerOpts struct {
+	sel nodeselector.Selector
+}
+
+// withSelector replaces the default single-node selector. Capacity
+// tests use it to exercise the real capacity wrapper, which sits in
+// front of the reservation on the clone path.
+func withSelector(sel nodeselector.Selector) testManagerOpt {
+	return func(o *testManagerOpts) { o.sel = sel }
+}
+
+func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner, cfg Config, opts ...testManagerOpt) *manager {
 	t.Helper()
 	if cfg.MaxConcurrentRunners == 0 {
 		cfg.MaxConcurrentRunners = 10
@@ -315,6 +330,13 @@ func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner,
 
 	sel, err := nodeselector.NewSingle("pve1")
 	require.NoError(t, err)
+	var tmo testManagerOpts
+	for _, o := range opts {
+		o(&tmo)
+	}
+	if tmo.sel != nil {
+		sel = tmo.sel
+	}
 
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
 	var w io.Writer = io.Discard //nolint:staticcheck // explicit interface type required so reassignment to testWriter compiles

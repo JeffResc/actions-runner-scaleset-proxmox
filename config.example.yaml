@@ -216,7 +216,64 @@ pool:
   # Optional fleet-wide ceiling on the sum of per-profile
   # max_concurrent_runners. Validation rejects the config when the
   # arithmetic exceeds this. Leave at 0 (default) for no cap.
+  # Skipped when capacity admission is on and any profile omits its
+  # static cap — there is then no sum to check against.
   # global_max: 50
+
+  # Resource-aware admission control. Off by default; with it off,
+  # concurrency is bounded only by the static max_concurrent_runners
+  # counts, exactly as it always has been.
+  #
+  # With it on, a clone is dispatched only if it also fits in the target
+  # node's remaining ALLOCATED memory: the node's physical RAM, minus a
+  # host reserve, minus the configured memory of every guest already on
+  # it — including guests this orchestrator does not own. "Allocated",
+  # not "used": a booted-but-idle 16 GiB runner reports almost no RSS
+  # while owning its full 16 GiB, so usage is the wrong number to plan
+  # against.
+  #
+  # This lets a node be filled with whatever mix of profile shapes turns
+  # up, instead of reserving each profile's worst case up front. A clone
+  # that does not fit is DEFERRED, not failed: no VM is created, nothing
+  # is reported to GitHub, and the next reconcile tick retries. Watch
+  # scaleset_clone_deferred_capacity_total to see the wait, and
+  # scaleset_node_memory_{total,committed,available}_bytes for the
+  # ledger.
+  #
+  # Every profile must declare memory_mb when this is enabled (and cpu
+  # when cpu_overcommit_ratio is set) — a profile that inherits the
+  # template's memory has no footprint the orchestrator can size, and
+  # guessing would silently overcommit the node. Config load fails
+  # loudly instead.
+  #
+  # capacity:
+  #   enabled: true
+  #   # TTL on the cached /cluster/resources read that backs admission.
+  #   # Lower tracks foreign VMs appearing/disappearing more tightly;
+  #   # higher is lighter on the Proxmox API. Default 15s.
+  #   refresh_interval: 15s
+  #   # Host headroom never planned into. The effective reserve per node
+  #   # is the LARGER of the two, so you can set a floor in MiB and a
+  #   # proportional reserve for bigger nodes at once. Some reserve is
+  #   # essential: PVE itself, ZFS ARC and qemu's per-VM overhead all
+  #   # live outside the guests' configured memory. Defaults to
+  #   # 2048 MiB / 0.0.
+  #   reserve_memory_mb: 4096
+  #   reserve_memory_fraction: 0.1
+  #   # Memory is gated hard because it cannot be overcommitted safely.
+  #   # CPU is time-shared, so it is only gated when you ask: the cap is
+  #   # (physical cores x ratio). 0 (default) means vCPUs are never a
+  #   # reason to refuse a clone.
+  #   cpu_overcommit_ratio: 0
+  #   # Let a queued job reclaim capacity from an idle pool VM. When a
+  #   # job's clone cannot be placed anywhere and the node is full of
+  #   # idle hot/warm VMs, the oldest idle one (warm before hot) is
+  #   # destroyed and the job is admitted on the next tick. When there
+  #   # is room for both, nothing is evicted. Off by default: it trades
+  #   # a sibling profile's warm-start latency for the queued job's
+  #   # ability to run at all, which is your call to make. Scoped to one
+  #   # scale set's own VMs. Watch scaleset_capacity_evictions_total.
+  #   evict_idle_for_demand: false
   reconcile_interval: 10s
   vm_max_age: 24h                 # idle Hot/Warm VMs older than this are recycled
   drain_timeout: 30m              # max wait for running jobs on SIGTERM

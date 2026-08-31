@@ -25,6 +25,7 @@ Other `pool:` knobs worth knowing:
 | `orphan_grace` | How long a Proxmox VM may exist without a local row before the orphan sweep destroys it |
 | `drain_timeout` | Maximum wait for running jobs on SIGTERM |
 | `global_max` | Optional fleet-wide ceiling on the sum of per-profile `max_concurrent_runners` |
+| `capacity` | Opt-in resource-aware admission — gate clones on what actually fits on each node. See [Resource-aware admission control](#resource-aware-admission-control) |
 
 ### Recycling VMs with snapshot rollback
 
@@ -61,6 +62,167 @@ Metrics:
 | `scaleset_recycles_total` | VMs returned to the warm pool via snapshot rollback instead of destroyed |
 | `scaleset_recycle_failures_total` | Rollbacks that failed and fell back to the destroy path |
 | `scaleset_clone_suppressed_total` | Replacement clones skipped because a busy VM will return to the pool via rollback |
+
+## Resource-aware admission control
+
+By default the only bound on how many VMs exist is the static
+`max_concurrent_runners` count per profile. With heterogeneous profiles that
+forces a bad trade: you must size each profile for its worst case, so the node
+sits underused whenever the jobs that turn up are small — and it can still be
+oversubscribed if you tuned the numbers optimistically.
+
+Consider a 32 GiB node serving three shapes:
+
+| profile | cpu | memory_mb | `max_concurrent_runners` |
+| --- | --- | --- | --- |
+| `mem-4g` | 2 | 4096 | 2 |
+| `mem-8g` | 4 | 8192 | 1 |
+| `mem-16g` | 8 | 16384 | 1 |
+
+Those maxima reserve 32 GiB of worst case regardless of what is running. Raise
+any of them and the node can be overcommitted instead.
+
+`pool.capacity` replaces that guesswork with the real number:
+
+```yaml
+pool:
+  capacity:
+    enabled: true
+    reserve_memory_mb: 4096
+```
+
+A clone is now admitted only if it also fits in the target node's remaining
+**allocated** memory:
+
+```
+available = node RAM − host reserve − Σ configured memory of every guest on the node
+```
+
+Three things about that sum are load-bearing:
+
+- **Allocated, not used.** A booted-but-idle 16 GiB runner reports almost no
+  resident memory while owning its full 16 GiB. Planning against usage would
+  admit VMs the node cannot actually back.
+- **Every guest counts**, including VMs and LXC containers this orchestrator
+  does not own. A node's capacity is a property of the node, not of the pool.
+- **The host reserve is not optional.** PVE itself, ZFS ARC and qemu's per-VM
+  overhead all live outside the guests' configured memory. The effective reserve
+  is the larger of `reserve_memory_mb` and `reserve_memory_fraction × node RAM`,
+  so you can set a floor and a proportional reserve at once. It defaults to
+  2048 MiB.
+
+The data comes from a single cached `GET /cluster/resources` call, refreshed
+every `refresh_interval` (default `15s`).
+
+### Deferral is backpressure, not failure
+
+A clone that does not fit is **deferred**: no VM is created, no row is
+persisted, nothing is reported to GitHub, and the next reconcile tick retries.
+The job simply waits in GitHub's queue until capacity frees up. Watch it with:
+
+| Metric | Meaning |
+| --- | --- |
+| `scaleset_clone_deferred_capacity_total` | Clones turned away for lack of room, by profile, node and hot/warm. Sustained non-zero means the fleet wants more RAM than the nodes have |
+| `scaleset_node_memory_total_bytes` | Physical memory of each node |
+| `scaleset_node_memory_committed_bytes` | Memory allocated on each node (foreign guests included) plus outstanding clone reservations |
+| `scaleset_node_memory_available_bytes` | What each node can still admit, net of the host reserve |
+
+The three node gauges carry no `scaleset` label — the ledger behind them is
+fleet-wide, and a per-scale-set copy would report the same number several times.
+
+### CPU
+
+Memory is gated hard because it cannot be overcommitted safely. CPU is
+time-shared, so it is only gated if you ask:
+
+```yaml
+pool:
+  capacity:
+    cpu_overcommit_ratio: 4.0   # allow 4 vCPU per physical core
+```
+
+`0` (the default) means vCPUs are never a reason to refuse a clone.
+
+When the ratio is set, both dimensions are treated alike everywhere — including
+by idle eviction, which will reclaim vCPU as readily as memory. That matters
+because idle pool VMs are cheap on RAM and not on cores: a node can be saturated
+on vCPU with memory to spare, and an eviction that only ever looked at memory
+would find nothing to reclaim there.
+
+### Making memory the only cap
+
+With capacity admission on, `max_concurrent_runners` becomes optional. Omit it
+and there is no static cap at all — the node's memory decides how many runners
+exist, which is usually what you wanted from the static counts in the first
+place:
+
+```yaml
+scalesets:
+  - name: homelab
+    # no max_concurrent_runners: memory is the cap
+    profiles:
+      - name: mem-4g
+        cpu: 2
+        memory_mb: 4096
+```
+
+Keep both and the stricter one binds — they are independent checks, so a clone
+must satisfy each. Without `pool.capacity.enabled`, `max_concurrent_runners`
+stays mandatory: it is then the only thing bounding the fleet.
+
+Every profile must declare `memory_mb` (and `cpu`, if you set
+`cpu_overcommit_ratio`) when capacity admission is on. A profile that inherits
+the template's memory has no footprint the orchestrator can reserve against, and
+guessing one would silently overcommit the node — so config load fails instead.
+
+### Letting a queued job reclaim idle capacity
+
+A node can fill up with *idle* pool VMs. If a job then arrives for a profile
+that no longer fits, it waits behind warmth that nothing is using:
+
+```yaml
+pool:
+  capacity:
+    evict_idle_for_demand: true
+```
+
+With this on, a queued job that cannot be placed anywhere will reclaim capacity
+from an idle VM: the orchestrator destroys the oldest idle one (warm before hot
+— no boot is invested in a warm VM, and hot VMs serve job-start latency) and
+admits the job on the following reconcile tick. The one-tick gap is deliberate:
+cloning the replacement before the victim's `qmdestroy` lands would genuinely
+oversubscribe the node for those seconds. The freed memory is reserved for the
+requesting profile in the meantime, so the victim's own profile cannot
+immediately re-clone into it.
+
+Nothing is evicted when there is room for both. Only genuine queued demand
+triggers it — never routine hot/warm pool top-up, which would have two profiles
+destroying each other's VMs forever. Count it with
+`scaleset_capacity_evictions_total{profile,victim_profile}`; a high rate between
+two profiles means the node is too small for both pools to sit warm at once.
+
+Eviction respects [node placement](node-placement.md). It considers only nodes
+the requesting profile could actually be placed on, and among those takes the
+first with a viable victim — so a profile pinned by an affinity rule (or by
+linked clones) never destroys idle VMs on a node it could not land on, and a
+profile with no placeable node evicts nothing at all, since no amount of freed
+memory would help it. For the same reason, free memory on an ineligible node
+does not count as "there is room for both": a profile pinned to a full node
+still evicts, rather than waiting forever on capacity it can never use.
+
+The freed capacity is re-checked against those same rules before the replacement
+clone consumes it, so an `anti_affinity_with` guarantee holds even if the node's
+occupants changed while the claim was parked. A claim blocked that way is held
+and retried — co-tenancy resolves itself when the other job finishes — while one
+blocked by a hard pin, which will not resolve on its own, is released back to
+the fleet.
+
+Two limits worth knowing:
+
+- Eviction is scoped to one scale set's own VMs. A scale set cannot reclaim
+  capacity from a sibling scale set's pool, or from foreign VMs.
+- It is off by default, because it trades a sibling profile's warm-start latency
+  for the queued job's ability to run at all — a call that belongs to you.
 
 ## Runner profiles
 
