@@ -150,8 +150,20 @@ scalesetConfig:
     # below as SCALESET_GITHUB_PAT_TOKEN. Don't put secrets in
     # this yaml — it lands in a ConfigMap.
     pat: {}
-    scope:
-      org: my-org
+    # Set EXACTLY ONE of scope.org or scope.repo. They are mutually
+    # exclusive and the orchestrator refuses to start when both are
+    # present.
+    #
+    # The chart deliberately ships neither. A placeholder default here
+    # would deep-merge underneath whichever one you set and produce the
+    # rejected pair, and there is no portable way for you to remove it:
+    # Helm treats an explicit `null` as key deletion, but Argo CD's
+    # `valuesObject` is an x-kubernetes-preserve-unknown-fields field
+    # whose nulls the API server strips before Helm ever sees them. Use
+    # an empty string to blank a value under Argo CD, not null.
+    scope: {}
+    #  org: my-org
+    #  repo: my-org/my-repo
 
   scaleset:
     name: proxmox-ubuntu-x64
