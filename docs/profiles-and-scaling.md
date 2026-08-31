@@ -195,14 +195,21 @@ destroying each other's VMs forever. Count it with
 `scaleset_capacity_evictions_total{profile,victim_profile}`; a high rate between
 two profiles means the node is too small for both pools to sit warm at once.
 
-Eviction respects [node placement](node-placement.md): it only sacrifices VMs on
-the node the requesting profile would actually be placed on. A profile pinned by
-an affinity rule (or by linked clones) will not destroy idle VMs on a node it
-could never land on, and a profile with no placeable node at all evicts nothing —
-no amount of freed memory would help it. The freed capacity is re-checked against
-those same rules before the replacement clone consumes it, so an
-`anti_affinity_with` guarantee still holds even if the node's occupants changed
-while the claim was parked.
+Eviction respects [node placement](node-placement.md). It considers only nodes
+the requesting profile could actually be placed on, and among those takes the
+first with a viable victim — so a profile pinned by an affinity rule (or by
+linked clones) never destroys idle VMs on a node it could not land on, and a
+profile with no placeable node evicts nothing at all, since no amount of freed
+memory would help it. For the same reason, free memory on an ineligible node
+does not count as "there is room for both": a profile pinned to a full node
+still evicts, rather than waiting forever on capacity it can never use.
+
+The freed capacity is re-checked against those same rules before the replacement
+clone consumes it, so an `anti_affinity_with` guarantee holds even if the node's
+occupants changed while the claim was parked. A claim blocked that way is held
+and retried — co-tenancy resolves itself when the other job finishes — while one
+blocked by a hard pin, which will not resolve on its own, is released back to
+the fleet.
 
 Two limits worth knowing:
 

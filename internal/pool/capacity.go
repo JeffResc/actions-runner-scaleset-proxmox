@@ -81,15 +81,8 @@ func (m *manager) admitClone(ctx context.Context, ps *profileState, kind store.P
 	// letting this profile's own warm refill spend that memory instead
 	// would sacrifice the victim for nothing and leave the job waiting.
 	if m.cfg.Capacity != nil && kind == store.PoolKindHot {
-		if parked := ps.popEvicted(); parked != nil {
-			if m.stillEligible(ctx, ps, parked.node) {
-				m.log.Debug("clone: consuming reservation parked by an earlier eviction",
-					"profile", ps.settings.Name, "node", parked.node)
-				return parked.node, claimFor(parked.res), true
-			}
-			m.log.Info("clone: discarding parked eviction claim; node is no longer an eligible placement",
-				"profile", ps.settings.Name, "node", parked.node)
-			parked.res.Release()
+		if node, claim, ok := m.claimParked(ctx, ps); ok {
+			return node, claim, true
 		}
 	}
 
@@ -104,23 +97,74 @@ func (m *manager) admitClone(ctx context.Context, ps *profileState, kind store.P
 	return node, claim, true
 }
 
-// stillEligible reports whether node is (still) a legal placement for a
-// clone of ps, ignoring capacity.
+// claimParked consumes one reservation parked by an earlier eviction,
+// if any is still usable.
 //
-// It asks the ordinary selector, with every OTHER node in the avoid
-// list, so the answer comes from the same affinity rules and strategy
-// that govern a normal dispatch — no second copy of that logic to drift.
-// The Shape is left zero, which makes the capacity wrapper a
-// pass-through: the caller already holds a reservation for this node, so
-// "is there room" is not the question being asked.
-func (m *manager) stillEligible(ctx context.Context, ps *profileState, node string) bool {
+// Every parked claim is considered, not just the first: they may sit on
+// different nodes, and one having gone stale must not hide a good one
+// behind it for a whole reconcile tick. A claim whose node is
+// definitively no longer eligible is handed back; one the selector
+// cannot answer for is kept parked and retried next tick, because
+// releasing it would throw away memory an idle VM was destroyed to free.
+func (m *manager) claimParked(ctx context.Context, ps *profileState) (string, capacityClaim, bool) {
+	parked := ps.drainEvicted()
+	if len(parked) == 0 {
+		return "", capacityClaim{}, false
+	}
+	var (
+		chosen *parkedReservation
+		keep   []*parkedReservation
+	)
+	for _, p := range parked {
+		if chosen != nil {
+			keep = append(keep, p)
+			continue
+		}
+		eligible, known := m.nodeEligible(ctx, ps, p.node)
+		switch {
+		case eligible:
+			chosen = p
+		case known:
+			m.log.Info("clone: discarding parked eviction claim; node is no longer an eligible placement",
+				"profile", ps.settings.Name, "node", p.node)
+			p.res.Release()
+		default:
+			m.log.Debug("clone: keeping parked eviction claim; node eligibility unknown this tick",
+				"profile", ps.settings.Name, "node", p.node)
+			keep = append(keep, p)
+		}
+	}
+	ps.parkAll(keep)
+	if chosen == nil {
+		return "", capacityClaim{}, false
+	}
+	m.log.Debug("clone: consuming reservation parked by an earlier eviction",
+		"profile", ps.settings.Name, "node", chosen.node)
+	return chosen.node, claimFor(chosen.res), true
+}
+
+// nodeEligible reports whether node is a legal placement for a clone of
+// ps, ignoring capacity.
+//
+// It asks the ordinary selector with every OTHER node in the avoid list,
+// so the verdict comes from the same affinity rules and strategy that
+// govern a real dispatch — no second copy of that logic to drift. The
+// Shape is left zero, which makes the capacity wrapper a pass-through:
+// whether there is ROOM is a separate question, and for both callers
+// here it is either already answered or beside the point.
+//
+// known distinguishes "the selector says no" from "the selector could
+// not say". They must not be conflated: for a parked eviction claim,
+// treating a transient least_loaded read failure as a refusal would
+// throw away memory an idle VM was just destroyed to free.
+func (m *manager) nodeEligible(ctx context.Context, ps *profileState, node string) (eligible, known bool) {
 	if m.cfg.LinkedClones {
 		// Placement isn't the selector's to make in this mode.
-		return node == m.cfg.TemplateNode
+		return node == m.cfg.TemplateNode, true
 	}
 	states, err := m.cfg.Capacity.Snapshot(ctx)
 	if err != nil {
-		return false
+		return false, false
 	}
 	avoid := make([]string, 0, len(states))
 	for n := range states {
@@ -133,7 +177,23 @@ func (m *manager) stillEligible(ctx context.Context, ps *profileState, node stri
 		ExistingVMs: m.snapshotExistingVMsForAffinity(),
 		Avoid:       avoid,
 	})
-	return err == nil && got == node
+	switch {
+	case errors.Is(err, nodeselector.ErrAffinityRequireUnsatisfiable):
+		// Definitive. A hard pin is operator config: it will not resolve
+		// on its own, so a claim on this node is never coming good and
+		// its memory should go back to the fleet now.
+		return false, true
+	case err != nil:
+		// Everything else is treated as "can't say", and callers hold
+		// rather than discard. The refusals that land here — a node
+		// currently hosting an anti-affinity violator, a transient
+		// least_loaded read failure — are the kind that resolve
+		// themselves once a job finishes or the API recovers, and the
+		// avoid list here deliberately names every other node, so the
+		// error shapes are not reliably distinguishable anyway.
+		return false, false
+	}
+	return got == node, true
 }
 
 // selectNode runs node selection for a clone of ps, translating a
@@ -223,30 +283,41 @@ func (m *manager) recordCapacityDeferral(ps *profileState, node string, kind sto
 		WithLabelValues(m.cfg.ScaleSetName, metricsProfile(ps.settings.Name), node, string(kind)).Inc()
 }
 
-// popEvicted removes and returns one parked reservation, or nil. The
-// handle carries the node the eviction freed capacity on, so the caller
-// takes the node from it rather than choosing one first.
+// drainEvicted removes and returns every unexpired parked reservation.
+// Each handle carries the node its eviction freed capacity on, so the
+// caller takes the node from the claim rather than choosing one first.
 //
-// Expired handles are dropped on the way past — the capacity they
+// Draining rather than popping one keeps the eligibility checks — which
+// hit the selector and the accountant — outside evictMu. Whatever the
+// caller doesn't use goes back via parkAll.
+//
+// Expired handles are released on the way past; the capacity they
 // covered has long since been reclaimed by the accountant's own TTL.
-func (ps *profileState) popEvicted() *parkedReservation {
+func (ps *profileState) drainEvicted() []*parkedReservation {
 	ps.evictMu.Lock()
 	defer ps.evictMu.Unlock()
 	now := time.Now()
-	kept := ps.evicted[:0]
-	var found *parkedReservation
+	out := make([]*parkedReservation, 0, len(ps.evicted))
 	for _, p := range ps.evicted {
-		switch {
-		case now.After(p.expires):
+		if now.After(p.expires) {
 			p.res.Release()
-		case found == nil:
-			found = p
-		default:
-			kept = append(kept, p)
+			continue
 		}
+		out = append(out, p)
 	}
-	ps.evicted = kept
-	return found
+	ps.evicted = nil
+	return out
+}
+
+// parkAll returns unconsumed handles to the profile, preserving their
+// original expiry.
+func (ps *profileState) parkAll(rs []*parkedReservation) {
+	if len(rs) == 0 {
+		return
+	}
+	ps.evictMu.Lock()
+	defer ps.evictMu.Unlock()
+	ps.evicted = append(ps.evicted, rs...)
 }
 
 // parkEvicted stores a reservation for a later tick to consume.
@@ -331,37 +402,33 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 		return false
 	}
 
-	// If ANY node can already take the clone, evict nothing: the idle VM
-	// and the queued job can coexist, and destroying warmth we don't
-	// need to destroy is pure loss. This is also what keeps a single
-	// full node in a multi-node cluster from triggering evictions while
-	// its neighbours sit empty.
+	// Every node this profile could legally be placed on, in a stable
+	// order so a tie between two equally viable nodes doesn't oscillate
+	// between reconcile passes.
 	//
-	// Deliberately checked against every node rather than the ones this
-	// profile's affinity rules would actually allow: a profile pinned
-	// away from the node with room will simply not evict this tick. That
-	// errs toward keeping a sibling's VM alive, which is the safe
-	// direction for a destructive action.
-	for _, st := range states {
-		if st.AvailableBytes >= shape.MemoryBytes {
-			return false
-		}
+	// Eligibility is what scopes the whole pass. Without it a profile
+	// pinned by an affinity rule (or by linked clones) would destroy
+	// idle VMs on a node it can never land on, every tick, with no
+	// progress and a steadily shrinking pool.
+	eligible := m.eligibleNodes(ctx, ps, states)
+	if len(eligible) == 0 {
+		// Typically an unsatisfiable hard pin: no amount of freed memory
+		// would make this profile placeable anywhere.
+		m.log.Debug("evict: no placeable node for profile; nothing to evict for",
+			"profile", ps.settings.Name)
+		return false
 	}
 
-	// Evict only on the node this profile would actually be placed on.
-	// Scanning every node instead would let a profile pinned by an
-	// affinity rule (or by linked clones) destroy idle VMs on a node it
-	// can never land on — repeating every tick, with no progress and a
-	// steadily shrinking pool.
-	node, ok := m.evictionNode(ctx, ps)
-	if !ok {
-		return false
-	}
-	st, known := states[node]
-	if !known {
-		m.log.Debug("evict: target node not in the capacity snapshot; skipping",
-			"profile", ps.settings.Name, "node", node)
-		return false
+	// If an eligible node can already take the clone, evict nothing: the
+	// idle VM and the queued job can coexist, and destroying warmth we
+	// don't need to destroy is pure loss. Restricted to ELIGIBLE nodes —
+	// room on a node this profile is pinned away from is room it can
+	// never use, and letting that veto the eviction would stall the
+	// queued job indefinitely rather than for a tick.
+	for _, node := range eligible {
+		if states[node].AvailableBytes >= shape.MemoryBytes {
+			return false
+		}
 	}
 
 	byNode, err := m.idleCandidatesByNode()
@@ -370,38 +437,41 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 		return false
 	}
 
-	victims, freed := planEviction(byNode[node], shape.MemoryBytes, st.AvailableBytes)
-	if len(victims) == 0 {
-		return false
+	// Take the first eligible node that has a viable victim set. Scanning
+	// rather than committing to the selector's single top pick matters:
+	// under least_loaded that pick is whichever node currently scores
+	// best, which may hold none of this scale set's idle VMs while a
+	// sibling node — an equally legal placement — is full of them.
+	for _, node := range eligible {
+		victims, freed := planEviction(byNode[node], shape.MemoryBytes, states[node].AvailableBytes)
+		if len(victims) == 0 {
+			continue
+		}
+		if m.startEviction(ctx, ps, node, shape, victims, freed) {
+			return true
+		}
 	}
-	return m.startEviction(ctx, ps, node, shape, victims, freed)
+	return false
 }
 
-// evictionNode returns the node a clone of ps would be placed on if
-// capacity were not a constraint — which is exactly the question worth
-// asking, since capacity is what the eviction is about to free.
-//
-// It reuses the ordinary selector with a ZERO Shape: the capacity
-// wrapper is a pass-through for a zero shape, so affinity rules, the
-// underlying strategy and the linked-clone override all still apply
-// while the "every node is full" verdict that triggered this eviction
-// does not veto the answer.
-func (m *manager) evictionNode(ctx context.Context, ps *profileState) (string, bool) {
-	node, err := m.sel.Select(ctx, nodeselector.Hint{
-		Profile:     ps.settings.Name,
-		ExistingVMs: m.snapshotExistingVMsForAffinity(),
-	})
-	if err != nil {
-		// Typically an unsatisfiable hard pin. Nothing to evict for: no
-		// amount of freed memory would make this profile placeable.
-		m.log.Debug("evict: no placeable node for profile; nothing to evict for",
-			"profile", ps.settings.Name, "err", err)
-		return "", false
+// eligibleNodes returns, in sorted order, the subset of the snapshot's
+// nodes that this profile could legally be placed on. Nodes the selector
+// couldn't answer for are omitted — for eviction, "don't know" and "no"
+// lead to the same safe action.
+func (m *manager) eligibleNodes(ctx context.Context, ps *profileState, states map[string]nodecap.NodeState) []string {
+	nodes := make([]string, 0, len(states))
+	for node := range states {
+		nodes = append(nodes, node)
 	}
-	if m.cfg.LinkedClones {
-		node = m.cfg.TemplateNode
+	sort.Strings(nodes)
+
+	out := nodes[:0]
+	for _, node := range nodes {
+		if eligible, known := m.nodeEligible(ctx, ps, node); known && eligible {
+			out = append(out, node)
+		}
 	}
-	return node, true
+	return out
 }
 
 // planEviction picks the smallest set of idle VMs whose combined memory

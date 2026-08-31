@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -726,7 +727,166 @@ func TestEvict_ParkedClaimRecheckedAgainstAntiAffinity(t *testing.T) {
 	_, _, ok := m.admitClone(context.Background(), m.profileOf("big"), store.PoolKindHot)
 	require.False(t, ok,
 		"the parked claim must not place an anti-affine VM next to prod")
-	require.Equal(t, 1, adm.released, "and the claim is handed back, not leaked")
+
+	// The claim is HELD, not discarded: co-tenancy is transient — prod's
+	// VM will finish — so the memory an idle VM was destroyed to free
+	// stays earmarked instead of being handed back and re-fought for.
+	require.Len(t, m.profileOf("big").evicted, 1)
+	require.Zero(t, adm.released)
+
+	// Once prod is gone the same claim places normally.
+	require.NoError(t, st.Delete(10002))
+	node, _, ok := m.admitClone(context.Background(), m.profileOf("big"), store.PoolKindHot)
+	require.True(t, ok)
+	require.Equal(t, "pve1", node)
+}
+
+// TestEvict_ParkedClaimReleasedOnUnsatisfiableHardPin is the other side
+// of that distinction: a hard pin cannot resolve itself the way
+// co-tenancy does, so holding the claim would withhold memory until its
+// TTL for a placement that is never coming.
+func TestEvict_ParkedClaimReleasedOnUnsatisfiableHardPin(t *testing.T) {
+	t.Parallel()
+	// pve1 holds the idle VMs; pve-gpu is full. Neither can take `big`,
+	// so the eviction lands on pve1.
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 12 * gib, "pve-gpu": 0})
+	st := newTestStore(t)
+	all := []string{"pve1", "pve-gpu"}
+	rr, err := nodeselector.NewRoundRobin(all)
+	require.NoError(t, err)
+	sel, err := nodeselector.NewCapacity(rr, adm, all)
+	require.NoError(t, err)
+
+	m := newTestManager(t, st, &fakeProv{}, Config{
+		Capacity:           adm,
+		EvictIdleForDemand: true,
+		Profiles: []ProfileSettings{
+			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
+			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
+		},
+	}, withSelector(sel))
+	seedIdle(t, st, adm, 10001, "small", 4, store.StateWarm, time.Hour)
+	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")))
+	require.Len(t, m.profileOf("big").evicted, 1)
+
+	// The operator now hard-pins `big` to pve-gpu — the claim it holds on
+	// pve1 can never be placed, and no job finishing will change that.
+	aff, err := nodeselector.NewAffinity(rr, []nodeselector.AffinityRule{{
+		Match:       nodeselector.AffinitySelector{Profile: "big"},
+		PreferNodes: []string{"pve-gpu"},
+		Require:     true,
+	}}, all)
+	require.NoError(t, err)
+	m.sel, err = nodeselector.NewCapacity(aff, adm, all)
+	require.NoError(t, err)
+
+	_, _, ok := m.admitClone(context.Background(), m.profileOf("big"), store.PoolKindHot)
+	require.False(t, ok)
+	require.Empty(t, m.profileOf("big").evicted, "an unplaceable claim must not be held")
+	require.Equal(t, 1, adm.released, "its memory goes back to the fleet")
+}
+
+// stickySelector always returns the same node, whatever the hint says,
+// unless that node is avoided. It stands in for least_loaded pointing
+// at one particular node tick after tick — a real selector's answer is
+// a single pick, and eviction must not be limited to it.
+type stickySelector struct{ node string }
+
+func (s stickySelector) Select(_ context.Context, hint nodeselector.Hint) (string, error) {
+	for _, a := range hint.Avoid {
+		if a == s.node {
+			// Avoided: fall back to whatever else the caller left open.
+			for _, n := range []string{"pve1", "pve2"} {
+				if n != s.node && !slices.Contains(hint.Avoid, n) {
+					return n, nil
+				}
+			}
+			return "", errors.New("no node")
+		}
+	}
+	return s.node, nil
+}
+
+// TestEvict_ScansEveryEligibleNode: the selector's single top pick may
+// hold none of this scale set's idle VMs while a sibling node — an
+// equally legal placement — is full of them. Stopping at the top pick
+// would leave the queued job stranded forever with evictable warmth
+// sitting right there.
+func TestEvict_ScansEveryEligibleNode(t *testing.T) {
+	t.Parallel()
+	// Both nodes are memory-full. pve2 is the selector's favourite but
+	// holds only foreign guests; pve1 holds our idle VMs.
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 12 * gib, "pve2": 0})
+	st := newTestStore(t)
+	all := []string{"pve1", "pve2"}
+	sel, err := nodeselector.NewCapacity(stickySelector{node: "pve2"}, adm, all)
+	require.NoError(t, err)
+
+	m := newTestManager(t, st, &fakeProv{}, Config{
+		Capacity:           adm,
+		EvictIdleForDemand: true,
+		Profiles: []ProfileSettings{
+			{Name: "small", MemoryMB: 4096, MaxConcurrentRunners: 10},
+			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
+		},
+	}, withSelector(sel))
+	seedIdle(t, st, adm, 10001, "small", 4, store.StateWarm, time.Hour)
+
+	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")),
+		"pve1 is an eligible node with a viable victim; the top pick having none must not end the search")
+	row, err := st.Get(10001)
+	require.NoError(t, err)
+	require.Equal(t, store.StateDraining, row.State)
+	require.Equal(t, "pve1", m.profileOf("big").evicted[0].node,
+		"the claim is parked against the node the capacity was actually freed on")
+}
+
+// TestEvict_HardPinnedProfileIgnoresRoomElsewhere: the "somewhere has
+// room, so evict nothing" guard must only consider nodes this profile
+// can actually use. Room on a node it is pinned away from is room it can
+// never take, and letting that veto the eviction strands the job
+// indefinitely rather than for a tick.
+func TestEvict_HardPinnedProfileIgnoresRoomElsewhere(t *testing.T) {
+	t.Parallel()
+	// pve-gpu (where `big` is pinned) is full of our idle VMs; pve1 has
+	// plenty of room but `big` may never land there.
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 64 * gib, "pve-gpu": 0})
+	st := newTestStore(t)
+	all := []string{"pve1", "pve-gpu"}
+	rr, err := nodeselector.NewRoundRobin(all)
+	require.NoError(t, err)
+	aff, err := nodeselector.NewAffinity(rr, []nodeselector.AffinityRule{{
+		Match:       nodeselector.AffinitySelector{Profile: "big"},
+		PreferNodes: []string{"pve-gpu"},
+		Require:     true,
+	}}, all)
+	require.NoError(t, err)
+	sel, err := nodeselector.NewCapacity(aff, adm, all)
+	require.NoError(t, err)
+
+	m := newTestManager(t, st, &fakeProv{}, Config{
+		Capacity:           adm,
+		EvictIdleForDemand: true,
+		Profiles: []ProfileSettings{
+			{Name: "small", MemoryMB: 16384, MaxConcurrentRunners: 10},
+			{Name: "big", MemoryMB: 16384, MaxConcurrentRunners: 10},
+		},
+	}, withSelector(sel))
+	// The idle victim sits on the pinned node.
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 10001, Node: "pve-gpu", Name: "gh-runner-test-10001",
+		Profile: "small", State: store.StateWarm, PoolKind: store.PoolKindWarm,
+		CreatedAt: time.Now().Add(-time.Hour),
+	}))
+	adm.mu.Lock()
+	adm.vmSizes[10001] = 16 * gib
+	adm.mu.Unlock()
+
+	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")),
+		"64 GiB free on pve1 is irrelevant to a profile pinned to pve-gpu")
+	row, err := st.Get(10001)
+	require.NoError(t, err)
+	require.Equal(t, store.StateDraining, row.State)
 }
 
 // TestEvict_ParkedReservationsReleasedOnDrain: the accountant is shared
