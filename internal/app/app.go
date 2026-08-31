@@ -32,6 +32,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/gh"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/ipam"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
@@ -133,7 +134,17 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	sel, err := buildNodeSelector(cfg, sharedProv)
+	// The capacity accountant is built ONCE and shared by every scale
+	// set: a node's allocation is a property of the node, and per-scaleset
+	// accountants would each admit clones against capacity the others had
+	// already spent. Nil when pool.capacity.enabled is false, which makes
+	// both the selector wrapper and the pool's admission checks inert.
+	capacity, err := buildCapacityAccountant(cfg, sharedProv, log)
+	if err != nil {
+		return fmt.Errorf("init capacity accountant: %w", err)
+	}
+
+	sel, err := buildNodeSelector(cfg, sharedProv, capacity)
 	if err != nil {
 		return fmt.Errorf("init node selector: %w", err)
 	}
@@ -163,13 +174,14 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	deps := runOneScalesetDeps{
-		cfg:     cfg,
-		auth:    auth,
-		sel:     sel,
-		metrics: metrics,
-		health:  health,
-		log:     log,
-		sysInfo: sysInfo,
+		cfg:      cfg,
+		auth:     auth,
+		sel:      sel,
+		capacity: capacity,
+		metrics:  metrics,
+		health:   health,
+		log:      log,
+		sysInfo:  sysInfo,
 	}
 
 	// runLeaderPlane fans the per-scaleset workers out under one
@@ -511,15 +523,55 @@ func buildAdminGate(cfg *config.Config, coord cluster.Coordinator, tlsClient *tl
 // nodes.affinity rules are declared, the underlying strategy is
 // wrapped in nodeselector.NewAffinity so prefer_nodes /
 // anti_affinity_with rules apply before rotation / load balancing.
-func buildNodeSelector(cfg *config.Config, prov provisioner.Provisioner) (nodeselector.Selector, error) {
+// The capacity wrapper (when resource-aware admission is on) goes
+// OUTSIDE affinity, so a node with no room reaches the affinity rules as
+// an ordinary avoid entry — which keeps `require: true` honest: a hard
+// pin whose nodes are all full still fails loudly instead of silently
+// spilling onto an unpinned node.
+func buildNodeSelector(cfg *config.Config, prov provisioner.Provisioner, capacity pool.CapacityAdmitter) (nodeselector.Selector, error) {
 	underlying, err := buildUnderlyingSelector(cfg, prov)
 	if err != nil {
 		return nil, err
 	}
-	if len(cfg.Nodes.Affinity) == 0 {
-		return underlying, nil
+	sel := underlying
+	if len(cfg.Nodes.Affinity) > 0 {
+		sel, err = nodeselector.NewAffinity(underlying, affinityRulesFromConfig(cfg), affinityNodeUniverse(cfg))
+		if err != nil {
+			return nil, err
+		}
 	}
-	return nodeselector.NewAffinity(underlying, affinityRulesFromConfig(cfg), affinityNodeUniverse(cfg))
+	if capacity == nil {
+		return sel, nil
+	}
+	return nodeselector.NewCapacity(sel, capacity, affinityNodeUniverse(cfg))
+}
+
+// buildCapacityAccountant constructs the shared node-capacity
+// accountant, or returns (nil, nil) when pool.capacity.enabled is false.
+// A nil accountant is the disabled state everywhere downstream — no
+// extra Proxmox calls, no admission checks.
+func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, log *slog.Logger) (pool.CapacityAdmitter, error) {
+	cc := cfg.Pool.Capacity
+	if !cc.Enabled {
+		return nil, nil //nolint:nilnil // nil accountant IS the disabled state; an error would be wrong
+	}
+	acct, err := nodecap.New(prov.Client(), nodecap.Options{
+		Nodes:           affinityNodeUniverse(cfg),
+		Refresh:         cc.RefreshInterval.D(),
+		ReserveBytes:    uint64(max(cc.ReserveMemoryMB, 0)) * 1024 * 1024,
+		ReserveFraction: cc.ReserveMemoryFraction,
+		CPUOvercommit:   cc.CPUOvercommitRatio,
+		// The in-flight clone grace already means "how long before we
+		// assume a clone that never came back is gone"; a reservation
+		// outliving its clone is the same question, so it reuses the
+		// same knob rather than adding a near-duplicate one.
+		ReservationTTL: cfg.Pool.CloneInflightGrace.D(),
+		Log:            log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return acct, nil
 }
 
 func buildUnderlyingSelector(cfg *config.Config, prov provisioner.Provisioner) (nodeselector.Selector, error) {
@@ -622,13 +674,18 @@ type scalesetState struct {
 // inline closure so runOneScaleset can be invoked from tests
 // without rebuilding the closure capture set.
 type runOneScalesetDeps struct {
-	cfg     *config.Config
-	auth    githubauth.Auth
-	sel     nodeselector.Selector
-	metrics *observability.Metrics
-	health  *observability.Health
-	log     *slog.Logger
-	sysInfo scaleset.SystemInfo
+	cfg  *config.Config
+	auth githubauth.Auth
+	sel  nodeselector.Selector
+	// capacity is the shared node-capacity accountant, or nil when
+	// resource-aware admission is disabled. Shared rather than
+	// per-scaleset so sibling scale sets cannot each admit a clone
+	// against the same free memory.
+	capacity pool.CapacityAdmitter
+	metrics  *observability.Metrics
+	health   *observability.Health
+	log      *slog.Logger
+	sysInfo  scaleset.SystemInfo
 }
 
 // runOneScaleset drives one scale set's GH listener, REST
@@ -699,6 +756,8 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
 		OnRunnerOrphaned:     ghClient.RemoveRunner,
 		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
+		Capacity:             deps.capacity,
+		EvictIdleForDemand:   cfg.Pool.Capacity.EvictIdleForDemand,
 	}, st, state.prov, sel, log, metrics)
 	if err != nil {
 		return fmt.Errorf("init pool: %w", err)
@@ -1125,6 +1184,19 @@ func routerForScaleset(ss config.ScaleSetEntry) (*router.Router, error) {
 	return router.New(profiles)
 }
 
+// effectiveMaxConcurrent maps a resolved static cap into the pool's
+// representation. Config validation only permits a non-positive value
+// when pool.capacity.enabled, where it means "no static cap" — memory
+// admission decides instead. pool.Unlimited is a large finite sentinel
+// rather than a special case, so every existing consumer of the cap
+// keeps working with no extra branches.
+func effectiveMaxConcurrent(resolved int) int {
+	if resolved <= 0 {
+		return pool.Unlimited
+	}
+	return resolved
+}
+
 func profileSettingsForScaleset(ss config.ScaleSetEntry, cfg *config.Config) []pool.ProfileSettings {
 	out := make([]pool.ProfileSettings, 0, len(ss.Profiles))
 	for _, p := range ss.Profiles {
@@ -1132,7 +1204,7 @@ func profileSettingsForScaleset(ss config.ScaleSetEntry, cfg *config.Config) []p
 			Name:                 p.Name,
 			HotSize:              p.HotSizeOrDefault(cfg.Pool.HotSize),
 			WarmSize:             p.WarmSizeOrDefault(cfg.Pool.WarmSize),
-			MaxConcurrentRunners: p.MaxConcurrentRunnersOrDefault(ss.MaxConcurrentRunners),
+			MaxConcurrentRunners: effectiveMaxConcurrent(p.MaxConcurrentRunnersOrDefault(ss.MaxConcurrentRunners)),
 			BootMaxAttempts:      p.BootMaxAttemptsOrDefault(cfg.Pool.BootMaxAttempts),
 			VMMaxAge:             p.VMMaxAge.D(),
 			TemplateVMID:         p.TemplateVMID,

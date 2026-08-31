@@ -360,10 +360,18 @@ type ScaleSetConfig struct {
 type ScaleSetEntry struct {
 	// Identity fields (mirror ScaleSetConfig). Required on each
 	// entry.
-	Name                 string   `yaml:"name" validate:"required"`
-	Labels               []string `yaml:"labels"`
-	RunnerGroup          string   `yaml:"runner_group"`
-	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"required,gt=0,lte=1000000"`
+	Name        string   `yaml:"name" validate:"required"`
+	Labels      []string `yaml:"labels"`
+	RunnerGroup string   `yaml:"runner_group"`
+
+	// MaxConcurrentRunners is the static ceiling on this scale set's
+	// live VMs. Required — and enforced as such in validateProfiles —
+	// UNLESS pool.capacity.enabled, in which case omitting it (or
+	// setting 0) means "no static cap": admission is then governed
+	// purely by what fits in the nodes' memory. The struct tag can
+	// only say gte=0 because that rule is cross-field; see
+	// validateProfiles for the real check and its error message.
+	MaxConcurrentRunners int `yaml:"max_concurrent_runners" validate:"gte=0,lte=1000000"`
 
 	// Scope is the GitHub registration target for this scale
 	// set. Exactly one of Scope.Org or Scope.Repo must be set;
@@ -629,6 +637,63 @@ type PoolConfig struct {
 	// per-profile instead — this field is ignored in that case
 	// to keep the override boundary explicit.
 	Schedules []ScheduleConfig `yaml:"schedules,omitempty"`
+
+	// Capacity enables resource-aware admission: clones are gated on
+	// what is ALLOCATED across each node rather than only on static
+	// per-profile counts. Disabled by default — see CapacityConfig.
+	Capacity CapacityConfig `yaml:"capacity"`
+}
+
+// CapacityConfig configures resource-aware admission control.
+//
+// With it disabled (the default) the orchestrator behaves exactly as it
+// always has: concurrency is bounded only by the static per-profile
+// max_concurrent_runners counts. With it enabled, every clone must also
+// fit in a node's remaining ALLOCATED memory — the sum of the configured
+// maxmem of every guest on that node, foreign guests included, versus
+// the node's physical RAM minus a host reserve. The two gates are
+// independent, so when both are configured the stricter one binds.
+//
+// Memory is gated hard because it cannot be overcommitted safely. CPU is
+// time-shared and therefore gated only when the operator opts in via
+// CPUOvercommitRatio.
+type CapacityConfig struct {
+	// Enabled turns the whole feature on. False is a complete no-op:
+	// no extra Proxmox calls, no new admission checks.
+	Enabled bool `yaml:"enabled"`
+
+	// RefreshInterval is the TTL on the cached /cluster/resources read
+	// that backs the accountant. Lower = tighter tracking of foreign
+	// allocation changes; higher = less Proxmox load. Default "15s".
+	RefreshInterval Duration `yaml:"refresh_interval"`
+
+	// ReserveMemoryMB and ReserveMemoryFraction are the host headroom
+	// never planned into. The effective reserve per node is the LARGER
+	// of the two, so an operator can set a floor in MiB and a
+	// proportional reserve for bigger nodes at the same time. Some
+	// reserve is essential: PVE itself, ZFS ARC, and the qemu
+	// per-VM overhead all live outside a guest's maxmem.
+	// Defaults: 2048 MiB and 0.0.
+	ReserveMemoryMB       int     `yaml:"reserve_memory_mb" validate:"gte=0"`
+	ReserveMemoryFraction float64 `yaml:"reserve_memory_fraction" validate:"gte=0,lte=0.9"`
+
+	// CPUOvercommitRatio gates vCPU admission at
+	// (physical cores x ratio). 0 (the default) disables CPU gating
+	// entirely — deliberately permissive, since runner VMs are
+	// typically idle on CPU while waiting on I/O. 1.0 would refuse to
+	// overcommit cores at all.
+	CPUOvercommitRatio float64 `yaml:"cpu_overcommit_ratio" validate:"gte=0,lte=64"`
+
+	// EvictIdleForDemand lets a queued job reclaim capacity from an
+	// idle pool VM. When a job's clone cannot be admitted anywhere and
+	// the node is full of Hot/Warm VMs sitting idle, the oldest idle VM
+	// is destroyed and the job is admitted on the next reconcile tick.
+	// When there is room for both, nothing is evicted.
+	//
+	// Off by default: it trades a sibling profile's warm-start latency
+	// for the queued job's ability to run at all, and that is the
+	// operator's call. Eviction is scoped to one scale set's own VMs.
+	EvictIdleForDemand bool `yaml:"evict_idle_for_demand"`
 }
 
 // ProfileConfig defines a runner profile — a named bundle of hardware
@@ -1290,6 +1355,22 @@ func (c *Config) applyPoolDefaults() {
 	if c.Pool.RecycleMode == "" {
 		c.Pool.RecycleMode = RecycleModeDestroy
 	}
+	c.applyCapacityDefaults()
+}
+
+// applyCapacityDefaults fills the capacity-admission knobs. Only the
+// duration and the host reserve get defaults — Enabled,
+// CPUOvercommitRatio and EvictIdleForDemand are deliberately
+// zero-valued so the feature and each of its escalations stay opt-in.
+func (c *Config) applyCapacityDefaults() {
+	c.Pool.Capacity.RefreshInterval.setDefault(15 * time.Second)
+	if c.Pool.Capacity.ReserveMemoryMB == 0 && c.Pool.Capacity.ReserveMemoryFraction == 0 {
+		// Planning a node to 100% of its physical RAM is never right:
+		// PVE, ZFS ARC and qemu's per-VM overhead all live outside the
+		// guests' maxmem. Default to a 2 GiB floor rather than to zero
+		// so a minimal `capacity: {enabled: true}` is still safe.
+		c.Pool.Capacity.ReserveMemoryMB = 2048
+	}
 }
 
 // applyObservabilityDefaults fills the metrics/log defaults.
@@ -1557,6 +1638,9 @@ func (c *Config) resolvePool() error {
 	if c.Pool.CloneInflightGrace.D() <= 0 {
 		return errors.New("pool.clone_inflight_grace must be positive")
 	}
+	if c.Pool.Capacity.Enabled && c.Pool.Capacity.RefreshInterval.D() <= 0 {
+		return errors.New("pool.capacity.refresh_interval must be positive")
+	}
 	// GitHub reconciler grace knobs must be strictly positive. Like the
 	// pool durations above, ApplyDefaults substituted defaults for unset
 	// fields, so a failure here means an explicit non-positive value in
@@ -1730,7 +1814,10 @@ func (c *Config) validateSizing() error {
 	// "hot+warm > 0". The authoritative per-scaleset check in
 	// validateScalesets covers every entry (including the projected
 	// singular one); guard this legacy check to the single-scaleset case.
-	if len(c.Scalesets) == 1 && c.Pool.HotSize+c.Pool.WarmSize > c.ScaleSet.MaxConcurrentRunners {
+	// A zero cap under capacity admission means "unlimited", so there is
+	// nothing for hot+warm to exceed.
+	if len(c.Scalesets) == 1 && c.ScaleSet.MaxConcurrentRunners > 0 &&
+		c.Pool.HotSize+c.Pool.WarmSize > c.ScaleSet.MaxConcurrentRunners {
 		return fmt.Errorf("pool.hot_size+pool.warm_size (%d) must not exceed scaleset.max_concurrent_runners (%d)",
 			c.Pool.HotSize+c.Pool.WarmSize, c.ScaleSet.MaxConcurrentRunners)
 	}
@@ -1839,7 +1926,15 @@ func (c *Config) validateScalesets() error {
 		}
 		seenScope[scopeKey] = i
 
-		if c.Pool.HotSize+c.Pool.WarmSize > s.MaxConcurrentRunners {
+		// max_concurrent_runners is mandatory unless capacity admission
+		// is on, where omitting it means "let memory decide". This used
+		// to live in the struct tag; it moved here when the rule became
+		// cross-field. The message is unchanged from the validator's.
+		if s.MaxConcurrentRunners <= 0 && !c.Pool.Capacity.Enabled {
+			return fmt.Errorf("scalesets[%d] %q: max_concurrent_runners is required and must be > 0 (omit it only when pool.capacity.enabled)", i, s.Name)
+		}
+		// Vacuous when there is no static cap to exceed.
+		if s.MaxConcurrentRunners > 0 && c.Pool.HotSize+c.Pool.WarmSize > s.MaxConcurrentRunners {
 			return fmt.Errorf("scalesets[%d] %q: pool.hot_size+pool.warm_size (%d) must not exceed max_concurrent_runners (%d)",
 				i, s.Name, c.Pool.HotSize+c.Pool.WarmSize, s.MaxConcurrentRunners)
 		}
@@ -2111,6 +2206,12 @@ var profileNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 // labels.
 func (c *Config) validateProfiles() error {
 	sumMax := 0
+	// anyUnlimited records that some profile opted out of a static cap
+	// (only possible under capacity admission). The global_max
+	// arithmetic below is unevaluable once that happens — see the note
+	// at its call site.
+	anyUnlimited := false
+	capacityOn := c.Pool.Capacity.Enabled
 	for si := range c.Scalesets {
 		s := &c.Scalesets[si]
 		if len(s.Profiles) == 0 {
@@ -2131,20 +2232,35 @@ func (c *Config) validateProfiles() error {
 					si, s.Name, p.Name, prev, i)
 			}
 			seen[p.Name] = i
+			if err := c.validateProfileFootprint(si, s.Name, i, p); err != nil {
+				return err
+			}
 			maxConc := p.MaxConcurrentRunnersOrDefault(s.MaxConcurrentRunners)
 			if maxConc <= 0 {
-				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: max_concurrent_runners must be > 0 (inherited from scaleset when omitted)",
-					si, s.Name, i, p.Name)
+				// Under capacity admission a missing static cap is a
+				// legitimate choice: memory decides instead. Without it
+				// the cap is the ONLY bound on the fleet, so it stays
+				// mandatory and the message is unchanged.
+				if !capacityOn {
+					return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: max_concurrent_runners must be > 0 (inherited from scaleset when omitted)",
+						si, s.Name, i, p.Name)
+				}
+				anyUnlimited = true
+			}
+			if p.BootMaxAttempts != nil && *p.BootMaxAttempts < 1 {
+				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: boot_max_attempts (%d) must be >= 1",
+					si, s.Name, i, p.Name, *p.BootMaxAttempts)
+			}
+			// The remaining checks all bound something against the
+			// static cap, so they are vacuous when there isn't one.
+			if maxConc <= 0 {
+				continue
 			}
 			hot := p.HotSizeOrDefault(c.Pool.HotSize)
 			warm := p.WarmSizeOrDefault(c.Pool.WarmSize)
 			if hot+warm > maxConc {
 				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: hot_size+warm_size (%d) must not exceed max_concurrent_runners (%d)",
 					si, s.Name, i, p.Name, hot+warm, maxConc)
-			}
-			if p.BootMaxAttempts != nil && *p.BootMaxAttempts < 1 {
-				return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: boot_max_attempts (%d) must be >= 1",
-					si, s.Name, i, p.Name, *p.BootMaxAttempts)
 			}
 			// Schedule sizes must not exceed the profile's
 			// max_concurrent_runners — otherwise a fired
@@ -2165,9 +2281,37 @@ func (c *Config) validateProfiles() error {
 				si, s.Name, gaps)
 		}
 	}
-	if c.Pool.GlobalMax > 0 && sumMax > c.Pool.GlobalMax {
+	// global_max is a load-time arithmetic assertion over the per-profile
+	// caps, not a runtime gate. Once any profile has opted out of a
+	// static cap there is no sum to compare against, so the assertion is
+	// skipped rather than evaluated on a partial total that would reject
+	// valid configs (or, worse, pass a fleet with no ceiling at all).
+	if c.Pool.GlobalMax > 0 && !anyUnlimited && sumMax > c.Pool.GlobalMax {
 		return fmt.Errorf("pool.global_max (%d) is below the sum of profile.max_concurrent_runners across all scalesets (%d)",
 			c.Pool.GlobalMax, sumMax)
+	}
+	return nil
+}
+
+// validateProfileFootprint enforces that a profile declares the hardware
+// shape capacity admission needs to size it.
+//
+// A profile that leaves cpu / memory_mb at zero inherits the template's
+// values, which the orchestrator never reads — so under capacity
+// admission there would be no number to reserve against. Failing at load
+// time is the only honest option: guessing would silently overcommit the
+// node, which is the exact failure this feature exists to prevent.
+func (c *Config) validateProfileFootprint(si int, ssName string, pi int, p ProfileConfig) error {
+	if !c.Pool.Capacity.Enabled {
+		return nil
+	}
+	if p.MemoryMB <= 0 {
+		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: memory_mb must be > 0 when pool.capacity.enabled (admission cannot size a clone that inherits the template's memory)",
+			si, ssName, pi, p.Name)
+	}
+	if c.Pool.Capacity.CPUOvercommitRatio > 0 && p.CPUCores <= 0 {
+		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: cpu must be > 0 when pool.capacity.cpu_overcommit_ratio is set (admission cannot size a clone that inherits the template's cpu count)",
+			si, ssName, pi, p.Name)
 	}
 	return nil
 }

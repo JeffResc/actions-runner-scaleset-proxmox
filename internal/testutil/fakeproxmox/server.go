@@ -58,7 +58,29 @@ type Options struct {
 	// quickly, loose enough that a polling client sees the transition
 	// rather than missing it.
 	TaskDuration time.Duration
+
+	// NodeCapacity sets the physical resources each node reports, keyed
+	// by node name. Nodes not listed fall back to DefaultNodeCapacity —
+	// deliberately generous, so tests that predate capacity-aware
+	// admission never trip over it. Drive it (or Server.SetNodeCapacity)
+	// to model a node too small for the pool that wants to live on it.
+	NodeCapacity map[string]NodeCapacity
 }
+
+// NodeCapacity is the physical resource envelope of one fake node.
+type NodeCapacity struct {
+	MemoryBytes uint64
+	CPUs        int
+}
+
+// DefaultNodeCapacity is what a node reports when the test didn't say.
+// Large enough that no pre-existing test can exhaust it.
+var DefaultNodeCapacity = NodeCapacity{MemoryBytes: 64 * 1024 * 1024 * 1024, CPUs: 32}
+
+// DefaultGuestMemoryMB is the memory a VM reports when its config
+// carries no explicit `memory` key — mirroring PVE, where a VM created
+// without one gets the qemu-server default.
+const DefaultGuestMemoryMB = 512
 
 // Server is the fake Proxmox API. Construct with New; the embedded
 // httptest.Server gives Close() and a usable URL.
@@ -119,6 +141,18 @@ func New(t testing.TB, opts Options) *Server {
 // etc.).
 func (s *Server) SeedVM(node string, vmid int, name string, running bool, tags []string) {
 	s.store.seedVM(node, vmid, name, false, running, tags)
+}
+
+// SetNodeCapacity overrides a node's physical resource envelope,
+// bypassing Options. Tests use it to shrink a node mid-scenario so the
+// capacity accountant starts refusing clones.
+func (s *Server) SetNodeCapacity(node string, memoryBytes uint64, cpus int) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if s.opts.NodeCapacity == nil {
+		s.opts.NodeCapacity = map[string]NodeCapacity{}
+	}
+	s.opts.NodeCapacity[node] = NodeCapacity{MemoryBytes: memoryBytes, CPUs: cpus}
 }
 
 // SeedSecurityGroup registers a datacenter firewall security group so
@@ -192,6 +226,7 @@ func (s *Server) routes() http.Handler {
 
 	r.Get("/version", s.handleVersion)
 	r.Get("/cluster/firewall/groups", s.handleClusterFWGroups)
+	r.Get("/cluster/resources", s.handleClusterResources)
 	r.Get("/nodes", s.handleListNodes)
 	r.Get("/nodes/{node}/status", s.handleNodeStatus)
 	r.Get("/nodes/{node}/qemu", s.handleListVMs)
@@ -293,13 +328,75 @@ func (s *Server) handleClusterFWGroups(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleListNodes(w http.ResponseWriter, _ *http.Request) {
 	out := make([]map[string]any, 0, len(s.opts.Nodes))
 	for _, n := range s.opts.Nodes {
+		cap := s.nodeCapacity(n)
 		out = append(out, map[string]any{
 			"node":   n,
 			"type":   "node",
 			"status": "online",
+			"maxmem": cap.MemoryBytes,
+			"maxcpu": cap.CPUs,
 		})
 	}
 	writeData(w, out)
+}
+
+// handleClusterResources models GET /cluster/resources — the single
+// call the capacity accountant uses. Real PVE returns node rows and
+// guest rows in one undifferentiated list, with each guest's maxmem and
+// maxcpu taken from its CONFIG (so they are populated for stopped
+// guests too) and template guests flagged template=1.
+func (s *Server) handleClusterResources(w http.ResponseWriter, _ *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	out := make([]map[string]any, 0, len(s.opts.Nodes)+len(s.store.vms))
+	for _, n := range s.opts.Nodes {
+		cap := s.nodeCapacityLocked(n)
+		out = append(out, map[string]any{
+			"id":     "node/" + n,
+			"type":   "node",
+			"node":   n,
+			"status": "online",
+			"maxmem": cap.MemoryBytes,
+			"maxcpu": cap.CPUs,
+		})
+	}
+	for _, v := range s.store.vms {
+		row := map[string]any{
+			"id":     fmt.Sprintf("qemu/%d", v.VMID),
+			"type":   "qemu",
+			"node":   v.Node,
+			"vmid":   v.VMID,
+			"name":   v.Name,
+			"status": "stopped",
+			"maxmem": guestMemoryBytes(v),
+			"maxcpu": guestVCPUs(v),
+		}
+		if v.Running {
+			row["status"] = "running"
+		}
+		if v.Template {
+			row["template"] = 1
+		}
+		out = append(out, row)
+	}
+	writeData(w, out)
+}
+
+// nodeCapacity resolves a node's physical envelope, taking the lock.
+func (s *Server) nodeCapacity(node string) NodeCapacity {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	return s.nodeCapacityLocked(node)
+}
+
+// nodeCapacityLocked resolves a node's physical envelope. Caller must
+// hold s.store.mu (SetNodeCapacity writes s.opts.NodeCapacity under it).
+func (s *Server) nodeCapacityLocked(node string) NodeCapacity {
+	if c, ok := s.opts.NodeCapacity[node]; ok {
+		return c
+	}
+	return DefaultNodeCapacity
 }
 
 func (s *Server) handleNodeStatus(w http.ResponseWriter, r *http.Request) {
@@ -905,6 +1002,8 @@ func vmJSON(v *vmRecord) map[string]any {
 		"name":   v.Name,
 		"status": "stopped",
 		"tags":   v.Tags,
+		"maxmem": guestMemoryBytes(v),
+		"cpus":   guestVCPUs(v),
 	}
 	if v.Running {
 		out["status"] = "running"
@@ -913,4 +1012,42 @@ func vmJSON(v *vmRecord) map[string]any {
 		out["template"] = 1
 	}
 	return out
+}
+
+// guestMemoryBytes derives a VM's ALLOCATED memory from its qemu config,
+// exactly as PVE does (`get_current_memory($conf->{memory}) * 1MiB`).
+// Reading it back from Config rather than storing it separately keeps
+// the fake automatically faithful to the orchestrator's own post-clone
+// memory override: whatever the provisioner PUTs to /config is what the
+// capacity accountant then observes.
+func guestMemoryBytes(v *vmRecord) uint64 {
+	mb := configInt(v.Config["memory"], DefaultGuestMemoryMB)
+	if mb < 0 {
+		mb = 0
+	}
+	return uint64(mb) * 1024 * 1024
+}
+
+// guestVCPUs mirrors PVE's `sockets * cores`, both defaulting to 1.
+func guestVCPUs(v *vmRecord) int {
+	return configInt(v.Config["sockets"], 1) * configInt(v.Config["cores"], 1)
+}
+
+// configInt coerces a qemu config value to an int. Values arrive either
+// as JSON numbers (float64) from the API path or as native ints from
+// Server.SetVMConfig, so both are accepted.
+func configInt(raw any, fallback int) int {
+	switch n := raw.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case string:
+		if parsed, err := strconv.Atoi(n); err == nil {
+			return parsed
+		}
+	}
+	return fallback
 }

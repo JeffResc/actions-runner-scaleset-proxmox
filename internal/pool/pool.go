@@ -23,7 +23,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
 )
 
 // Errors returned from Manager methods.
@@ -265,6 +268,44 @@ type Manager interface {
 	// profile's MaxConcurrentRunners (hot trimmed last). Returns
 	// ErrUnknownProfile when the name doesn't match.
 	SetTargetSizes(name string, hot, warm int) error
+}
+
+// Unlimited is the effective MaxConcurrentRunners for a profile that
+// declared no static cap — only possible under capacity admission, where
+// memory is the binding constraint instead (see config.CapacityConfig).
+//
+// A large finite sentinel rather than a special case: every existing
+// consumer of the cap (validateConfig, computeCloneNeeds' room clamp,
+// store.AcquireHotInProfile) then keeps working unchanged and with no
+// new branches. MaxInt32 leaves room for `profileMax - occupied` to be
+// computed without overflow.
+const Unlimited = math.MaxInt32
+
+// CapacityAdmitter is the subset of nodecap.Accountant the pool needs.
+// A nil CapacityAdmitter disables resource-aware admission entirely —
+// every clone is dispatched exactly as it was before the feature
+// existed.
+//
+// Kept as a narrow interface so manager tests can drive admission
+// decisions directly instead of standing up a Proxmox client.
+type CapacityAdmitter interface {
+	// Fits reports which candidate nodes have room for shape. Advisory:
+	// it narrows the node selector's choices, while Reserve is the
+	// atomic gate.
+	Fits(ctx context.Context, shape nodecap.Shape, candidates []string) (map[string]bool, error)
+
+	// Reserve atomically claims shape on node. A false bool is ordinary
+	// backpressure (the node filled up), not an error.
+	Reserve(ctx context.Context, node string, shape nodecap.Shape) (nodecap.Reservation, bool, error)
+
+	// ReserveFreeing is Reserve with the allocation of the freeing
+	// VMIDs treated as already released — used by the idle-eviction
+	// path, which has just committed those VMs to destruction.
+	ReserveFreeing(ctx context.Context, node string, shape nodecap.Shape, freeing []int) (nodecap.Reservation, bool, error)
+
+	// Snapshot returns per-node capacity, for gauges and eviction
+	// planning.
+	Snapshot(ctx context.Context) (map[string]nodecap.NodeState, error)
 }
 
 // validateConfig returns a descriptive error if poolConfig + maxConcurrent

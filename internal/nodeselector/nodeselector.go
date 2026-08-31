@@ -28,6 +28,8 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/luthermonson/go-proxmox"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
 )
 
 // Hint lets callers influence the selection without coupling each
@@ -38,13 +40,18 @@ import (
 // Profile is the runner profile the new clone belongs to, used to
 // look up the matching affinity rule; ExistingVMs is the snapshot
 // of currently-tracked VMs (excluding the row about to be created)
-// used to compute anti-affinity exclusions. Both are optional —
-// the underlying single / round_robin / least_loaded selectors
-// ignore them.
+// used to compute anti-affinity exclusions. Shape feeds the
+// capacity wrapper. All are optional — the underlying single /
+// round_robin / least_loaded selectors ignore them.
 type Hint struct {
 	Avoid       []string
 	Profile     string
 	ExistingVMs []ExistingVM
+
+	// Shape is the resource footprint of the VM about to be
+	// cloned. Consulted only by the capacity wrapper; a zero
+	// Shape makes that wrapper a pass-through.
+	Shape nodecap.Shape
 }
 
 // ExistingVM is the affinity wrapper's projection of a tracked VM
@@ -455,4 +462,119 @@ func (a *affinityWrapper) matchingRule(profile string) *AffinityRule {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Capacity wrapper
+// ---------------------------------------------------------------------------
+
+// capacityFitter is the subset of nodecap.Accountant the capacity
+// wrapper needs. Narrow interface so tests inject a fake rather
+// than standing up a Proxmox client.
+type capacityFitter interface {
+	Fits(ctx context.Context, shape nodecap.Shape, candidates []string) (map[string]bool, error)
+}
+
+// ErrNoCapacity is returned by the capacity wrapper when no
+// candidate node has room for the requested shape. Distinct from
+// the underlying selectors' "no eligible nodes" and from
+// ErrAffinityRequireUnsatisfiable so the caller can treat it as
+// BACKPRESSURE — defer the clone and retry next tick — rather than
+// as a failure worth surfacing to GitHub.
+var ErrNoCapacity = errors.New("nodeselector: no node has capacity for the requested shape")
+
+// capacityWrapper filters out nodes that cannot fit the clone's
+// resource shape before delegating to the underlying selector.
+//
+// It composes exactly like affinityWrapper: eligibility is
+// communicated through the existing Hint.Avoid surface, so
+// rotation (round_robin) and load balancing (least_loaded) keep
+// their semantics within the set of nodes that actually have room.
+//
+// Layering is capacity(affinity(underlying)): capacity runs
+// OUTERMOST so a full node reaches the affinity wrapper as an
+// ordinary Avoid entry. That keeps `require: true` honest — a hard
+// pin whose nodes are all full still fails with
+// ErrAffinityRequireUnsatisfiable rather than silently spilling
+// onto an unpinned node.
+//
+// The wrapper only NARROWS the candidate set. The authoritative,
+// atomic gate is nodecap.Accountant.Reserve at the clone site — a
+// node reported as fitting here can be filled by a concurrent
+// dispatch a microsecond later, and that race costs one deferred
+// clone, not an overcommit.
+type capacityWrapper struct {
+	underlying Selector
+	fitter     capacityFitter
+	allNodes   []string
+}
+
+// NewCapacity returns a Selector that admits only nodes with room
+// for the hint's Shape. A nil fitter returns the underlying
+// selector unchanged, so the wrapper is zero-cost when
+// capacity-aware admission is switched off.
+func NewCapacity(underlying Selector, fitter capacityFitter, allNodes []string) (Selector, error) {
+	if underlying == nil {
+		return nil, errors.New("nodeselector: capacity requires a non-nil underlying selector")
+	}
+	if fitter == nil {
+		return underlying, nil
+	}
+	if len(allNodes) == 0 {
+		return nil, errors.New("nodeselector: capacity requires the operator node universe to compute eligibility")
+	}
+	return &capacityWrapper{
+		underlying: underlying,
+		fitter:     fitter,
+		allNodes:   slices.Clone(allNodes),
+	}, nil
+}
+
+func (c *capacityWrapper) Select(ctx context.Context, hint Hint) (string, error) {
+	// A zero Shape means the caller has nothing to size (a profile
+	// with no declared footprint, which config validation rejects
+	// when capacity is enabled). Pass through rather than guess.
+	if hint.Shape.MemoryBytes == 0 && hint.Shape.VCPUs == 0 {
+		return c.underlying.Select(ctx, hint)
+	}
+
+	candidates := make([]string, 0, len(c.allNodes))
+	for _, n := range c.allNodes {
+		if !slices.Contains(hint.Avoid, n) {
+			candidates = append(candidates, n)
+		}
+	}
+	if len(candidates) == 0 {
+		// Nothing for us to filter — let the underlying selector
+		// produce its own (more specific) error.
+		return c.underlying.Select(ctx, hint)
+	}
+
+	fits, err := c.fitter.Fits(ctx, hint.Shape, candidates)
+	if err != nil {
+		// The accountant could not establish what is allocated. Fail
+		// closed: admitting blind is exactly the overcommit this
+		// package exists to prevent. Only reachable before the first
+		// successful snapshot — afterwards the accountant serves stale
+		// data rather than erroring.
+		return "", fmt.Errorf("%w: %w", ErrNoCapacity, err)
+	}
+
+	avoid := slices.Clone(hint.Avoid)
+	roomy := 0
+	for _, n := range candidates {
+		if fits[n] {
+			roomy++
+			continue
+		}
+		avoid = append(avoid, n)
+	}
+	if roomy == 0 {
+		return "", fmt.Errorf("%w: profile %q needs %d bytes / %d vcpu; %d candidate node(s) all full",
+			ErrNoCapacity, hint.Profile, hint.Shape.MemoryBytes, hint.Shape.VCPUs, len(candidates))
+	}
+
+	newHint := hint
+	newHint.Avoid = avoid
+	return c.underlying.Select(ctx, newHint)
 }

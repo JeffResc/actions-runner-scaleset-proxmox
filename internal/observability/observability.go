@@ -142,6 +142,40 @@ type Metrics struct {
 	// panic in a clone/destroy/boot path can leak a Proxmox VM
 	// (and historically did, before the allocMu defer fix).
 	PanicsRecovered *prometheus.CounterVec
+
+	// CloneDeferredCapacity counts clones the reconciler wanted to
+	// dispatch but could not admit because no node had room for the
+	// profile's memory (or, when cpu_overcommit_ratio is set, vCPU)
+	// footprint. This is BACKPRESSURE, not failure: no store row is
+	// created, nothing is surfaced to GitHub, and the next reconcile
+	// tick retries. A sustained rate means the fleet wants more RAM
+	// than the nodes have — the signal operators should alert on.
+	// The node label is the node the dispatch was aimed at, or "none"
+	// when every candidate was full.
+	CloneDeferredCapacity *prometheus.CounterVec
+
+	// CapacityEvictions counts idle Hot/Warm VMs destroyed to free
+	// memory for a queued job that could not otherwise be admitted
+	// (pool.capacity.evict_idle_for_demand). victim_profile is the
+	// profile whose idle VM was sacrificed; profile is the one whose
+	// demand triggered it. A high rate between two profiles means the
+	// node is too small for both pools to sit warm at once.
+	CapacityEvictions *prometheus.CounterVec
+
+	// NodeMemory{Total,Committed,Available}Bytes expose the capacity
+	// ledger per Proxmox node. Committed is ALLOCATED memory (the sum
+	// of every guest's configured maxmem, including guests this
+	// orchestrator does not own, plus outstanding clone reservations)
+	// — not used memory. Available is already net of the host reserve.
+	//
+	// These three deliberately carry NO `scaleset` label: the
+	// accountant behind them is fleet-wide (a node's allocation is a
+	// property of the node, not of a scale set), so a per-scaleset
+	// copy would report the same number N times under different
+	// labels and invite double-counting in dashboards.
+	NodeMemoryTotalBytes     *prometheus.GaugeVec
+	NodeMemoryCommittedBytes *prometheus.GaugeVec
+	NodeMemoryAvailableBytes *prometheus.GaugeVec
 }
 
 // ProxmoxOpUnknown is the fallback for off-list values of the
@@ -374,6 +408,26 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "panics_recovered_total",
 			Help: "Panics caught by the pool's async worker recover() guards, by operation. Non-zero rate indicates a real bug — alert on rate(panics_recovered_total[5m]) > 0.",
 		}, []string{"scaleset", "op"}),
+		CloneDeferredCapacity: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "clone_deferred_capacity_total",
+			Help: "Clones deferred because no node had room for the profile's allocated footprint. Backpressure, not failure — the next reconcile tick retries. node is \"none\" when every candidate was full.",
+		}, []string{"scaleset", "profile", "node", "kind"}),
+		CapacityEvictions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "capacity_evictions_total",
+			Help: "Idle Hot/Warm VMs destroyed to free capacity for queued demand (pool.capacity.evict_idle_for_demand).",
+		}, []string{"scaleset", "profile", "victim_profile"}),
+		NodeMemoryTotalBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "node_memory_total_bytes",
+			Help: "Physical memory of a Proxmox node. Fleet-wide: no scaleset label.",
+		}, []string{"node"}),
+		NodeMemoryCommittedBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "node_memory_committed_bytes",
+			Help: "Memory ALLOCATED on a Proxmox node (every guest's configured maxmem, foreign guests included, plus outstanding clone reservations) — not memory used. Fleet-wide: no scaleset label.",
+		}, []string{"node"}),
+		NodeMemoryAvailableBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "node_memory_available_bytes",
+			Help: "Memory a Proxmox node can still admit, net of the host reserve and outstanding reservations. Fleet-wide: no scaleset label.",
+		}, []string{"node"}),
 	}
 	reg.MustRegister(
 		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
@@ -386,6 +440,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
 		m.PanicsRecovered,
 		m.Recycles, m.RecycleFailures, m.CloneSuppressed,
+		m.CloneDeferredCapacity, m.CapacityEvictions,
+		m.NodeMemoryTotalBytes, m.NodeMemoryCommittedBytes, m.NodeMemoryAvailableBytes,
 		m.Leader,
 	)
 	return m

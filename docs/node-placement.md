@@ -59,3 +59,32 @@ eligible set.
 
 Config validation rejects rules that name an undeclared profile or node —
 typos surface at load time rather than as silent no-ops at runtime.
+
+## Capacity-aware placement
+
+When [`pool.capacity`](profiles-and-scaling.md#resource-aware-admission-control)
+is enabled, a third filter runs **outside** both of the above: nodes without
+room for the clone's memory footprint are removed from the candidate set before
+the strategy picks among the rest. So `round_robin` keeps rotating and
+`least_loaded` keeps balancing — but only across nodes that can actually take
+the VM.
+
+The layering matters for `require: true`. Because the capacity filter runs
+first, a full node reaches the affinity rules as an ordinary exclusion, and a
+hard pin whose nodes are all full still fails with
+`ErrAffinityRequireUnsatisfiable` rather than quietly spilling onto an unpinned
+node.
+
+If no node has room, the clone is deferred (counted in
+`scaleset_clone_deferred_capacity_total`) and retried on the next reconcile
+tick.
+
+Two notes on how this interacts with the strategies:
+
+- `least_loaded` scores nodes by memory **used**, while admission gates on
+  memory **allocated**. That is deliberate — usage is a reasonable tie-breaker
+  for placing a VM among nodes that all have room, and a bad basis for deciding
+  whether room exists at all.
+- With `proxmox.clone.linked: true` every clone lands on the template's node
+  regardless of what the selector returns, so capacity is charged against that
+  node. Node selection cannot spread load in that mode.

@@ -124,6 +124,38 @@ type Options struct {
 	// the harness creates one with matching multi-scaleset entries
 	// so each per-scaleset listener resolves its own scope.
 	Scalesets []ScalesetSpec
+
+	// Profiles, when non-empty, emits a top-level `profiles:` block
+	// so a scenario can run several hardware shapes against one
+	// scale set. Only valid with the singular scaleset shape.
+	Profiles []ProfileSpec
+
+	// Capacity, when non-nil, emits the `pool.capacity` block that
+	// turns on resource-aware admission. Requires every entry in
+	// Profiles to declare MemoryMB — config validation rejects the
+	// combination otherwise.
+	Capacity *CapacitySpec
+}
+
+// ProfileSpec is one entry in Options.Profiles.
+type ProfileSpec struct {
+	Name     string
+	Labels   []string // defaults to the scale set's own label set
+	CPUCores int
+	MemoryMB int
+	HotSize  int
+	WarmSize int
+	// MaxConcurrentRunners is the profile's static cap. Zero omits
+	// the key so the profile inherits the scale set's value (or, under
+	// capacity admission with no scaleset cap either, runs uncapped).
+	MaxConcurrentRunners int
+}
+
+// CapacitySpec drives the pool.capacity block.
+type CapacitySpec struct {
+	ReserveMemoryMB    int
+	CPUOvercommitRatio float64
+	EvictIdleForDemand bool
 }
 
 // RaftCluster manages the in-process raft transport network shared
@@ -264,6 +296,8 @@ func Start(t testing.TB, opts Options) *Harness {
 		FirewallEnabled:      opts.FirewallEnabled,
 		ObsAddr:              obsAddr,
 		AdminAddr:            adminAddr,
+		Profiles:             opts.Profiles,
+		Capacity:             opts.Capacity,
 	}
 	if multi {
 		const (
@@ -481,6 +515,11 @@ type configValues struct {
 	// fields are ignored when this is set.
 	Scalesets []scalesetCfg
 
+	// Profiles / Capacity drive the optional top-level `profiles:`
+	// block and the `pool.capacity` block respectively.
+	Profiles []ProfileSpec
+	Capacity *CapacitySpec
+
 	// Cluster mode plumbing. When ClusterMode is "raft" the template
 	// emits the cluster.raft block; otherwise it's omitted
 	// (default = standalone).
@@ -596,6 +635,28 @@ pool:
   clone_inflight_grace: 1m
 {{- if .RecycleMode }}
   recycle_mode: {{.RecycleMode}}
+{{- end }}
+{{- if .Capacity }}
+  capacity:
+    enabled: true
+    refresh_interval: 100ms
+    reserve_memory_mb: {{.Capacity.ReserveMemoryMB}}
+    cpu_overcommit_ratio: {{.Capacity.CPUOvercommitRatio}}
+    evict_idle_for_demand: {{.Capacity.EvictIdleForDemand}}
+{{- end }}
+{{- if .Profiles }}
+profiles:
+{{- range .Profiles }}
+  - name: {{.Name}}
+    labels: [{{range $i, $l := .Labels}}{{if $i}}, {{end}}{{$l}}{{end}}]
+    cpu: {{.CPUCores}}
+    memory_mb: {{.MemoryMB}}
+    hot_size: {{.HotSize}}
+    warm_size: {{.WarmSize}}
+{{- if .MaxConcurrentRunners }}
+    max_concurrent_runners: {{.MaxConcurrentRunners}}
+{{- end }}
+{{- end }}
 {{- end }}
 observability:
   http_addr: "{{.ObsAddr}}"
@@ -742,11 +803,19 @@ func applyOptionDefaults(opts Options) Options {
 		}
 		return opts
 	}
-	if opts.HotSize == 0 {
+	// With explicit profiles the per-profile hot_size is authoritative,
+	// so the pool-level default must stay out of the way — otherwise
+	// every profile that meant "no hot pool" would silently get 2.
+	if opts.HotSize == 0 && len(opts.Profiles) == 0 {
 		opts.HotSize = 2
 	}
 	if opts.MaxConcurrentRunners == 0 {
 		opts.MaxConcurrentRunners = 8
+	}
+	for i := range opts.Profiles {
+		if len(opts.Profiles[i].Labels) == 0 {
+			opts.Profiles[i].Labels = []string{"self-hosted", "linux", "x64", "e2e"}
+		}
 	}
 	if opts.Org == "" {
 		opts.Org = "octocat"

@@ -19,6 +19,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/canary"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/ipam"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
@@ -157,6 +158,24 @@ type Config struct {
 	// and treated as a no-op (e.g. in tests).
 	OnRunnerOrphaned func(ctx context.Context, runnerID int64) error
 
+	// Capacity, when non-nil, enables resource-aware admission: a clone
+	// is dispatched only if its profile's memory footprint fits in the
+	// target node's remaining ALLOCATED capacity. Nil disables the
+	// feature completely — no extra Proxmox calls, no admission checks,
+	// and clone dispatch is byte-for-byte the pre-feature behaviour.
+	//
+	// Independent of MaxConcurrentRunners rather than a replacement for
+	// it: when both are configured, both must admit the clone, so the
+	// stricter one binds.
+	Capacity CapacityAdmitter
+
+	// EvictIdleForDemand lets a queued job reclaim capacity from an idle
+	// pool VM. When a DEMAND-DRIVEN clone can't be admitted anywhere and
+	// this scaleset has idle Hot/Warm VMs holding allocations, the
+	// oldest idle VM is destroyed and the clone is admitted on the next
+	// reconcile tick. Ignored when Capacity is nil.
+	EvictIdleForDemand bool
+
 	// RunnerLister is consulted by Adopt to classify owner-tagged
 	// Proxmox VMs more precisely: a VM whose runner is busy on GitHub
 	// is adopted directly as Running with the right RunnerID, skipping
@@ -198,6 +217,43 @@ type profileState struct {
 	// refill is a per-profile signal channel so a profile's
 	// reconcile loop can be nudged without waking sibling loops.
 	refill chan struct{}
+
+	// evictMu guards evicted, the capacity reservation parked by the
+	// idle-eviction path for this profile to consume on a later tick.
+	//
+	// Eviction destroys a sibling's idle VM and must then wait a tick
+	// for the destroy to land before cloning (starting the replacement
+	// first would genuinely overcommit the node for a few seconds).
+	// Parking the reservation across that gap is what stops the victim's
+	// own profile from reclaiming the memory it just lost on ITS next
+	// tick — without it the two profiles livelock, each evicting the
+	// other forever. kickClone pops the handle instead of reserving
+	// afresh; if the destroy failed, the reservation simply TTLs out
+	// inside the accountant and the cycle retries.
+	evictMu sync.Mutex
+	evicted []*parkedReservation
+
+	// capacityDeferredHot records that a HOT clone for this profile was
+	// turned away by the capacity gate since the last reconcile pass
+	// looked. It is the trigger for idle eviction, and it exists because
+	// clone dispatch is asynchronous: the tick that calls kickClone
+	// cannot observe whether the resulting goroutine was admitted, so
+	// eviction acts on the PREVIOUS tick's evidence rather than
+	// speculating that this tick's dispatches will fail. Only hot
+	// matters — warm is pool warmth, not a queued job.
+	capacityDeferredHot atomic.Bool
+}
+
+// parkedReservation is a capacity claim taken on behalf of a profile
+// before the clone that will consume it has been dispatched.
+type parkedReservation struct {
+	node string
+	res  nodecap.Reservation
+	// expires bounds how long a parked handle is worth trying. The
+	// accountant enforces its own TTL on the underlying reservation;
+	// this is the manager-side guard against popping a handle whose
+	// capacity was reclaimed long ago.
+	expires time.Time
 }
 
 // manager is the in-process Manager implementation.
@@ -1535,11 +1591,24 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	m.shrinkHotPool(profile, hotSize, desired, stats.Busy())
 	m.shrinkWarmPool(profile, warmSize)
 
+	// Capacity admission may have refused this profile's demand-driven
+	// clones. Acting on the flag set by a PREVIOUS pass (clone dispatch
+	// is async, so this pass can't know how its own kickClones fared)
+	// and only while the demand is still unmet, reclaim memory from an
+	// idle pool VM so the queued job can run. Cleared unconditionally:
+	// if the demand has since been satisfied the evidence is stale.
+	if ps.capacityDeferredHot.Swap(false) && burstDeficit(stats, inflight, hotProv, desired, credit) > 0 {
+		m.evictForDemand(ctx, ps)
+	}
+
 	// Stuck-state sweep is fleet-wide (transient-state issues aren't
 	// profile-specific). Pin it to the default profile to avoid N
 	// parallel sweeps doing the same work each tick.
 	if profile == m.defaultProfile() {
 		m.sweepStuckRows()
+		// Node capacity is a property of the node, not of a profile, so
+		// the gauges are refreshed once per tick rather than N times.
+		m.publishCapacityGauges(ctx)
 	}
 	m.recycleOldVMs(profile, ps.settings.VMMaxAge)
 }
@@ -1679,7 +1748,7 @@ func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSi
 	//       current in-flight runner count, scale up immediately.
 	// Effective need is the larger of the two.
 	needIdle := hotSize - base - hotCredit
-	needBurst := desired - (base + credit.recycling + busy)
+	needBurst := burstDeficit(stats, inflight, hotProv, desired, credit)
 	needHot = needIdle
 	if needBurst > needHot {
 		needHot = needBurst
@@ -1704,6 +1773,24 @@ func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSi
 		needWarm = 0
 	}
 	return needHot, needWarm
+}
+
+// burstDeficit is how many hot VMs GitHub's demand signal wants beyond
+// what the profile already has or has coming. Positive means real jobs
+// are queued that no current or in-flight VM can serve.
+//
+// Extracted so computeCloneNeeds and the idle-eviction gate read the
+// SAME number: eviction is destructive and must fire only for genuine
+// queued demand, never for baseline pool top-up, and two independent
+// copies of this expression would eventually disagree about which is
+// which.
+//
+// credit.recycling counts (rollback is seconds from acquirable) but
+// credit.busy deliberately does not — see the credit-placement notes on
+// computeCloneNeeds.
+func burstDeficit(stats Stats, inflight, hotProv, desired int, credit returningCredit) int {
+	base := stats.Available() + hotProv + inflight
+	return desired - (base + credit.recycling + stats.Busy())
 }
 
 // profileReturningCredit counts the profile's busy-side rows that will
@@ -2019,6 +2106,17 @@ type clonePrep struct {
 	ipConfig      string
 	kind          store.PoolKind
 	poweredOn     bool
+
+	// releaseCapacity drops this clone's capacity reservation. Always
+	// non-nil (a no-op when admission is disabled) and idempotent.
+	//
+	// Called ONLY on the paths where no live Proxmox VM survives to
+	// carry the allocation — a successful clone deliberately keeps its
+	// reservation, which the accountant retires once it observes the VM
+	// at full size. Releasing early would open a window in which the VM
+	// is accounted for by neither the reservation nor the (lagging)
+	// cluster snapshot.
+	releaseCapacity func()
 }
 
 // runClone is the body of an async clone goroutine. The caller
@@ -2180,21 +2278,49 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	hint := nodeselector.Hint{
 		Profile:     profileName,
 		ExistingVMs: m.snapshotExistingVMsForAffinity(),
+		Shape:       shapeOf(ps.settings),
 	}
 	node, err := m.sel.Select(ctx, hint)
 	if err != nil {
-		m.log.Warn("clone: node selection failed", "profile", profileName, "err", err)
+		// A capacity refusal is expected backpressure, not a fault: the
+		// nodes are simply full. Log it at Debug and count it, so a
+		// saturated fleet doesn't drown the log in warnings.
+		if errors.Is(err, nodeselector.ErrNoCapacity) {
+			m.recordCapacityDeferral(ps, "none", kind)
+			m.log.Debug("clone: deferred, no node has capacity", "profile", profileName, "kind", kind, "err", err)
+		} else {
+			m.log.Warn("clone: node selection failed", "profile", profileName, "err", err)
+		}
 		span.End()
 		cancel()
 		return nil
 	}
 	if m.cfg.LinkedClones {
+		// A linked clone must stay on the template's node, so the
+		// selector's answer is discarded. The reservation below is
+		// therefore taken against THIS node — the capacity wrapper's
+		// filtering could not have helped here, and reserving against
+		// the node we selected but will not use would account for the
+		// clone in the wrong place.
 		node = m.cfg.TemplateNode
+	}
+
+	// Admission. The selector's capacity wrapper only narrowed the
+	// candidates; this reservation is the atomic gate that makes
+	// concurrent dispatches unable to spend the same memory twice.
+	// Taken BEFORE the VMID mint and row insert so a refusal leaves
+	// nothing to roll back.
+	claim, admitted := m.reserveCapacity(ctx, ps, node, kind)
+	if !admitted {
+		span.End()
+		cancel()
+		return nil
 	}
 
 	vmid, name, templateVMID, templateClass, err := m.allocateVMIDAndInsertRow(ctx, ps, kind, node)
 	if err != nil {
 		m.log.Warn("clone: allocate/insert failed", "profile", profileName, "err", err)
+		claim.release()
 		span.End()
 		cancel()
 		return nil
@@ -2202,6 +2328,13 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	// The Provisioning row now carries this dispatch's headroom; drop
 	// the reservation so the reconciler counts it exactly once.
 	rowInserted()
+	// Bind the capacity reservation to the VMID it minted. From here the
+	// accountant can net the reservation against the guest row Proxmox
+	// will publish — and retire it once that row reports the VM at its
+	// full configured memory (qmclone copies the TEMPLATE's memory; the
+	// provisioner raises it in a later Config call, so the guest row
+	// understates the VM for a few seconds).
+	claim.bind(vmid)
 	// Publish the allocated id to the caller so a panic later in this
 	// function logs the real vmid rather than 0.
 	if vmidRef != nil {
@@ -2226,6 +2359,8 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		templateClass: templateClass,
 		kind:          kind,
 		poweredOn:     poweredOn,
+
+		releaseCapacity: claim.release,
 	}
 
 	// Allocate a static IP (if the profile's IPAM is non-noop)
@@ -2313,6 +2448,10 @@ func (m *manager) handleCloneFailure(prep *clonePrep, err error, op string) {
 	if m.metrics != nil && op == "clone" {
 		m.metrics.VMsTotal.WithLabelValues(m.cfg.ScaleSetName, prep.profileName, "clone-failed").Inc()
 	}
+	// No VM survives this path — the row is about to be destroyed — so
+	// the capacity claim must go back to the pool rather than wait out
+	// its TTL.
+	prep.releaseCapacity()
 	if _, updErr := m.store.Update(prep.vmid, func(v *store.VM) {
 		v.State = store.StateDestroying
 		v.StateSince = time.Now()
@@ -2872,6 +3011,11 @@ func (m *manager) drain() {
 	// from a state-sweep that ran on the last reconcile tick) doesn't
 	// outlive us.
 	defer m.workerCancel()
+	// The capacity accountant is shared with sibling scale sets, so a
+	// reservation this manager parked for a clone it will now never
+	// dispatch would keep memory withheld from them for the rest of its
+	// TTL. Hand it back.
+	defer m.releaseParkedReservations()
 
 	timeout := m.cfg.DrainTimeout
 	if timeout <= 0 {

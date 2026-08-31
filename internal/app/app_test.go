@@ -227,7 +227,7 @@ func TestBuildNodeSelector_KnownStrategiesReturnNonNil(t *testing.T) {
 		cfg := &config.Config{Nodes: config.NodesConfig{
 			Strategy: "single", SingleNode: "pve1",
 		}}
-		sel, err := buildNodeSelector(cfg, nil)
+		sel, err := buildNodeSelector(cfg, nil, nil)
 		require.NoError(t, err)
 		require.NotNil(t, sel)
 	})
@@ -236,7 +236,7 @@ func TestBuildNodeSelector_KnownStrategiesReturnNonNil(t *testing.T) {
 		cfg := &config.Config{Nodes: config.NodesConfig{
 			Strategy: "round_robin", Members: []string{"pve1", "pve2"},
 		}}
-		sel, err := buildNodeSelector(cfg, nil)
+		sel, err := buildNodeSelector(cfg, nil, nil)
 		require.NoError(t, err)
 		require.NotNil(t, sel)
 	})
@@ -254,7 +254,7 @@ func TestBuildNodeSelector_UnknownStrategyReturnsError(t *testing.T) {
 	cfg := &config.Config{Nodes: config.NodesConfig{
 		Strategy: "made-up-strategy", SingleNode: "pve1",
 	}}
-	sel, err := buildNodeSelector(cfg, nil)
+	sel, err := buildNodeSelector(cfg, nil, nil)
 	require.Error(t, err,
 		"unknown strategy must surface as an error so a misconfig fails loud, "+
 			"not as a nil selector that crashes the first Acquire")
@@ -282,7 +282,7 @@ func TestBuildNodeSelector_AffinityWrapsUnderlying(t *testing.T) {
 		},
 		Profiles: []config.ProfileConfig{{Name: "gpu"}},
 	}
-	sel, err := buildNodeSelector(cfg, nil)
+	sel, err := buildNodeSelector(cfg, nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, sel)
 	// The single-node selector returns a static string; the
