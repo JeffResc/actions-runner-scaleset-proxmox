@@ -94,6 +94,7 @@ type Metrics struct {
 	RunnerHookEvents     *prometheus.CounterVec
 	ReconcileErrors      *prometheus.CounterVec
 	UnroutedJobs         *prometheus.CounterVec
+	LabelDrift           *prometheus.GaugeVec
 	QuotaThrottled       *prometheus.CounterVec
 	PriorityAcquires     *prometheus.CounterVec
 	Preemptions          *prometheus.CounterVec
@@ -360,6 +361,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "unrouted_jobs_total",
 			Help: "Jobs whose requested labels did not match any configured runner profile.",
 		}, []string{"scaleset", "labels"}),
+		LabelDrift: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "labels_drift",
+			Help: "1 when the scale set's labels on GitHub disagree with the configured labels and the orchestrator could not repair them. Jobs requesting a config-only label stay queued while this is 1.",
+		}, []string{"scaleset"}),
 		QuotaThrottled: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "quota_throttled_total",
 			Help: "Jobs observed exceeding their configured per-org or per-repo quota. The name label is FNV-bucketed to bound cardinality; the raw org/repo name is logged at the throttle site.",
@@ -438,7 +443,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors,
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
-		m.ReconcileErrors, m.UnroutedJobs,
+		m.ReconcileErrors, m.UnroutedJobs, m.LabelDrift,
 		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions, m.CanaryReverts,
 		m.ScheduleFires, m.ScheduleActive,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,

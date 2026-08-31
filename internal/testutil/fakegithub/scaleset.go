@@ -108,6 +108,20 @@ type ScaleSetOptions struct {
 
 	// RunnerGroupID defaults to 1 (the "Default" group).
 	RunnerGroupID int
+
+	// Labels are the labels the fake claims the scale set already
+	// carries, seeded as "User" labels. Empty mirrors real GitHub's
+	// create-path default: one "System" label named after the scale
+	// set. Tests that drive the orchestrator's label reconciliation
+	// seed a set that differs from the config's.
+	Labels []string
+}
+
+// isZero reports whether the caller left ScaleSetOptions untouched.
+// A plain `==` comparison stopped working once Labels made the struct
+// non-comparable.
+func (o ScaleSetOptions) isZero() bool {
+	return o.ID == 0 && o.Name == "" && o.RunnerGroupID == 0 && len(o.Labels) == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +263,10 @@ func (s *Server) handleRunnerGroupLookup(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleScaleSetLookup(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	entry, ok := s.scalesets[name]
+	// spec.Labels is mutable (handleScaleSetUpdate), so serialising a
+	// spec needs the lock even though the map itself is fixed.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !ok {
 		// Even when no name matches, the scaleset library treats
 		// `count:0` as "not found" (returns nil rather than error)
@@ -268,14 +286,55 @@ func (s *Server) handleScaleSetCreate(w http.ResponseWriter, r *http.Request) {
 	// canonical default (the single configured entry).
 	var body fakeRunnerScaleSet
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if entry, ok := s.scalesets[body.Name]; ok {
-		writeJSON(w, http.StatusCreated, entry.spec)
+		// Real GitHub stores the labels the create request carried;
+		// keeping them here lets a later lookup (and ScaleSetLabels)
+		// agree with what the orchestrator asked for.
+		//
+		// No test reaches this today: a create only follows a lookup
+		// miss, and the lookup answers for every name this branch
+		// accepts. Reaching it needs a lookup-miss injection knob.
+		if len(body.Labels) > 0 {
+			entry.spec.Labels = body.Labels
+		}
+		// 200, not 201: CreateRunnerScaleSet rejects anything else as
+		// "unexpected status code", which made this whole branch
+		// unreachable.
+		writeJSON(w, http.StatusOK, entry.spec)
 		return
 	}
 	// Unknown name and we don't synthesise new scalesets at runtime
 	// — return 422 so the orchestrator surfaces the misconfiguration
 	// cleanly.
 	http.Error(w, fmt.Sprintf("scaleset %q not configured on fake", body.Name), http.StatusUnprocessableEntity)
+}
+
+// handleScaleSetUpdate applies a PATCH to an existing scale set. Only
+// the labels are mutable here — that is the field the orchestrator
+// reconciles — and an omitted `labels` leaves the current set alone,
+// matching PATCH semantics.
+func (s *Server) handleScaleSetUpdate(w http.ResponseWriter, r *http.Request) {
+	entry := s.entryByURLID(w, r)
+	if entry == nil {
+		return
+	}
+	var body fakeRunnerScaleSet
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad scaleset patch body", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.takeScaleSetUpdateFaultLocked(); ok {
+		http.Error(w, "scaleset update rejected", f.status)
+		return
+	}
+	if body.Labels != nil {
+		entry.spec.Labels = body.Labels
+	}
+	writeJSON(w, http.StatusOK, entry.spec)
 }
 
 func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
@@ -534,6 +593,26 @@ func (s *Server) JITMintIDForRunnerOn(scaleset, runnerName string) (int, bool) {
 	defer s.mu.Unlock()
 	id, ok := entry.jitMintsByName[runnerName]
 	return id, ok
+}
+
+// ScaleSetLabels returns the label names the fake currently holds for
+// the single registered scaleset, in the order GitHub would return
+// them. Panics in multi-scaleset configs — use ScaleSetLabelsFor.
+func (s *Server) ScaleSetLabels() []string {
+	return s.ScaleSetLabelsFor(s.onlyEntry("ScaleSetLabels").spec.Name)
+}
+
+// ScaleSetLabelsFor is the multi-scaleset variant of ScaleSetLabels.
+// Panics on unknown names.
+func (s *Server) ScaleSetLabelsFor(name string) []string {
+	entry := s.entryFor(name, "ScaleSetLabelsFor")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(entry.spec.Labels))
+	for _, l := range entry.spec.Labels {
+		out = append(out, l.Name)
+	}
+	return out
 }
 
 // SetStatistics overrides the per-session statistics returned for the

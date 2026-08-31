@@ -103,6 +103,12 @@ type Server struct {
 	// decrements count.
 	deleteFault httpFault
 
+	// scaleSetUpdateFault, when count > 0, makes the next `count`
+	// scale-set PATCH calls return `status` — used to exercise the
+	// label-reconciliation failure branch, which warns and continues
+	// with GitHub's current labels.
+	scaleSetUpdateFault httpFault
+
 	// scalesets is the per-scaleset state, indexed by scaleset name
 	// (the operator-facing identifier). scalesetsByID is a parallel
 	// view for routing handlers that key off the URL {id} param.
@@ -191,7 +197,7 @@ func optsToList(opts Options) []ScaleSetOptions {
 }
 
 func normaliseScalesetOptions(opts Options) []fakeRunnerScaleSet {
-	if len(opts.Scalesets) > 0 && (opts.ScaleSet != ScaleSetOptions{}) {
+	if len(opts.Scalesets) > 0 && !opts.ScaleSet.isZero() {
 		panic("fakegithub: Options.ScaleSet and Options.Scalesets are mutually exclusive")
 	}
 	list := optsToList(opts)
@@ -225,10 +231,18 @@ func normaliseScalesetOptions(opts Options) []fakeRunnerScaleSet {
 		if rg == 0 {
 			rg = 1
 		}
+		labels := make([]runnerScaleSetLabel, 0, len(ss.Labels))
+		for n, l := range ss.Labels {
+			labels = append(labels, runnerScaleSetLabel{ID: n + 1, Name: l, Type: "User"})
+		}
+		if len(labels) == 0 {
+			labels = []runnerScaleSetLabel{{ID: 1, Name: name, Type: "System"}}
+		}
 		out = append(out, fakeRunnerScaleSet{
 			ID:            id,
 			Name:          name,
 			RunnerGroupID: rg,
+			Labels:        labels,
 		})
 	}
 	return out
@@ -427,6 +441,7 @@ func (s *Server) routes() http.Handler {
 	// _apis/runtime — actions service surface (mounted under /).
 	r.Get("/_apis/runtime/runnerscalesets", s.handleScaleSetLookup)
 	r.Post("/_apis/runtime/runnerscalesets", s.handleScaleSetCreate)
+	r.Patch("/_apis/runtime/runnerscalesets/{id}", s.handleScaleSetUpdate)
 	r.Get("/_apis/runtime/runnergroups/", s.handleRunnerGroupLookup)
 	r.Get("/_apis/runtime/runnergroups", s.handleRunnerGroupLookup)
 	r.Post("/_apis/runtime/runnerscalesets/{id}/sessions", s.handleSessionCreate)
