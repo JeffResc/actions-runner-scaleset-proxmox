@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/v90/github"
+	"github.com/google/go-github/v91/github"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakegithub"
