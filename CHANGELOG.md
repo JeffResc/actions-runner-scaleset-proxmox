@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.6](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.5...actions-runner-scaleset-proxmox-v0.1.6) (2026-09-04)
+
+
+### Bug Fixes
+
+* **deps:** update module github.com/go-playground/validator/v10 to v10.30.4 ([ddbe21c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/ddbe21c52856530713e42566acf79468cceeabfd))
+* **deps:** update module github.com/go-playground/validator/v10 to v10.30.4 ([091ef93](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/091ef93674b8b926b5685886b9ba2ab475465497))
+* **deps:** update module github.com/google/go-github/v90 to v91 ([44fa49c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/44fa49cedf2c89ef6f502aabddf5108092db479a))
+* **deps:** update module github.com/google/go-github/v90 to v91 ([f06252a](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/f06252a1544b6d2d443ea68f3e87a2b508489043))
+
+
+### Miscellaneous
+
+* **deps:** update docker/dockerfile docker tag to v1.27 ([6d8a2ac](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/6d8a2ac3ef31292ee691693e913811a4302ffc4f))
+* **deps:** update docker/dockerfile docker tag to v1.27 ([0022532](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/0022532e9efa65d973e24eb85bc7f0d7474b7061))
+* **deps:** update docker/setup-qemu-action digest to 1f40c72 ([3126ce9](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/3126ce95d6333ab303b7a6b710938463731b5f8c))
+* **deps:** update docker/setup-qemu-action digest to 1f40c72 ([de3daac](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/de3daac037e75f413ff55445ca7d9c17ad5a9c1b))
+* **deps:** update go-toolchain to v1.27.1 ([639a18c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/639a18c37e3b7266909764c0cd7b86f1723c6ee2))
+* **deps:** update go-toolchain to v1.27.1 ([88cd7b9](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/88cd7b9ad0da6b077c6456ede66bcaeda1215193))
+
 ## [0.1.5](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.4...actions-runner-scaleset-proxmox-v0.1.5) (2026-08-31)
 
 
