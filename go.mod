@@ -15,7 +15,7 @@ require (
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-memdb v1.3.5
 	github.com/hashicorp/go-retryablehttp v0.7.8
-	github.com/hashicorp/raft v1.7.3
+	github.com/hashicorp/raft v1.8.0
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/jellydator/ttlcache/v3 v3.4.1
 	github.com/jonboulle/clockwork v0.5.0
