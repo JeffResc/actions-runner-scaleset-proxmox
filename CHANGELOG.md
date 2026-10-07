@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.2.0](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.5...actions-runner-scaleset-proxmox-v0.2.0) (2026-10-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** require every profile to advertise its scale set's labels, since a JIT runner carries none of its own and GitHub cannot tell one set's runners apart
+
+### Bug Fixes
+
+* **config:** require every profile to advertise its scale set's labels, since a JIT runner carries none of its own and GitHub cannot tell one set's runners apart ([1baf0c7](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/1baf0c77957850d6e350a7eb128e0f14c469f7b8))
+* **deps:** update module github.com/cenkalti/backoff/v7 to v7.0.1 ([d81b89d](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/d81b89d926013a177f65950692a4d73109868fc3))
+* **deps:** update module github.com/cenkalti/backoff/v7 to v7.0.1 ([e031045](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/e031045b9968a1ce82c3cb0a527fef336c49d6ac))
+* **deps:** update module github.com/go-playground/validator/v10 to v10.30.4 ([ddbe21c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/ddbe21c52856530713e42566acf79468cceeabfd))
+* **deps:** update module github.com/go-playground/validator/v10 to v10.30.4 ([091ef93](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/091ef93674b8b926b5685886b9ba2ab475465497))
+* **deps:** update module github.com/go-playground/validator/v10 to v10.30.5 ([c0833ed](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/c0833edd75d6c7e4d226dcc204ade2d4f8b189a0))
+* **deps:** update module github.com/go-playground/validator/v10 to v10.30.5 ([64db6ee](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/64db6ee811aa234fb5ece88cf30f61b611c8c7f4))
+* **deps:** update module github.com/google/go-github/v90 to v91 ([44fa49c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/44fa49cedf2c89ef6f502aabddf5108092db479a))
+* **deps:** update module github.com/google/go-github/v90 to v91 ([f06252a](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/f06252a1544b6d2d443ea68f3e87a2b508489043))
+* **deps:** update module github.com/google/go-github/v91 to v92 ([2cbe5de](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/2cbe5ded6431a9a8ce04655d3fe23fb9489e897d))
+* **deps:** update module github.com/google/go-github/v91 to v92 ([a79a97c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/a79a97cb7b3e7c63cb33d5fee9f63e895eb10719))
+* **deps:** update module golang.org/x/sync to v0.23.0 ([ea7e09c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/ea7e09c80a09d68ea2495d9b9b62a028f387eda8))
+* **deps:** update module golang.org/x/sync to v0.23.0 ([d173d7c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/d173d7c626e15e88159fdef1a6d56670293a27a1))
+* **deps:** update module golang.org/x/time to v0.16.0 ([ba14cd2](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/ba14cd2a53f038f8aead0b066e1d7d60c79f3c48))
+* **deps:** update module golang.org/x/time to v0.16.0 ([5b9321c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/5b9321c81a978fedf36bf0da46911d5eccdba09c))
+
+
+### Miscellaneous
+
+* **deps:** update dependency helm to v4.3.0 ([5e9202f](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/5e9202f15dcb465792b1112751ad079a2fd6ab11))
+* **deps:** update dependency helm to v4.3.0 ([69916f3](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/69916f3369443e1d1237519de9593eab283550ad))
+* **deps:** update docker/build-push-action digest to c3c9e26 ([6496d78](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/6496d78e39ccb688afada519e0ad95cf95f03a2e))
+* **deps:** update docker/build-push-action digest to c3c9e26 ([e58da40](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/e58da40310c0d2ffa1d50f1d971410a6a5f89d68))
+* **deps:** update docker/dockerfile docker tag to v1.27 ([6d8a2ac](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/6d8a2ac3ef31292ee691693e913811a4302ffc4f))
+* **deps:** update docker/dockerfile docker tag to v1.27 ([0022532](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/0022532e9efa65d973e24eb85bc7f0d7474b7061))
+* **deps:** update docker/setup-buildx-action digest to f87e599 ([610b640](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/610b640d5f5d94b23524d6c24552fad624693e16))
+* **deps:** update docker/setup-buildx-action digest to f87e599 ([3065571](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/3065571c16ddd8fb07d5f9645b67c6e75a62d684))
+* **deps:** update docker/setup-qemu-action digest to 1f40c72 ([3126ce9](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/3126ce95d6333ab303b7a6b710938463731b5f8c))
+* **deps:** update docker/setup-qemu-action digest to 1f40c72 ([de3daac](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/de3daac037e75f413ff55445ca7d9c17ad5a9c1b))
+* **deps:** update docker/setup-qemu-action digest to 9901266 ([140b4da](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/140b4da6a3e7b50831f3b8b10486e62609e00ebd))
+* **deps:** update docker/setup-qemu-action digest to 9901266 ([89cb0d1](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/89cb0d1c56d598ec991945b21a94a856353fcd74))
+* **deps:** update go-toolchain ([593e0e3](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/593e0e3bf81fa28a2d53f3a1285db31ee52715b1))
+* **deps:** update go-toolchain ([f9b3dee](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/f9b3deeef5a14ec0118f4a6444d5828dcecc8ca4))
+* **deps:** update go-toolchain to v1.27.1 ([639a18c](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/639a18c37e3b7266909764c0cd7b86f1723c6ee2))
+* **deps:** update go-toolchain to v1.27.1 ([88cd7b9](https://github.com/JeffResc/actions-runner-scaleset-proxmox/commit/88cd7b9ad0da6b077c6456ede66bcaeda1215193))
+
 ## [0.1.5](https://github.com/JeffResc/actions-runner-scaleset-proxmox/compare/actions-runner-scaleset-proxmox-v0.1.4...actions-runner-scaleset-proxmox-v0.1.5) (2026-08-31)
 
 
