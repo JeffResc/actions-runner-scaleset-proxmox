@@ -131,14 +131,18 @@ func (s *Scaler) SetPriority(p *priority.Matcher) { s.priority = p }
 // HandleJobStarted is called when GitHub assigns a queued job to one of our
 // JIT runners. We transition the matching VM row Assigned -> Running and,
 // when a label router is configured, record the routing decision for the
-// job's RequestLabels. Routing here is observational — by the time
-// JobStarted fires GitHub has already paired the job with a specific VM,
-// so we can't redirect; what we CAN do is alert operators via the
-// unrouted-jobs metric when a job arrives whose labels no profile
-// satisfies (a config gap they need to fix). The quotas + priority
-// machinery (issues #4 + #10) follows the same observational
-// pattern for the same reason — per-job pre-assignment metadata
-// requires a deeper listener integration, deferred to a future PR.
+// job's RequestLabels.
+//
+// Routing here is observational, and no earlier call site would change
+// that: a JIT runner carries no labels of its own, so every runner in a
+// scale set is indistinguishable to GitHub and the job/VM pairing is
+// GitHub's to make. Hardware distinctions live at scale-set granularity
+// instead, enforced at load by config.validateProfileLabels. What the
+// router still buys us is the unrouted-jobs metric — a job whose labels
+// no profile satisfies is a coverage gap the operator needs to fix. The
+// quotas + priority machinery (issues #4 + #10) is observational for a
+// related reason: per-job pre-assignment metadata requires a deeper
+// listener integration, deferred to a future PR.
 func (s *Scaler) HandleJobStarted(ctx context.Context, info *scaleset.JobStarted) error {
 	if s.metrics != nil {
 		s.metrics.ListenerMessages.WithLabelValues(s.cfg.ScaleSetName, "job_started").Inc()

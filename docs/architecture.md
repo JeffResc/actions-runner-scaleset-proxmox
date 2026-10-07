@@ -123,8 +123,8 @@ sweep reaps anything stranded once Proxmox recovers.
 | `internal/app` | Process wiring — config load, leader election, worker supervision |
 | `internal/config` | YAML configuration, validation, env-var expansion |
 | `internal/githubauth` | GitHub App and PAT authentication |
-| `internal/scaler` | `scaleset.Scaler` implementation; job-to-profile routing |
-| `internal/router` | Label-matching that maps a job's `RequestLabels` to a profile |
+| `internal/scaler` | `scaleset.Scaler` implementation — acquire, JIT mint and inject, job lifecycle |
+| `internal/router` | Label-matching used to flag jobs a scale set advertises for but cannot serve |
 | `internal/pool` | Pool manager, VM state machine, reconcile loop |
 | `internal/store` | In-memory state via `hashicorp/go-memdb` |
 | `internal/provisioner` | Proxmox client wrapper, clone/start/stop/destroy, guest-agent JIT injection |

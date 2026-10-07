@@ -11,8 +11,10 @@ import (
 )
 
 // capacityYAML is the homelab shape from the feature's motivating case:
-// three heterogeneous profiles on one node. `%s` takes the pool.capacity
-// block (and anything else) each test wants to append.
+// heterogeneous hardware shapes on one node. The profiles differ in
+// cpu/memory only — they share the scaleset's labels, as
+// validateProfileLabels requires. `%s` takes the pool.capacity block
+// (and anything else) each test wants to append.
 const capacityYAML = `
 github:
   auth_mode: pat
@@ -51,7 +53,7 @@ profiles:
     cpu: %s
     memory_mb: %s
   - name: mem-16g
-    labels: [self-hosted, linux, proxmox, big]
+    labels: [self-hosted, linux, proxmox]
     cpu: 8
     memory_mb: 16384
 `

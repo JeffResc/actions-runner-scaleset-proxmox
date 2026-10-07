@@ -166,7 +166,10 @@ A few of the keys deserve a note:
   fully booted and take a job in seconds; warm VMs are cloned but powered off,
   so they cost RAM only while booting. See
   [profiles-and-scaling.md](profiles-and-scaling.md).
-- **`labels`** must match the `runs-on:` in your workflows.
+- **`labels`** must match the `runs-on:` in your workflows. They belong to the
+  scale set as a whole — GitHub matches a job against them and then picks any of
+  the set's runners, so a second hardware shape needs a second scale set. See
+  [Where labels are matched](profiles-and-scaling.md#where-labels-are-matched).
 
 ## 5. Run it
 
@@ -246,9 +249,11 @@ and enabled. After `pool.boot_max_attempts` failures a VM is marked `poison`
 and left in place for inspection.
 
 **Jobs queue but no VM is assigned.** The job's `runs-on:` labels must be a
-subset of a profile's labels. Check
-`scaleset_unrouted_jobs_total` in `/metrics` — a non-zero value means no
-profile matched. See [profiles-and-scaling.md](profiles-and-scaling.md#label-routing).
+subset of the scale set's labels. Check `scaleset_unrouted_jobs_total` in
+`/metrics` — a non-zero value means no profile matched — and
+`scaleset_labels_drift`, which is 1 while the labels on GitHub disagree with
+your config. See
+[profiles-and-scaling.md](profiles-and-scaling.md#where-labels-are-matched).
 
 **Clone fails with "VM N is running - destroy failed" or lock timeouts.**
 Proxmox is still tearing down a VMID the allocator reissued. Raise

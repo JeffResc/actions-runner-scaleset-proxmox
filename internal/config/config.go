@@ -2205,9 +2205,8 @@ var profileNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 //
 // Profile names are scoped to their owning scaleset, so two
 // scalesets may both declare a "default" profile without
-// collision. The label-coverage check runs per-scaleset: each
-// scaleset's profiles must collectively cover that scaleset's
-// labels.
+// collision. The label-equality check runs per-profile: see
+// validateProfileLabels.
 func (c *Config) validateProfiles() error {
 	sumMax := 0
 	// anyUnlimited records that some profile opted out of a static cap
@@ -2236,6 +2235,9 @@ func (c *Config) validateProfiles() error {
 					si, s.Name, p.Name, prev, i)
 			}
 			seen[p.Name] = i
+			if err := validateProfileLabels(si, s, i, p); err != nil {
+				return err
+			}
 			if err := c.validateProfileFootprint(si, s.Name, i, p); err != nil {
 				return err
 			}
@@ -2277,13 +2279,6 @@ func (c *Config) validateProfiles() error {
 			}
 			sumMax += maxConc
 		}
-		// Label-routing safety: every label this scaleset
-		// advertises must be present on at least one of its
-		// profiles.
-		if gaps := uncoveredScaleSetLabels(s.Labels, s.Profiles); len(gaps) > 0 {
-			return fmt.Errorf("scalesets[%d] %q: no profile covers labels %v — add the labels to a profile or remove them from scaleset.labels",
-				si, s.Name, gaps)
-		}
 	}
 	// global_max is a load-time arithmetic assertion over the per-profile
 	// caps, not a runtime gate. Once any profile has opted out of a
@@ -2293,6 +2288,40 @@ func (c *Config) validateProfiles() error {
 	if c.Pool.GlobalMax > 0 && !anyUnlimited && sumMax > c.Pool.GlobalMax {
 		return fmt.Errorf("pool.global_max (%d) is below the sum of profile.max_concurrent_runners across all scalesets (%d)",
 			c.Pool.GlobalMax, sumMax)
+	}
+	return nil
+}
+
+// validateProfileLabels enforces that a profile advertises exactly the
+// labels of the scaleset that owns it.
+//
+// A JIT runner carries no labels of its own — the only labels GitHub
+// ever sees are the scaleset's, and every runner inside one scaleset is
+// therefore indistinguishable to GitHub. GitHub matches a job to a
+// SCALESET by that label set and then hands the job to whichever runner
+// in the set asks for work next; the orchestrator has no say in the
+// pairing. So a profile that declares a label its siblings don't
+// describes a distinction GitHub cannot honour: a job requesting it can
+// land on any profile's VM, which silently gives the job the wrong
+// hardware (issue: a mem-16g job served by a 4 GiB VM, which then OOMs
+// and surfaces as "the runner has received a shutdown signal").
+//
+// Failing at load is the only honest option. The distinction is real
+// and expressible — it just belongs at scaleset granularity, where
+// GitHub does the matching for us. Workflow `runs-on:` is unchanged by
+// the split.
+func validateProfileLabels(si int, s *ScaleSetEntry, pi int, p ProfileConfig) error {
+	if extra := labelsNotIn(p.Labels, s.Labels); len(extra) > 0 {
+		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: declares labels %v that scalesets[%d].labels does not advertise — "+
+			"runners inside one scale set are indistinguishable to GitHub, so a per-profile label cannot route anything. "+
+			"Give each label set its own scale set (see docs/multi-scaleset.md)",
+			si, s.Name, pi, p.Name, extra, si)
+	}
+	if missing := labelsNotIn(s.Labels, p.Labels); len(missing) > 0 {
+		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: does not advertise labels %v that scalesets[%d].labels does — "+
+			"every profile in a scale set serves every job the set accepts, so all profiles must carry the same labels. "+
+			"Give each label set its own scale set (see docs/multi-scaleset.md)",
+			si, s.Name, pi, p.Name, missing, si)
 	}
 	return nil
 }
@@ -2375,19 +2404,18 @@ func resolveSchedules(schedules []ScheduleConfig, prefix string) error {
 	return nil
 }
 
-// uncoveredScaleSetLabels returns the labels in scaleSetLabels that
-// no profile's label set contains. Used by Validate to enforce the
-// label-routing coverage invariant.
-func uncoveredScaleSetLabels(scaleSetLabels []string, profiles []ProfileConfig) []string {
-	union := make(map[string]struct{})
-	for _, p := range profiles {
-		for _, l := range p.Labels {
-			union[l] = struct{}{}
-		}
+// labelsNotIn returns the labels in want that have does not contain,
+// preserving want's order so error messages are stable. Used by
+// Validate in both directions to enforce the profile/scaleset label
+// equality invariant.
+func labelsNotIn(want, have []string) []string {
+	set := make(map[string]struct{}, len(have))
+	for _, l := range have {
+		set[l] = struct{}{}
 	}
 	var gaps []string
-	for _, l := range scaleSetLabels {
-		if _, ok := union[l]; !ok {
+	for _, l := range want {
+		if _, ok := set[l]; !ok {
 			gaps = append(gaps, l)
 		}
 	}

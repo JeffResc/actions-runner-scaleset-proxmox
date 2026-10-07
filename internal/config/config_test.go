@@ -987,15 +987,15 @@ pool:
 
 profiles:
   - name: linux-x64
-    labels: [self-hosted, linux, proxmox, x64]
+    labels: [self-hosted, linux, proxmox]
     template_vmid: 9001
     cpu: 4
     memory_mb: 8192
     hot_size: 5
     warm_size: 10
     max_concurrent_runners: 20
-  - name: gpu
-    labels: [self-hosted, linux, proxmox, gpu]
+  - name: linux-x64-large
+    labels: [self-hosted, linux, proxmox]
     template_vmid: 9100
     cpu: 8
     memory_mb: 32768
@@ -1036,7 +1036,9 @@ func TestProfiles_ExplicitBlockParses(t *testing.T) {
 	require.Len(t, cfg.Profiles, 2)
 	x64 := cfg.Profiles[0]
 	require.Equal(t, "linux-x64", x64.Name)
-	require.Equal(t, []string{"self-hosted", "linux", "proxmox", "x64"}, x64.Labels)
+	// Every profile carries its scaleset's labels — the invariant
+	// validateProfileLabels enforces.
+	require.Equal(t, []string{"self-hosted", "linux", "proxmox"}, x64.Labels)
 	require.Equal(t, 9001, x64.TemplateVMID)
 	require.Equal(t, 4, x64.CPUCores)
 	require.Equal(t, 8192, x64.MemoryMB)
@@ -1047,13 +1049,15 @@ func TestProfiles_ExplicitBlockParses(t *testing.T) {
 	require.Equal(t, cfg.Pool.BootMaxAttempts, x64.BootMaxAttemptsOrDefault(0))
 	require.Equal(t, cfg.Pool.VMMaxAge, x64.VMMaxAge)
 
-	gpu := cfg.Profiles[1]
-	require.Equal(t, "gpu", gpu.Name)
+	large := cfg.Profiles[1]
+	require.Equal(t, "linux-x64-large", large.Name)
+	require.Equal(t, x64.Labels, large.Labels,
+		"sibling profiles serve the same GitHub labels")
 	// Explicit 0 stays 0 — not overwritten by the global default of 2.
-	require.Equal(t, 0, gpu.HotSizeOrDefault(99))
-	require.Equal(t, 1, gpu.WarmSizeOrDefault(99))
+	require.Equal(t, 0, large.HotSizeOrDefault(99))
+	require.Equal(t, 1, large.WarmSizeOrDefault(99))
 	// Per-profile override takes precedence over global pool.vm_max_age.
-	require.Equal(t, 6*time.Hour, gpu.VMMaxAge.D())
+	require.Equal(t, 6*time.Hour, large.VMMaxAge.D())
 }
 
 func TestProfiles_GlobalMaxRejectsOversum(t *testing.T) {
@@ -1074,7 +1078,7 @@ func TestProfiles_DuplicateNameRejected(t *testing.T) {
 		"TEST_GH_TOKEN":  "ghp_fake",
 		"TEST_PVE_TOKEN": "pve-secret",
 	})
-	dup := strings.Replace(validProfileYAML, "name: gpu", "name: linux-x64", 1)
+	dup := strings.Replace(validProfileYAML, "name: linux-x64-large", "name: linux-x64", 1)
 	_, err := config.Parse([]byte(dup))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "duplicate name")
@@ -1085,29 +1089,67 @@ func TestProfiles_InvalidNameRejected(t *testing.T) {
 		"TEST_GH_TOKEN":  "ghp_fake",
 		"TEST_PVE_TOKEN": "pve-secret",
 	})
-	bad := strings.Replace(validProfileYAML, "name: gpu", `name: "GPU 1"`, 1)
+	bad := strings.Replace(validProfileYAML, "name: linux-x64-large", `name: "GPU 1"`, 1)
 	_, err := config.Parse([]byte(bad))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must match")
 }
 
-func TestProfiles_UncoveredScaleSetLabelRejected(t *testing.T) {
+// TestProfiles_ProfileLabelNotOnScaleSetRejected is the regression for
+// jobs landing on a VM from the wrong profile. A per-profile label is a
+// distinction GitHub cannot honour: a JIT runner carries no labels, so
+// every runner in a scale set is interchangeable and a job asking for
+// `big` can be handed any profile's VM — silently running on the wrong
+// hardware. Config load must refuse it and name the split as the fix.
+func TestProfiles_ProfileLabelNotOnScaleSetRejected(t *testing.T) {
 	setEnv(t, map[string]string{
 		"TEST_GH_TOKEN":  "ghp_fake",
 		"TEST_PVE_TOKEN": "pve-secret",
 	})
-	// Strip "proxmox" off both profiles so neither covers the
-	// scaleset's declared `proxmox` label. The router-coverage
-	// invariant must reject this at config load time rather than
-	// surfacing it as a per-job ErrNoMatchingProfile in production.
-	uncovered := strings.ReplaceAll(validProfileYAML,
-		"[self-hosted, linux, proxmox, x64]", "[self-hosted, linux, x64]")
-	uncovered = strings.ReplaceAll(uncovered,
-		"[self-hosted, linux, proxmox, gpu]", "[self-hosted, linux, gpu]")
-	_, err := config.Parse([]byte(uncovered))
+	bad := strings.Replace(validProfileYAML,
+		"  - name: linux-x64-large\n    labels: [self-hosted, linux, proxmox]",
+		"  - name: linux-x64-large\n    labels: [self-hosted, linux, proxmox, big]", 1)
+	_, err := config.Parse([]byte(bad))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no profile covers labels")
-	require.Contains(t, err.Error(), "proxmox")
+	require.Contains(t, err.Error(), "linux-x64-large")
+	require.Contains(t, err.Error(), "[big]")
+	require.Contains(t, err.Error(), "docs/multi-scaleset.md")
+}
+
+// TestProfiles_ScaleSetLabelNotOnProfileRejected is the other direction:
+// a label the scale set advertises to GitHub but a profile cannot serve.
+// Jobs requesting it can still be routed to that profile's VMs.
+func TestProfiles_ScaleSetLabelNotOnProfileRejected(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	bad := strings.Replace(validProfileYAML,
+		"  - name: linux-x64\n    labels: [self-hosted, linux, proxmox]",
+		"  - name: linux-x64\n    labels: [self-hosted, linux]", 1)
+	_, err := config.Parse([]byte(bad))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "linux-x64")
+	require.Contains(t, err.Error(), "[proxmox]")
+}
+
+// TestProfiles_SplitAcrossScaleSetsAccepted is the supported way to
+// serve two hardware shapes: one scale set each, so GitHub does the
+// matching against label sets it can actually tell apart.
+func TestProfiles_SplitAcrossScaleSetsAccepted(t *testing.T) {
+	setEnv(t, map[string]string{
+		"TEST_GH_TOKEN":  "ghp_fake",
+		"TEST_PVE_TOKEN": "pve-secret",
+	})
+	cfg, err := config.Parse([]byte(validMultiScalesetYAML))
+	require.NoError(t, err)
+	require.Len(t, cfg.Scalesets, 2)
+	for _, s := range cfg.Scalesets {
+		for _, p := range s.Profiles {
+			require.ElementsMatch(t, s.Labels, p.Labels,
+				"scaleset %q profile %q", s.Name, p.Name)
+		}
+	}
 }
 
 func TestProfiles_HotPlusWarmExceedsMaxRejected(t *testing.T) {
@@ -1133,7 +1175,7 @@ func TestProfiles_VMMaxAgeZeroRejected(t *testing.T) {
 	_, err := config.Parse([]byte(bad))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "vm_max_age must be positive")
-	require.Contains(t, err.Error(), "gpu")
+	require.Contains(t, err.Error(), "linux-x64-large")
 }
 
 func TestProfiles_VMMaxAgeNegativeRejected(t *testing.T) {
@@ -1331,11 +1373,11 @@ nodes:
   strategy: round_robin
   members: [pve1, pve2, pve-gpu-1]
   affinity:
-    - match: { profile: gpu }
+    - match: { profile: linux-x64-large }
       prefer_nodes: [pve-gpu-1]
       require: true
     - match: { profile: linux-x64 }
-      anti_affinity_with: { profile: gpu }
+      anti_affinity_with: { profile: linux-x64-large }
 `
 	// validProfileYAML already sets nodes.strategy: single — strip
 	// it so the appended block doesn't duplicate the key.
@@ -1346,14 +1388,14 @@ nodes:
 	require.NoError(t, err)
 	require.Len(t, cfg.Nodes.Affinity, 2)
 
-	gpu := cfg.Nodes.Affinity[0]
-	require.Equal(t, "gpu", gpu.Match.Profile)
-	require.Equal(t, []string{"pve-gpu-1"}, gpu.PreferNodes)
-	require.True(t, gpu.Require)
+	large := cfg.Nodes.Affinity[0]
+	require.Equal(t, "linux-x64-large", large.Match.Profile)
+	require.Equal(t, []string{"pve-gpu-1"}, large.PreferNodes)
+	require.True(t, large.Require)
 
 	x64 := cfg.Nodes.Affinity[1]
 	require.Equal(t, "linux-x64", x64.Match.Profile)
-	require.Equal(t, "gpu", x64.AntiAffinityWith.Profile)
+	require.Equal(t, "linux-x64-large", x64.AntiAffinityWith.Profile)
 }
 
 func TestNodeAffinity_RejectsUnknownProfileInMatch(t *testing.T) {
@@ -1389,7 +1431,7 @@ nodes:
   strategy: round_robin
   members: [pve1, pve2]
   affinity:
-    - match: { profile: gpu }
+    - match: { profile: linux-x64-large }
       prefer_nodes: [pve-nonexistent]
       require: true
 `
@@ -1409,7 +1451,7 @@ nodes:
   strategy: round_robin
   members: [pve1, pve2]
   affinity:
-    - match: { profile: gpu }
+    - match: { profile: linux-x64-large }
       require: true
 `
 	bad = strings.Replace(bad, "nodes:\n  strategy: single\n  single_node: pve1\n", "", 1)

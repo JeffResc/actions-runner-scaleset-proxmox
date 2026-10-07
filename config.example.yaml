@@ -362,17 +362,19 @@ pool:
 # leave them off entirely to inherit the global pool / scaleset
 # default.
 #
-# Label routing: when JobStarted fires, the scaler picks the profile
-# whose labels are the smallest superset of the job's RequestLabels
-# (ties resolve by declaration order). Unrouted jobs increment
-# scaleset_unrouted_jobs_total{labels="..."}. Config validation
-# rejects scale sets whose declared labels aren't collectively
-# covered by some profile, so a missing label is a load-time error
-# rather than a per-job runtime miss.
+# Labels: every profile MUST advertise exactly its scaleset's
+# labels, and config load fails otherwise. A JIT runner carries no
+# labels of its own, so GitHub only ever sees the SCALESET's labels
+# and treats all of its runners as interchangeable — a per-profile
+# label would promise a distinction GitHub cannot honour, and jobs
+# would silently land on the wrong hardware. To serve a second
+# hardware shape, declare a second scaleset (see the `scalesets:`
+# block above and docs/multi-scaleset.md). Jobs whose labels match
+# no profile increment scaleset_unrouted_jobs_total{labels="..."}.
 #
 # profiles:
 #   - name: linux-x64
-#     labels: [self-hosted, linux, proxmox, x64]
+#     labels: [self-hosted, linux, proxmox]   # == scaleset.labels
 #     template_vmid: 9000           # optional override of the global proxmox.template_vmid
 #     cpu: 4                        # cores; 0 inherits the template default
 #     memory_mb: 8192               # 0 inherits the template default
@@ -419,8 +421,11 @@ pool:
 #     #   mtu: 1500
 #     #   ipam:
 #     #     backend: noop
-#   - name: gpu
-#     labels: [self-hosted, linux, proxmox, gpu]
+#   # A sibling profile carries the SAME labels — it is an
+#   # interchangeable pool (second image, different placement),
+#   # not a way to send particular jobs to particular hardware.
+#   - name: linux-x64-large
+#     labels: [self-hosted, linux, proxmox]   # == scaleset.labels
 #     template_vmid: 9100
 #     cpu: 8
 #     memory_mb: 32768
