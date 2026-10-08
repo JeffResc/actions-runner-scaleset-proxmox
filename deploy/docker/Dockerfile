@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 
 # ---------- builder ----------
 # Digest-pinned for reproducible, tamper-evident builds (tags are
