@@ -2390,6 +2390,47 @@ func TestRunClone_PanicReportsAllocatedVMID(t *testing.T) {
 	mgr.wg.Wait()
 }
 
+// TestRunClone_LogsCloneFailure: a failed clone is counted and its row
+// destroyed; the cause must also reach the log, which is the only place an
+// operator without a tracing endpoint can read it.
+func TestRunClone_LogsCloneFailure(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+
+	var logBuf strings.Builder
+	logMu := sync.Mutex{}
+	log := slog.New(slog.NewTextHandler(&syncWriter{w: &logBuf, mu: &logMu}, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	fp := &fakeProv{cloneErr: errors.New("403 Permission check failed (/vms/9000, VM.Clone)")}
+	mi, err := NewManager(Config{
+		MaxConcurrentRunners: 5,
+		VMIDRange:            config.VMIDRange{Min: 74000, Max: 74099},
+		VMNamePrefix:         "gh-runner-test-",
+		TemplateNode:         "pve1",
+		BootMaxAttempts:      3,
+	}, st, fp, mustSel(t), log, observability.NewMetrics(prometheus.NewRegistry()))
+	require.NoError(t, err)
+	mgr := mi.(*manager)
+
+	mgr.runClone("", store.PoolKindWarm, false, nil, func() {})
+
+	require.Eventually(t, func() bool {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return strings.Contains(logBuf.String(), "clone failed")
+	}, 2*time.Second, 10*time.Millisecond)
+
+	logMu.Lock()
+	out := logBuf.String()
+	logMu.Unlock()
+	require.Contains(t, out, "VM.Clone", "the log must carry the cause. log: %s", out)
+	require.Contains(t, out, "vmid=74000", "the log must name the VM ID. log: %s", out)
+	require.Contains(t, out, "op=clone", "the log must name the failing step. log: %s", out)
+
+	mgr.workerCancel()
+	mgr.wg.Wait()
+}
+
 // TestRunClone_DeletesOrphanWhenRowVanished simulates the race fixed
 // by #63: Clone succeeds on Proxmox, then a concurrent ForceDestroy /
 // stuck-state sweep deletes the store row before runClone can flip it

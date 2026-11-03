@@ -2452,6 +2452,12 @@ func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState
 // emitted for "clone" — IPAM failures don't yet have a dedicated
 // metric, matching the pre-refactor behaviour).
 func (m *manager) handleCloneFailure(prep *clonePrep, err error, op string) {
+	// The span and the metric say that a clone failed, not why; without
+	// a tracing endpoint this line is the only place the cause (a 403
+	// from Proxmox, a locked template, full storage) is recorded.
+	m.log.Warn("clone failed; destroying its row, the next reconcile retries",
+		"vmid", prep.vmid, "node", prep.node, "profile", prep.profileName,
+		"template_vmid", prep.templateVMID, "op", op, "err", err)
 	if prep.span != nil {
 		prep.span.RecordError(err)
 		prep.span.SetStatus(codes.Error, op+" failed")
