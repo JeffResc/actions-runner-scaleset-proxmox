@@ -380,7 +380,14 @@ func newProxmoxClient(cfg config.ProxmoxConfig) *proxmox.Client {
 	// Silence the retryable-http default logger; orchestrator logs the
 	// final outcome via the provisioner's slog.
 	retry.Logger = nil
-	retry.ErrorHandler = func(resp *http.Response, _ error, _ int) (*http.Response, error) {
+	retry.ErrorHandler = func(resp *http.Response, err error, attempts int) (*http.Response, error) {
+		// Without a response (TLS verification, connection refused, DNS,
+		// timeout) the error is all there is: returning (nil, nil) here
+		// makes net/http replace it with "RoundTripper ... returned a nil
+		// *Response with a nil error", which hides the cause.
+		if resp == nil {
+			return nil, fmt.Errorf("giving up after %d attempt(s): %w", attempts, err)
+		}
 		// Returning the last response (not an error) lets the typed
 		// Proxmox client handle the HTTP status normally, including its
 		// own 4xx/5xx error decoding.
