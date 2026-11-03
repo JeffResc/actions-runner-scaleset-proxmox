@@ -933,6 +933,26 @@ func TestNewProxmoxClient_ReachesTestServer(t *testing.T) {
 	require.True(t, strings.HasPrefix(got.Path, "/nodes"))
 }
 
+// A request that fails before any HTTP response (here: a certificate the
+// client does not trust) must surface its cause, not net/http's generic
+// "nil *Response with a nil error" that a (nil, nil) ErrorHandler produces.
+func TestNewProxmoxClient_SurfacesConnectionErrors(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	}))
+	defer srv.Close()
+
+	cli := newProxmoxClient(config.ProxmoxConfig{
+		Endpoint: srv.URL,
+		Auth:     config.ProxmoxAuth{TokenID: "scaleset@pve!automation", TokenSecret: "fake-secret"},
+	})
+	_, err := cli.Nodes(context.Background())
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "nil *Response")
+	require.Contains(t, err.Error(), "certificate")
+}
+
 // listOwnedVMsServer returns an httptest server that answers the three
 // GET endpoints ListOwnedVMs needs: cluster node list, per-node status
 // (go-proxmox's Client.Node helper hits /nodes/{node}/status to enrich
