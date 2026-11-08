@@ -37,3 +37,6 @@ packer/*.pkrvars.hcl
 packer/manifest.json
 packer/packer_cache/
 packer/.packer.d/
+
+# Local Claude worktrees
+/.claude/worktrees/
