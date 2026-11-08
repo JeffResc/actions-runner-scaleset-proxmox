@@ -8,17 +8,17 @@
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
 Run your GitHub Actions jobs on your own Proxmox hardware, with each job in a
-brand-new virtual machine that is destroyed the moment it finishes. Nothing
-leaks between jobs — no cached credentials, no leftover containers, no
-poisoned toolchain. Pre-booted hot and warm pools keep job start times low, so
-you get the isolation of a fresh VM without paying the boot cost on every run.
+single-use virtual machine that is destroyed or rolled back to a clean
+pre-boot snapshot after it finishes. Pre-booted hot and warm pools reduce
+job-start latency while keeping each job separate from the previous VM state.
 
 **Status:** pre-1.0, in active development.
 
 ## Features
 
-- **Ephemeral single-use VMs** — one job per VM, destroyed afterwards. No state
-  survives a run.
+- **Ephemeral single-use VMs** — one job per VM, destroyed or rolled back
+  afterwards to discard guest disk changes.
+- **Linux and Windows guests** — separate scale sets route jobs to the correct OS. → [Windows setup](docs/windows-runners.md)
 - **Hot and warm pools** — pre-booted and pre-cloned VMs so jobs start in
   seconds, not minutes. → [scaling](docs/profiles-and-scaling.md)
 - **Snapshot-rollback recycling** — optionally reuse a VM by rolling it back to
@@ -50,8 +50,9 @@ The service implements the [`actions/scaleset`](https://github.com/actions/scale
 `Scaler` interface and long-polls GitHub for runner demand. When a job needs a
 runner, it takes a VM from the hot pool, powers on a warm one, or clones a new
 one from your template. The JIT runner config is written into the VM through
-the QEMU guest agent, a systemd path-unit picks it up, and the runner takes
-exactly one job before shutting the VM down.
+the QEMU guest agent. A guest-side launcher starts the runner, which takes
+exactly one job before the VM shuts down. Linux uses a systemd path unit;
+Windows uses a scheduled task.
 
 ```mermaid
 flowchart TD
@@ -78,7 +79,7 @@ dropped listener callbacks, and sweeps Proxmox for orphaned VMs. See
 - **Proxmox VE**, single node or cluster, with an API token for the
   orchestrator.
 - **A VM template** with the Actions runner and `qemu-guest-agent` baked in.
-  [`packer/`](packer/) builds one for you.
+  [`packer/`](packer/) builds a Linux template; see [Windows setup](docs/windows-runners.md) for an existing Windows VM.
 - **A GitHub org or repo**, plus a PAT or GitHub App.
 
 ## Quick start
@@ -166,6 +167,7 @@ Full walkthrough, including GitHub App auth and verification steps:
 | --- | --- |
 | [Getting started](docs/getting-started.md) | End-to-end first run: template, tokens, config, verification, troubleshooting |
 | [Architecture](docs/architecture.md) | Job lifecycle, VM state machine, control loops, crash recovery, package map |
+| [Windows runners](docs/windows-runners.md) | Windows template preparation, mixed OS configuration, performance and validation |
 | [Configuration](docs/configuration.md) | Config blocks, env-var overrides, validation rules, GHES |
 | [Profiles and scaling](docs/profiles-and-scaling.md) | Hot/warm pools, profiles, where labels are matched, networking, schedules, canaries, quotas |
 | [Node placement](docs/node-placement.md) | Placement strategies and affinity rules on a PVE cluster |

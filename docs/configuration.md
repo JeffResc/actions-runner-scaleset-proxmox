@@ -59,8 +59,9 @@ startup error rather than a runtime surprise. Notable rules:
 - `github.auth_mode` must be `app` or `pat`, and the matching block must be
   present.
 - `github.scope` must set exactly one of `org` or `repo`.
-- A scale set's declared `labels` must be collectively covered by some
-  profile — otherwise jobs matching those labels could never be routed.
+- Every profile must advertise exactly its scale set's labels. Profiles in a
+  scale set must use the same `guest_os`; separate Linux and Windows into
+  different scale sets. See [Windows runners](windows-runners.md).
 - `nodes.affinity` rules naming an undeclared profile or node are rejected.
 - With more than one scale set declared, every entry must carry its own
   `vmid_range` and the ranges must be pairwise disjoint.

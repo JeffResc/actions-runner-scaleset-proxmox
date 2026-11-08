@@ -288,6 +288,22 @@ func ListRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 	return out, err
 }
 
+// runnerNameMatchesPrefix identifies exactly one scale set's generated VM
+// names. A plain prefix would also match a sibling named, for example,
+// "a-b" when this set is named "a".
+func runnerNameMatchesPrefix(name, prefix string) bool {
+	suffix, ok := strings.CutPrefix(name, prefix)
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // listRunnersByPrefix is the truncation-aware core of ListRunnersByPrefix.
 // It additionally reports whether the listing was cut short at the
 // maxListPages cap. Callers that make delete-or-keep decisions from a
@@ -308,7 +324,7 @@ func listRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 		}
 		for _, gr := range runnersPage.Runners {
 			name := gr.GetName()
-			if !strings.HasPrefix(name, prefix) {
+			if !runnerNameMatchesPrefix(name, prefix) {
 				continue
 			}
 			out[name] = pool.RunnerInfo{
@@ -557,6 +573,9 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 	now := r.now()
 	for _, row := range rows {
 		gr, present := runners[row.Name]
+		if present && gr.Online {
+			r.metrics.RunnerObservedOnline(r.cfg.ScaleSetName, row.Name)
+		}
 		ghLabel := ghStateLabel(gr, present)
 		age := now.Sub(row.StateSince)
 

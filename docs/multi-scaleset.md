@@ -4,6 +4,8 @@ One orchestrator process can drive several independent scale sets — for
 example, separate pools for two GitHub organisations, or a general-purpose
 pool alongside a GPU pool with its own concurrency ceiling.
 
+For a mixed Linux and Windows deployment, see the [complete example](../examples/windows-linux.yaml) and [Windows preparation guide](windows-runners.md). Each OS requires a separate scale set.
+
 ## Config shape
 
 Replace the singular `scaleset:` block (plus the top-level `github.scope` and

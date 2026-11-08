@@ -9,6 +9,26 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+// AgentCall records the protocol received by the fake; it does not execute it.
+type AgentCall struct {
+	VMID int
+	Kind string
+	Body map[string]any
+}
+
+// AgentCalls returns a snapshot of guest-agent handoff requests.
+func (s *Server) AgentCalls() []AgentCall {
+	s.agentCallsMu.Lock()
+	defer s.agentCallsMu.Unlock()
+	return append([]AgentCall(nil), s.agentCalls...)
+}
+func (s *Server) recordAgentCall(r *http.Request, kind string, body map[string]any) {
+	id, _ := vmidParam(r)
+	s.agentCallsMu.Lock()
+	defer s.agentCallsMu.Unlock()
+	s.agentCalls = append(s.agentCalls, AgentCall{VMID: id, Kind: kind, Body: body})
+}
+
 // handleAgentGetOSInfo replies with a stub OS info payload, or with the
 // 500 "guest agent is not responding" body during a VM's
 // GuestAgentDelay window after Start.
@@ -79,6 +99,7 @@ func (s *Server) handleAgentFileWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	s.recordAgentCall(r, "write", body)
 	writeData(w, nil)
 }
 
@@ -102,6 +123,9 @@ func (s *Server) handleAgentExec(w http.ResponseWriter, r *http.Request) {
 	if !s.assertVMRunning(w, r) {
 		return
 	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	s.recordAgentCall(r, "exec", body)
 	writeData(w, map[string]any{"pid": 4242})
 }
 

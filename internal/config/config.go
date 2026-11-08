@@ -374,9 +374,8 @@ type ScaleSetEntry struct {
 	MaxConcurrentRunners int `yaml:"max_concurrent_runners" validate:"gte=0,lte=1000000"`
 
 	// Scope is the GitHub registration target for this scale
-	// set. Exactly one of Scope.Org or Scope.Repo must be set;
-	// uniqueness across the Scalesets list is enforced in
-	// Validate so two entries can't fight over the same scope.
+	// set. Exactly one of Scope.Org or Scope.Repo must be set.
+	// Multiple distinct scale sets can share a GitHub target.
 	Scope GitHubScope `yaml:"scope" validate:"required"`
 
 	// Profiles is the per-scaleset runner-profile catalog. May
@@ -711,6 +710,11 @@ type ProfileConfig struct {
 	// scaler's routing decisions. Must be unique across Profiles and
 	// match the sanitised-tag character set [a-z0-9-].
 	Name string `yaml:"name" validate:"required"`
+
+	// GuestOS selects the in-guest JIT handoff protocol. Empty means linux.
+	GuestOS string `yaml:"guest_os,omitempty"`
+	// WindowsJITPath is the absolute handoff file path for Windows guests.
+	WindowsJITPath string `yaml:"windows_jit_path,omitempty"`
 
 	// Labels are the GitHub Actions labels this profile satisfies.
 	// The router (issue #7) picks a profile whose Labels are a
@@ -1888,7 +1892,6 @@ func (c *Config) validateScalesets() error {
 		return errors.New("scalesets: at least one scale set must be declared (or use the legacy singular `scaleset:` form)")
 	}
 	seenName := make(map[string]int, len(c.Scalesets))
-	seenScope := make(map[string]int, len(c.Scalesets))
 	seenOwnerTag := make(map[string]int, len(c.Scalesets))
 	for i, s := range c.Scalesets {
 		if prev, dup := seenName[s.Name]; dup {
@@ -1923,12 +1926,6 @@ func (c *Config) validateScalesets() error {
 		case !hasOrg && !hasRepo:
 			return fmt.Errorf("scalesets[%d] %q.scope: exactly one of org or repo must be set (both are empty)", i, s.Name)
 		}
-		scopeKey := "org:" + s.Scope.Org + "|repo:" + s.Scope.Repo
-		if prev, dup := seenScope[scopeKey]; dup {
-			return fmt.Errorf("scalesets: %q and %q share the same scope (org=%q repo=%q) — two scale sets cannot register against the same GitHub target",
-				c.Scalesets[prev].Name, s.Name, s.Scope.Org, s.Scope.Repo)
-		}
-		seenScope[scopeKey] = i
 
 		// max_concurrent_runners is mandatory unless capacity admission
 		// is on, where omitting it means "let memory decide". This used
@@ -2207,6 +2204,8 @@ var profileNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 // scalesets may both declare a "default" profile without
 // collision. The label-equality check runs per-profile: see
 // validateProfileLabels.
+var windowsJITPathRE = regexp.MustCompile(`^[A-Za-z]:\\[A-Za-z0-9_. -]+(?:\\[A-Za-z0-9_. -]+)*$`)
+
 func (c *Config) validateProfiles() error {
 	sumMax := 0
 	// anyUnlimited records that some profile opted out of a static cap
@@ -2225,7 +2224,22 @@ func (c *Config) validateProfiles() error {
 			return fmt.Errorf("scalesets[%d] %q.profiles: at least one profile is required", si, s.Name)
 		}
 		seen := make(map[string]int, len(s.Profiles))
+		guestOS := ""
 		for i, p := range s.Profiles {
+			os := p.GuestOS
+			if os == "" {
+				os = "linux"
+			}
+			if os != "linux" && os != "windows" {
+				return fmt.Errorf("scalesets[%d].profiles[%d].guest_os must be linux or windows", si, i)
+			}
+			if guestOS != "" && guestOS != os {
+				return fmt.Errorf("scalesets[%d] %q: profiles must use the same guest_os", si, s.Name)
+			}
+			guestOS = os
+			if p.WindowsJITPath != "" && (os != "windows" || !windowsJITPathRE.MatchString(p.WindowsJITPath)) {
+				return fmt.Errorf("scalesets[%d].profiles[%d].windows_jit_path must be an absolute Windows file path with safe characters", si, i)
+			}
 			if !profileNameRE.MatchString(p.Name) {
 				return fmt.Errorf("scalesets[%d] %q.profiles[%d].name %q must match %s",
 					si, s.Name, i, p.Name, profileNameRE.String())

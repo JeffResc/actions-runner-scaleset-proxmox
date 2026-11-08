@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -131,12 +132,72 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) er
 		attribute.Int("jit.bytes", len(jitConfig)),
 	))
 	defer span.End()
-	err := wrapGuestAgent(p.injectJITConfigInner(ctx, vm, jitConfig))
+	os, path, err := p.guestJITSettings(vm)
+	if err == nil {
+		if os == "windows" {
+			err = p.injectWindowsJIT(ctx, vm, path, jitConfig)
+		} else {
+			err = p.injectJITConfigInner(ctx, vm, jitConfig)
+		}
+	}
+	err = wrapGuestAgent(err)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "inject failed")
 	}
 	return err
+}
+
+const defaultWindowsJITPath = `C:\ProgramData\ActionsRunnerScaleSet\jitconfig`
+
+func (p *pmox) guestJITSettings(vm *VM) (string, string, error) {
+	name := vm.Profile
+	if name == "" {
+		name = "default"
+	}
+	profile, ok := p.profiles[name]
+	if !ok && len(p.profiles) != 0 {
+		return "", "", fmt.Errorf("unknown guest profile %q", name)
+	}
+	if profile.GuestOS == "" || profile.GuestOS == "linux" {
+		return "linux", "", nil
+	}
+	if profile.GuestOS != "windows" {
+		return "", "", fmt.Errorf("unsupported guest OS for profile %q", name)
+	}
+	path := profile.WindowsJITPath
+	if path == "" {
+		path = defaultWindowsJITPath
+	}
+	return "windows", path, nil
+}
+
+func (p *pmox) injectWindowsJIT(ctx context.Context, vm *VM, path, jit string) error {
+	if err := p.agentFileWrite(ctx, vm.Node, vm.VMID, path+".tmp", []byte(jit)); err != nil {
+		// A server error can echo request data; never propagate it.
+		if isGuestAgentNotReady(err) {
+			return fmt.Errorf("%w: windows jit temporary write failed", ErrGuestAgentNotReady)
+		}
+		return fmt.Errorf("windows jit temporary write failed")
+	}
+	// Paths are validated at configuration load. Escape quotes as defense in depth.
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+	script := "$ErrorActionPreference = 'Stop'; $tmp = " + quote(path+".tmp") + "; $final = " + quote(path) + "; " +
+		"if ([System.IO.File]::Exists($final)) { if ([System.IO.File]::ReadAllText($tmp) -cne [System.IO.File]::ReadAllText($final)) { throw 'handoff already exists' }; [System.IO.File]::Delete($tmp) } else { [System.IO.File]::Move($tmp, $final) }"
+	units := utf16.Encode([]rune(script))
+	bytes := make([]byte, len(units)*2)
+	for i, u := range units {
+		bytes[2*i] = byte(u & 0xff)
+		bytes[2*i+1] = byte(u >> 8)
+	}
+	command := []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", base64.StdEncoding.EncodeToString(bytes)}
+	if err := p.agentExecWait(ctx, vm.Node, vm.VMID, command); err != nil {
+		if isGuestAgentNotReady(err) {
+			return fmt.Errorf("%w: windows jit publication failed", ErrGuestAgentNotReady)
+		}
+		return fmt.Errorf("windows jit publication failed")
+	}
+	return nil
 }
 
 func (p *pmox) injectJITConfigInner(ctx context.Context, vm *VM, jitConfig string) error {
@@ -240,6 +301,13 @@ func (p *pmox) ReadJITConfig(ctx context.Context, vm *VM) ([]byte, error) {
 	const jitConfigPath = "/opt/actions-runner/jitconfig.env"
 	if vm == nil {
 		return nil, fmt.Errorf("read jit config: nil vm")
+	}
+	os, path, err := p.guestJITSettings(vm)
+	if err != nil {
+		return nil, err
+	}
+	if os == "windows" {
+		return p.readAgentFile(ctx, vm, path)
 	}
 	return p.readAgentFile(ctx, vm, jitConfigPath)
 }

@@ -540,8 +540,12 @@ func TestEvict_ReclaimsIdleCapacityForQueuedDemand(t *testing.T) {
 	require.True(t, m.evictForDemand(context.Background(), m.profileOf("big")))
 
 	row, err := st.Get(10001)
-	require.NoError(t, err)
-	require.Equal(t, store.StateDraining, row.State, "the victim is CAS'd out of the pool")
+	if errors.Is(err, store.ErrNotFound) {
+		// The asynchronous destroyer may already have removed the victim.
+	} else {
+		require.NoError(t, err)
+		require.Contains(t, []store.State{store.StateDraining, store.StateDestroying}, row.State, "the victim is no longer acquirable")
+	}
 	require.Equal(t, []int{10001}, adm.lastFreeing,
 		"the reservation must name the VM whose destruction pays for it")
 	require.Equal(t, float64(1), testutil.ToFloat64(
@@ -1037,4 +1041,32 @@ func TestBurstDeficit_MatchesComputeCloneNeeds(t *testing.T) {
 	stats := Stats{Running: 3}
 	needHot, _ := computeCloneNeeds(stats, 0, 0, 0, 0, 0, 6, 100, returningCredit{})
 	require.Equal(t, burstDeficit(stats, 0, 0, 6, returningCredit{}), needHot)
+}
+
+type sourceNodeProv struct{ *fakeProv }
+
+func (p *sourceNodeProv) SourceTemplateNode(_ context.Context, vmid int) (string, error) {
+	if vmid == 42 {
+		return "profile-node", nil
+	}
+	return "", errors.New("missing template")
+}
+func TestLinkedProfileTemplateNodeAdmission(t *testing.T) {
+	st := newTestStore(t)
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 32 * gib, "profile-node": 32 * gib})
+	m := newTestManager(t, st, &sourceNodeProv{&fakeProv{}}, Config{Capacity: adm, LinkedClones: true, TemplateNode: "pve1", Profiles: []ProfileSettings{{Name: "p", TemplateVMID: 42, MemoryMB: 8192, MaxConcurrentRunners: 10}}})
+	m.runClone("p", store.PoolKindWarm, false, nil, func() {})
+	require.Equal(t, uint64(24*gib), adm.snapshotFree("profile-node"))
+	require.Equal(t, uint64(32*gib), adm.snapshotFree("pve1"))
+}
+
+func TestLinkedCloneHonorsRequiredAffinity(t *testing.T) {
+	nodes := []string{"pve1", "profile-node"}
+	base, err := nodeselector.NewRoundRobin(nodes)
+	require.NoError(t, err)
+	selector, err := nodeselector.NewAffinity(base, []nodeselector.AffinityRule{{Match: nodeselector.AffinitySelector{Profile: "p"}, PreferNodes: []string{"pve1"}, Require: true}}, nodes)
+	require.NoError(t, err)
+	m := newTestManager(t, newTestStore(t), &sourceNodeProv{&fakeProv{}}, Config{LinkedClones: true, TemplateNode: "pve1", Nodes: nodes, Profiles: []ProfileSettings{{Name: "p", TemplateVMID: 42, MaxConcurrentRunners: 10}}}, withSelector(selector))
+	_, ok := m.selectNode(context.Background(), m.profileOf("p"), store.PoolKindWarm)
+	require.False(t, ok)
 }

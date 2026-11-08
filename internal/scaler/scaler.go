@@ -55,6 +55,9 @@ type Config struct {
 
 // Scaler implements scaleset.Scaler against the orchestrator's pool.
 type Scaler struct {
+	demandMu    sync.Mutex
+	demandSince time.Time
+
 	cfg     Config
 	gh      *scaleset.Client
 	pool    pool.Manager
@@ -147,6 +150,7 @@ func (s *Scaler) HandleJobStarted(ctx context.Context, info *scaleset.JobStarted
 	if s.metrics != nil {
 		s.metrics.ListenerMessages.WithLabelValues(s.cfg.ScaleSetName, "job_started").Inc()
 	}
+	s.metrics.RunnerObservedOnline(s.cfg.ScaleSetName, info.RunnerName)
 	s.recordRouting(info.RequestLabels)
 	vmid, ok := vmidFromRunnerName(info.RunnerName, s.cfg.NamePrefix)
 	if !ok {
@@ -390,6 +394,14 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	// count > HotSize we want reconcile to clone the difference asap,
 	// even for the runners we can't satisfy from the hot pool right now.
 	s.pool.SetDesiredCount(count)
+	s.demandMu.Lock()
+	if count <= 0 {
+		s.demandSince = time.Time{}
+	} else if s.demandSince.IsZero() {
+		s.demandSince = time.Now()
+	}
+	wave := s.demandSince
+	s.demandMu.Unlock()
 	if count <= 0 {
 		return 0, nil
 	}
@@ -409,6 +421,11 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	}
 	need := count - busy
 	if need <= 0 {
+		s.demandMu.Lock()
+		if s.demandSince.Equal(wave) {
+			s.demandSince = time.Time{}
+		}
+		s.demandMu.Unlock()
 		return 0, nil
 	}
 
@@ -416,7 +433,15 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	if len(vms) == 0 {
 		return 0, nil
 	}
-	return s.provisionAcquired(ctx, vms), nil
+	delivered := s.provisionAcquired(ctx, vms)
+	if delivered >= need {
+		s.demandMu.Lock()
+		if s.demandSince.Equal(wave) {
+			s.demandSince = time.Time{}
+		}
+		s.demandMu.Unlock()
+	}
+	return delivered, nil
 }
 
 // preAcquireVMs serially claims up to `need` Hot VMs from the pool,
@@ -529,9 +554,15 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		}
 	}
 
+	s.demandMu.Lock()
+	requested := s.demandSince
+	s.demandMu.Unlock()
+	s.metrics.TrackStartup(s.cfg.ScaleSetName, vmObj.Profile, vmObj.Name, requested)
+	injectStarted := time.Now()
 	if err := s.injectWithRetry(ctx, &provisioner.VM{
-		VMID: vmObj.VMID, Node: vmObj.Node, Name: vmObj.Name,
+		VMID: vmObj.VMID, Node: vmObj.Node, Name: vmObj.Name, Profile: vmObj.Profile,
 	}, jitCfg.EncodedJITConfig); err != nil {
+		s.metrics.ForgetStartup(s.cfg.ScaleSetName, vmObj.Name)
 		s.log.Error("jit injection failed (after retries); releasing vm", "vmid", vmObj.VMID, "err", err)
 		// Helper enforces the closed enum on `op` so a future caller
 		// can't blow up Prometheus cardinality silently.
@@ -544,6 +575,8 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		}
 		return false
 	}
+	s.metrics.ObserveStartupStage(s.cfg.ScaleSetName, vmObj.Profile, "jit_injection", time.Since(injectStarted))
+	s.metrics.StartupDelivered(s.cfg.ScaleSetName, vmObj.Name)
 	return true
 }
 

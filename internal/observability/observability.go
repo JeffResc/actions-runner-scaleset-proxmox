@@ -78,6 +78,10 @@ func parseLevel(s string) (slog.Level, error) {
 // binary hosts multiple scale sets. Fleet-wide instruments
 // (Leader) keep their original signature.
 type Metrics struct {
+	StartupStage *prometheus.HistogramVec
+	startupMu    sync.Mutex
+	startups     map[string]startupTiming
+
 	PoolSize             *prometheus.GaugeVec
 	VMsTotal             *prometheus.CounterVec
 	CloneDuration        *prometheus.HistogramVec
@@ -301,6 +305,11 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "vms_total",
 			Help: "Cumulative count of VMs created, partitioned by scaleset, profile and outcome.",
 		}, []string{"scaleset", "profile", "outcome"}),
+		StartupStage: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: ns, Name: "startup_stage_duration_seconds",
+			Help:    "Startup stage latency; online samples require successful injection and include GitHub observation delay.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15),
+		}, []string{"scaleset", "profile", "stage"}),
 		CloneDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: ns, Name: "clone_duration_seconds",
 			Help:    "Time to clone a VM from template.",
@@ -439,7 +448,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"node"}),
 	}
 	reg.MustRegister(
-		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
+		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration, m.StartupStage,
 		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors,
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,

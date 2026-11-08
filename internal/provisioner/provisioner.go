@@ -223,12 +223,14 @@ type Provisioner interface {
 
 // pmox is the production Provisioner backed by github.com/luthermonson/go-proxmox.
 type pmox struct {
-	cfg          config.ProxmoxConfig
-	cli          *proxmox.Client
-	scaleSetName string
-	vmNamePrefix string // e.g. "gh-runner-<scaleset>-" — used to detect untagged orphans
-	templateNode string
-	log          *slog.Logger
+	cfg              config.ProxmoxConfig
+	cli              *proxmox.Client
+	scaleSetName     string
+	vmNamePrefix     string // e.g. "gh-runner-<scaleset>-" — used to detect untagged orphans
+	templateNode     string
+	templateNodeVMID int
+	profiles         map[string]config.ProfileConfig
+	log              *slog.Logger
 
 	// inFlightClones tracks VMIDs currently inside Clone() between the
 	// PVE qmclone task returning and the follow-up qmconfig that applies
@@ -258,6 +260,8 @@ type pmox struct {
 // Options configures Provisioner trackers separate from the static
 // Proxmox connection settings. Zero values fall back to safe defaults.
 type Options struct {
+	Profiles []config.ProfileConfig
+
 	// CloneInflightTTL bounds how long an in-flight clone entry may
 	// live before the background sweep prunes it. Protects against
 	// a Clone() that hangs and never reaches its defer-Delete.
@@ -306,7 +310,24 @@ func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePref
 		inFlightClones:    newTracker(opts.CloneInflightTTL),
 		recentlyDestroyed: newTracker(opts.RecentlyDestroyedTTL),
 	}
-	if err := p.discoverTemplateNode(ctx); err != nil {
+	p.profiles = make(map[string]config.ProfileConfig, len(opts.Profiles))
+	for _, profile := range opts.Profiles {
+		p.profiles[profile.Name] = profile
+	}
+	discoveryVMID := cfg.TemplateVMID
+	if len(opts.Profiles) > 0 {
+		allOverride := true
+		for _, profile := range opts.Profiles {
+			if profile.TemplateVMID == 0 {
+				allOverride = false
+				break
+			}
+		}
+		if allOverride {
+			discoveryVMID = opts.Profiles[0].TemplateVMID
+		}
+	}
+	if err := p.discoverTemplateNodeFor(ctx, discoveryVMID); err != nil {
 		return nil, err
 	}
 	if err := p.validateFirewallSecurityGroup(ctx); err != nil {
@@ -324,7 +345,7 @@ func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePref
 		p.inFlightClones.Stop()
 		p.recentlyDestroyed.Stop()
 	}()
-	log.Info("provisioner ready", "template_vmid", cfg.TemplateVMID, "template_node", p.templateNode)
+	log.Info("provisioner ready", "template_vmid", discoveryVMID, "template_node", p.templateNode)
 	return p, nil
 }
 
@@ -455,6 +476,10 @@ var listOwnedVMsTimeoutPerNode = 15 * time.Second
 // Each per-node interaction is bounded by templateDiscoveryTimeoutPerNode
 // so a single hung node can't pin startup.
 func (p *pmox) discoverTemplateNode(ctx context.Context) error {
+	return p.discoverTemplateNodeFor(ctx, p.cfg.TemplateVMID)
+}
+
+func (p *pmox) discoverTemplateNodeFor(ctx context.Context, vmid int) error {
 	statuses, err := p.cli.Nodes(ctx)
 	if err != nil {
 		return fmt.Errorf("provisioner: list nodes: %w", err)
@@ -468,25 +493,26 @@ func (p *pmox) discoverTemplateNode(ctx context.Context) error {
 			p.log.Warn("provisioner: get node failed; continuing scan", "node", ns.Node, "err", err)
 			continue
 		}
-		vm, err := node.VirtualMachine(nodeCtx, p.cfg.TemplateVMID)
+		vm, err := node.VirtualMachine(nodeCtx, vmid)
 		cancel()
 		if err != nil {
 			continue
 		}
 		if !isTemplate(vm) {
 			p.log.Warn("provisioner: VMID found but not a template; continuing scan",
-				"vmid", p.cfg.TemplateVMID, "node", ns.Node)
+				"vmid", vmid, "node", ns.Node)
 			nonTemplateHits = append(nonTemplateHits, ns.Node)
 			continue
 		}
 		p.templateNode = ns.Node
+		p.templateNodeVMID = vmid
 		return nil
 	}
 	if len(nonTemplateHits) > 0 {
 		return fmt.Errorf("%w: vmid=%d found on %v but none are templates",
-			ErrTemplateNotFound, p.cfg.TemplateVMID, nonTemplateHits)
+			ErrTemplateNotFound, vmid, nonTemplateHits)
 	}
-	return fmt.Errorf("%w: vmid=%d", ErrTemplateNotFound, p.cfg.TemplateVMID)
+	return fmt.Errorf("%w: vmid=%d", ErrTemplateNotFound, vmid)
 }
 
 // validateFirewallSecurityGroup confirms once, at startup, that the
@@ -532,9 +558,6 @@ func isTemplate(vm *proxmox.VirtualMachine) bool {
 // qmclone task returning and the follow-up qmconfig that applies our
 // owner tags. The entry is removed on any return path (success or error).
 func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
-	if opts.Linked && opts.Node != p.templateNode {
-		return nil, fmt.Errorf("%w: requested node=%s template_node=%s", ErrLinkedCloneCrossNode, opts.Node, p.templateNode)
-	}
 	p.inFlightClones.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
 	defer p.inFlightClones.Delete(opts.NewVMID)
 
@@ -542,6 +565,10 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	templateNodeName, err := p.resolveTemplateNode(ctx, opts)
 	if err != nil {
 		return nil, err
+	}
+
+	if opts.Linked && opts.Node != templateNodeName {
+		return nil, fmt.Errorf("%w: requested node=%s template_node=%s", ErrLinkedCloneCrossNode, opts.Node, templateNodeName)
 	}
 
 	templateNode, err := p.cli.Node(ctx, templateNodeName)
@@ -705,11 +732,20 @@ func resolveTemplateVMID(optOverride, defaultTemplateVMID int) int {
 // on the same node but we re-discover when the override is
 // explicitly set and differs from the global template, since the
 // operator may have placed it elsewhere.
+func (p *pmox) SourceTemplateNode(ctx context.Context, vmid int) (string, error) {
+	return p.resolveTemplateNode(ctx, CloneOptions{TemplateVMID: vmid})
+}
+
 func (p *pmox) resolveTemplateNode(ctx context.Context, opts CloneOptions) (string, error) {
-	if opts.TemplateVMID > 0 && opts.TemplateVMID != p.cfg.TemplateVMID {
-		discovered, err := p.locateTemplate(ctx, opts.TemplateVMID)
+	vmid := resolveTemplateVMID(opts.TemplateVMID, p.cfg.TemplateVMID)
+	cachedVMID := p.templateNodeVMID
+	if cachedVMID == 0 {
+		cachedVMID = p.cfg.TemplateVMID
+	}
+	if vmid != cachedVMID {
+		discovered, err := p.locateTemplate(ctx, vmid)
 		if err != nil {
-			return "", fmt.Errorf("locate profile template %d: %w", opts.TemplateVMID, err)
+			return "", fmt.Errorf("locate profile template %d: %w", vmid, err)
 		}
 		return discovered, nil
 	}
@@ -912,6 +948,8 @@ func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) 
 }
 
 func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) error {
+	ctx, span := tracer.Start(ctx, "provisioner.PowerOn")
+	defer span.End()
 	task, err := pVM.Start(ctx)
 	if err != nil {
 		// If the VM is already running, Proxmox returns an error. Treat as

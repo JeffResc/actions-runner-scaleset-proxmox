@@ -10,12 +10,12 @@ runner is needed it either:
 2. starts a pre-cloned, powered-off VM from the **warm pool**, or
 3. clones a new one from the template VMID.
 
-The JIT runner configuration is injected via the QEMU guest agent — there is no
-SSH into runner VMs. A systemd path-unit inside the VM watches for the config
-file, picks it up, and starts the runner. The runner takes exactly one job.
-When the job finishes, the runner unit's `ExecStopPost=poweroff` shuts the VM
-down; the orchestrator's power-state poller observes the transition to
-`stopped` and queues destruction.
+The JIT runner configuration is injected via the QEMU guest agent. Linux uses
+a systemd path unit to start the runner; Windows uses a boot-triggered
+scheduled task watching an atomically published handoff file. The runner takes
+one job and the guest shuts down. The orchestrator observes `stopped` and
+destroys the VM or rolls it back to its clean snapshot, according to recycle
+mode. See [Windows runners](windows-runners.md).
 
 ```mermaid
 flowchart TD
@@ -28,14 +28,13 @@ flowchart TD
     poweron --> agent["Wait for qemu-guest-agent"]
     clone --> agent
     agent --> ready
-    ready --> inject["Write JIT config via<br/>guest-agent file-write"]
-    inject --> pathunit["gh-runner.path fires"]
-    pathunit --> service["gh-runner.service starts the runner"]
-    service --> onejob["Runner takes exactly ONE job"]
-    onejob --> stop["Job finishes:<br/>ExecStopPost=poweroff"]
+    ready --> inject["Publish JIT config via guest agent"]
+    inject --> launcher["Guest launcher starts runner"]
+    launcher --> onejob["Runner takes exactly ONE job"]
+    onejob --> stop["Job finishes; guest shuts down"]
     stop --> poller["Power-state poller observes 'stopped'"]
-    poller --> destroy["Destroy the VM"]
-    destroy --> refill["Pool reclones back to size"]
+    poller --> destroy["Destroy or roll back VM"]
+    destroy --> refill["Pool reconciles"]
     refill -.-> hot
 ```
 

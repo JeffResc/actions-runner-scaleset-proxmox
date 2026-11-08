@@ -1848,11 +1848,10 @@ func TestScalesets_MixingLegacyAndPluralRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "github.scope")
 }
 
-func TestScalesets_DuplicateScopeRejected(t *testing.T) {
+func TestScalesets_SharedScopeAllowed(t *testing.T) {
 	dup := strings.Replace(validMultiScalesetYAML, "org: org-b", "org: org-a", 1)
 	_, err := config.Parse([]byte(dup))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "share the same scope")
+	require.NoError(t, err)
 }
 
 func TestScalesets_DuplicateNameRejected(t *testing.T) {

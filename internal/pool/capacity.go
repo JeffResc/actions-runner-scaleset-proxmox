@@ -175,8 +175,16 @@ func (m *manager) claimParked(ctx context.Context, ps *profileState) (string, ca
 // rules, which would drift from the selector's.
 func (m *manager) nodeEligible(ctx context.Context, ps *profileState, node string, existing []nodeselector.ExistingVM) (eligible, known bool) {
 	if m.cfg.LinkedClones {
-		// Placement isn't the selector's to make in this mode.
-		return node == m.cfg.TemplateNode, true
+		source, ok := m.profileTemplateNode(ctx, ps)
+		if !ok {
+			return false, false
+		}
+		if node != source {
+			return false, true
+		}
+	}
+	if len(m.cfg.Nodes) == 0 && m.cfg.LinkedClones {
+		return true, true
 	}
 	if len(m.cfg.Nodes) == 0 {
 		// NewManager rejects this combination; defend anyway rather than
@@ -216,6 +224,18 @@ func (m *manager) nodeEligible(ctx context.Context, ps *profileState, node strin
 // selectNode runs node selection for a clone of ps, translating a
 // capacity refusal into a counted deferral rather than an error.
 func (m *manager) selectNode(ctx context.Context, ps *profileState, kind store.PoolKind) (string, bool) {
+	if m.cfg.LinkedClones {
+		node, ok := m.profileTemplateNode(ctx, ps)
+		if !ok {
+			m.log.Warn("clone: source template node lookup failed", "profile", ps.settings.Name)
+			return "", false
+		}
+		eligible, known := m.nodeEligible(ctx, ps, node, m.snapshotExistingVMsForAffinity())
+		if !known || !eligible {
+			return "", false
+		}
+		return node, true
+	}
 	// Profile + existing-row context lets the affinity wrapper apply
 	// prefer_nodes / anti_affinity_with; Shape lets the capacity wrapper
 	// skip nodes without room. The plain single / round_robin /
@@ -239,14 +259,25 @@ func (m *manager) selectNode(ctx context.Context, ps *profileState, kind store.P
 		m.log.Warn("clone: node selection failed", "profile", ps.settings.Name, "err", err)
 		return "", false
 	}
-	if m.cfg.LinkedClones {
-		// A linked clone must stay on the template's node, so the
-		// selector's answer is discarded — and the reservation is taken
-		// against THIS node, since charging the node we selected but
-		// will not use would account for the clone in the wrong place.
-		node = m.cfg.TemplateNode
-	}
 	return node, true
+}
+
+// profileTemplateNode resolves the actual profile template before capacity is charged.
+func (m *manager) profileTemplateNode(ctx context.Context, ps *profileState) (string, bool) {
+	if resolver, ok := m.prov.(interface {
+		SourceTemplateNode(context.Context, int) (string, error)
+	}); ok {
+		node, err := resolver.SourceTemplateNode(ctx, ps.settings.TemplateVMID)
+		if err != nil {
+			return "", false
+		}
+		return node, true
+	}
+	// Older provisioners only expose the global template. Do not guess for overrides.
+	if ps.settings.TemplateVMID != 0 {
+		return "", false
+	}
+	return m.cfg.TemplateNode, true
 }
 
 // reserveCapacity claims capacity for one clone of ps on node.

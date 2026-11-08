@@ -145,6 +145,7 @@ type Options struct {
 
 // ProfileSpec is one entry in Options.Profiles.
 type ProfileSpec struct {
+	GuestOS  string
 	Name     string
 	Labels   []string // defaults to the scale set's own label set
 	CPUCores int
@@ -600,7 +601,7 @@ scalesets:
 {{- else }}
 scaleset:
   name: {{.ScaleSetName}}
-  labels: [self-hosted, linux, x64, e2e]
+  labels: [self-hosted, {{if and .Profiles (eq (index .Profiles 0).GuestOS "windows")}}windows{{else}}linux{{end}}, x64, e2e]
   runner_group: default
 {{- if not .OmitMaxConcurrentRunners }}
   max_concurrent_runners: {{.MaxConcurrentRunners}}
@@ -662,6 +663,9 @@ pool:
 profiles:
 {{- range .Profiles }}
   - name: {{.Name}}
+{{- if .GuestOS }}
+    guest_os: {{.GuestOS}}
+{{- end }}
     labels: [{{range $i, $l := .Labels}}{{if $i}}, {{end}}{{$l}}{{end}}]
     cpu: {{.CPUCores}}
     memory_mb: {{.MemoryMB}}
@@ -828,7 +832,11 @@ func applyOptionDefaults(opts Options) Options {
 	}
 	for i := range opts.Profiles {
 		if len(opts.Profiles[i].Labels) == 0 {
-			opts.Profiles[i].Labels = []string{"self-hosted", "linux", "x64", "e2e"}
+			guestOS := "linux"
+			if opts.Profiles[i].GuestOS == "windows" {
+				guestOS = "windows"
+			}
+			opts.Profiles[i].Labels = []string{"self-hosted", guestOS, "x64", "e2e"}
 		}
 	}
 	if opts.Org == "" {

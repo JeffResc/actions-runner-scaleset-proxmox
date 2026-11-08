@@ -39,6 +39,7 @@ All metrics are namespaced `scaleset_`. Every per-scale-set metric carries
 | `scaleset_acquire_duration_seconds` | `scaleset, profile, tier` | Acquire to ready VM. `tier` tells you whether it came from hot, warm, or a fresh clone |
 | `scaleset_clone_duration_seconds` | `scaleset, profile, linked, node` | Template clone time |
 | `scaleset_boot_duration_seconds` | `scaleset, profile, node` | VM start to guest-agent ready |
+| `scaleset_startup_stage_duration_seconds` | `scaleset, profile, stage` | Startup stages; see measurement boundaries below |
 | `scaleset_reconcile_duration_seconds` | `scaleset` | One pool reconciliation pass |
 
 ### Routing, quotas, and priority
@@ -88,6 +89,23 @@ All metrics are namespaced `scaleset_`. Every per-scale-set metric carries
   dropped and VMs will leak until the orphan sweep catches them.
 - `scaleset_canary_reverted_total` increasing — a bad template candidate.
 - `scaleset_gh_rate_limit_remaining` trending toward zero.
+
+### Startup stage timings
+
+`scaleset_startup_stage_duration_seconds` is a histogram partitioned by scale
+set, profile and stage. `power_on` measures explicit Proxmox start tasks for
+warm promotion and snapshot-mode cold starts. In destroy mode the cold start
+happens inside Clone, so the clone histogram includes it; the
+`provisioner.PowerOn` trace span separates that start task.
+`guest_agent` measures the readiness wait; and `jit_injection` includes
+transient injection retries. `jit_to_online` begins before injection and ends
+when REST polling observes the runner online or a JobStarted event arrives;
+REST polling adds up to a polling interval of observation delay.
+`demand_to_online` begins with the first outstanding desired-count wave and
+includes clone and boot; runners in the same wave share its start time. These
+timings exist only within the current process and are not recovered or
+backfilled after a restart. Compare them with the existing clone, boot and
+acquire metrics and measured workflow queue-to-start latency.
 
 ### Changing a scale set's labels
 

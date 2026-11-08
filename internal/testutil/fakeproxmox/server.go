@@ -25,6 +25,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,6 +86,8 @@ const DefaultGuestMemoryMB = 512
 // Server is the fake Proxmox API. Construct with New; the embedded
 // httptest.Server gives Close() and a usable URL.
 type Server struct {
+	agentCallsMu sync.Mutex
+	agentCalls   []AgentCall
 	*httptest.Server
 	store *store
 	opts  Options

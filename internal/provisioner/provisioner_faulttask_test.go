@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakeproxmox"
 )
 
@@ -121,4 +122,20 @@ func TestSnapshotCreate_TaskFailureSurfacesError(t *testing.T) {
 	err := p.SnapshotCreate(context.Background(), &VM{VMID: 10052, Node: "pve1"}, "scaleset-clean")
 	require.Error(t, err, "a snapshot task that completes with a failure exitstatus must surface as an error")
 	require.Contains(t, err.Error(), "snapshot")
+}
+
+func TestNewUsesProfileTemplateWhenAllProfilesOverrideGlobal(t *testing.T) {
+	fp := fakeproxmox.New(t, fakeproxmox.Options{TemplateVMID: 9001})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := config.ProxmoxConfig{Endpoint: fp.URL, InsecureSkipVerify: true, TemplateVMID: 9000, Auth: config.ProxmoxAuth{TokenID: "test@pve!test", TokenSecret: "test"}}
+	prov, err := New(ctx, cfg, "win", "win-", Options{Profiles: []config.ProfileConfig{{Name: "win", TemplateVMID: 9001, GuestOS: "windows"}}}, quietLogger())
+	require.NoError(t, err)
+	require.Equal(t, "pve1", prov.TemplateNode())
+	pm := prov.(*pmox)
+	node, err := pm.SourceTemplateNode(ctx, 9001)
+	require.NoError(t, err)
+	require.Equal(t, "pve1", node)
+	_, err = pm.SourceTemplateNode(ctx, 0)
+	require.ErrorIs(t, err, ErrTemplateNotFound)
 }

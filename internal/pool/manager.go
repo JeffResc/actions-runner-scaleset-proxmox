@@ -63,7 +63,8 @@ type ProfileSettings struct {
 	// Name is the profile identifier. Must be non-empty when
 	// Profiles is set; pool.NewManager synthesises a default
 	// "default" profile when the slice is empty.
-	Name string
+	Name    string
+	GuestOS string
 
 	// HotSize / WarmSize / MaxConcurrentRunners / BootMaxAttempts
 	// override the top-level Config fields when > 0.
@@ -1189,18 +1190,25 @@ func (m *manager) Adopt(ctx context.Context) error {
 // without leaking the loop control structure into the classification.
 func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) {
 	state, kind, runnerID := m.classifyAdoption(ctx, pv, runners)
-	// Route the adopted VM into a known profile. An unrecognised
-	// profile name (operator removed a profile config but VMs from
-	// it still exist on Proxmox) is force-routed to the default
-	// profile so the destroyer can still recycle the row instead of
-	// leaving it orphaned.
 	profile := pv.Profile
-	if profile == "" || m.profileOf(profile) == nil {
-		if profile != "" {
-			m.log.Warn("adopt: unknown profile on inherited vm; routing to default",
-				"vmid", pv.VMID, "profile", profile, "default", m.defaultProfile())
-		}
+	unknownProfile := profile != "" && m.profileOf(profile) == nil
+	if profile == "" || unknownProfile {
 		profile = m.defaultProfile()
+	}
+	if unknownProfile {
+		m.log.Warn("adopt: unknown profile; destroying inherited vm", "vmid", pv.VMID, "profile", pv.Profile)
+		state = store.StateDestroying
+	} else if ps := m.profileOf(profile); ps != nil && ps.settings.GuestOS == "windows" {
+		if state == store.StateWarm && !m.snapshotRecycle() {
+			state = store.StateDestroying
+		} else if state == store.StateHot {
+			readCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
+			jit, err := m.prov.ReadJITConfig(readCtx, &provisioner.VM{VMID: pv.VMID, Node: pv.Node, Name: pv.Name, Profile: profile})
+			cancel()
+			if err != nil || len(jit) != 0 {
+				state = store.StateAssigned
+			}
+		}
 	}
 	// Snapshot-rollback mode: a stopped VM found at startup may carry a
 	// dirty disk (the previous leader crashed mid-job or between the
@@ -1256,6 +1264,8 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 	}
 	if recycleOnAdopt {
 		m.rollbackAsync(pv.VMID, pv.Node, pv.Name, profile)
+	} else if state == store.StateDestroying {
+		m.destroyOrSyncFallback(pv.VMID, pv.Node, profile) //nolint:contextcheck // destruction is owned by the manager worker context, surviving the adoption request
 	}
 }
 
@@ -2279,7 +2289,12 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 			// Snapshot mode deferred the power-on past the snapshot;
 			// start the VM now so runBootInline's WaitReady has a
 			// booting guest to poll.
-			if serr := m.prov.Start(prep.ctx, pv); serr != nil {
+			startTime := time.Now()
+			serr := m.prov.Start(prep.ctx, pv)
+			if m.metrics != nil {
+				m.metrics.ObserveStartupStage(m.cfg.ScaleSetName, prep.profileName, "power_on", time.Since(startTime))
+			}
+			if serr != nil {
 				m.log.Warn("clone: start after snapshot failed", "vmid", prep.vmid, "err", serr)
 				m.markPoisonOrDestroy(updated)
 				return
@@ -2477,7 +2492,12 @@ func (m *manager) runBoot(row *store.VM) {
 	ctx, cancel := context.WithTimeout(m.workerCtx, 5*time.Minute)
 	defer cancel()
 	pv := &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}
-	if err := m.prov.Start(ctx, pv); err != nil {
+	startTime := time.Now()
+	err := m.prov.Start(ctx, pv)
+	if m.metrics != nil {
+		m.metrics.ObserveStartupStage(m.cfg.ScaleSetName, row.Profile, "power_on", time.Since(startTime))
+	}
+	if err != nil {
 		m.log.Warn("boot: start failed", "vmid", row.VMID, "err", err)
 		m.markPoisonOrDestroy(row)
 		return
@@ -2494,7 +2514,11 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 	))
 	defer span.End()
 	bootStart := time.Now()
-	if err := m.prov.WaitReady(ctx, pv, m.cfg.GuestAgentTO); err != nil {
+	readyErr := m.prov.WaitReady(ctx, pv, m.cfg.GuestAgentTO)
+	if m.metrics != nil {
+		m.metrics.ObserveStartupStage(m.cfg.ScaleSetName, row.Profile, "guest_agent", time.Since(bootStart))
+	}
+	if err := readyErr; err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "wait-ready failed")
 		m.log.Warn("boot: wait-ready failed", "vmid", row.VMID, "err", err)

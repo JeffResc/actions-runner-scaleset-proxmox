@@ -2,6 +2,9 @@
 
 ## Hot and warm pools
 
+Linux and Windows guests use the same pool lifecycle but different guest
+launchers. Give each OS a separate scale set; see [Windows runners](windows-runners.md).
+
 Two pools trade cost against job-start latency:
 
 - **Hot** VMs are cloned, booted, and idle. A job starts on one in seconds.

@@ -1,0 +1,64 @@
+# Replace names, endpoint, node and template VMIDs for your installation.
+# Supply SCALESET_GITHUB_PAT_TOKEN and SCALESET_PROXMOX_AUTH_TOKEN_SECRET
+# through your environment or secret manager. See docs/windows-runners.md.
+github:
+  auth_mode: pat
+  pat: {}
+
+scalesets:
+  - name: linux-x64
+    scope: { org: my-org }
+    labels: [self-hosted, linux, x64, proxmox-linux]
+    runner_group: default
+    max_concurrent_runners: 4
+    vmid_range: { min: 10000, max: 10999 }
+    profiles:
+      - name: linux
+        labels: [self-hosted, linux, x64, proxmox-linux]
+        template_vmid: 9000
+        cpu: 4
+        memory_mb: 8192
+        hot_size: 0
+        warm_size: 0
+        max_concurrent_runners: 4
+  - name: windows-x64
+    scope: { org: my-org }
+    labels: [self-hosted, windows, x64, proxmox-windows]
+    runner_group: default
+    max_concurrent_runners: 2
+    vmid_range: { min: 11000, max: 11999 }
+    profiles:
+      - name: windows
+        guest_os: windows
+        windows_jit_path: 'C:\ProgramData\ActionsRunnerScaleSet\jitconfig'
+        labels: [self-hosted, windows, x64, proxmox-windows]
+        template_vmid: 9100
+        cpu: 4
+        memory_mb: 8192
+        hot_size: 0
+        warm_size: 0
+        max_concurrent_runners: 2
+
+proxmox:
+  endpoint: https://pve.example.com:8006/api2/json
+  auth:
+    token_id: scaleset@pve!automation
+  template_vmid: 9000
+  vmid_range: { min: 10000, max: 11999 }
+  storage: { disk: local-lvm, snippets: local }
+  network: { bridge: vmbr0 }
+  clone: { linked: true }
+
+nodes:
+  strategy: single
+  single_node: pve
+
+pool:
+  hot_size: 0
+  warm_size: 0
+  recycle_mode: snapshot_rollback
+  capacity:
+    enabled: true
+    reserve_memory_mb: 4096
+    cpu_overcommit_ratio: 2.0
+    evict_idle_for_demand: true

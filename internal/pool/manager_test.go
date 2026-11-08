@@ -353,7 +353,7 @@ func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner,
 	}
 
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
-	var w io.Writer = io.Discard //nolint:staticcheck // explicit interface type required so reassignment to testWriter compiles
+	var w io.Writer = io.Discard //nolint:staticcheck,revive // explicit interface type required so reassignment to testWriter compiles
 	if testing.Verbose() {
 		w = testWriter{t}
 	}
@@ -3903,4 +3903,42 @@ func TestSweepStuckRows_RecyclingRowSelfHealsToDestroy(t *testing.T) {
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
 	require.Empty(t, fp.rollbacks, "the sweep must destroy, not retry the rollback")
+}
+
+type adoptWindowsProv struct {
+	*fakeProv
+	jit     []byte
+	readErr error
+}
+
+func (p *adoptWindowsProv) ReadJITConfig(_ context.Context, _ *provisioner.VM) ([]byte, error) {
+	return p.jit, p.readErr
+}
+func TestAdoptWindowsJITReadback(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		jit   []byte
+		err   error
+		state store.State
+	}{
+		{"clean", nil, nil, store.StateHot}, {"consumed", []byte("jit"), nil, store.StateAssigned}, {"unavailable", nil, errors.New("agent unavailable"), store.StateAssigned},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			fp := &adoptWindowsProv{fakeProv: &fakeProv{}, jit: tc.jit, readErr: tc.err}
+			mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "win", GuestOS: "windows", MaxConcurrentRunners: 10}}})
+			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, nil)
+			row, err := st.Get(10001)
+			require.NoError(t, err)
+			require.Equal(t, tc.state, row.State)
+		})
+	}
+}
+
+func TestAdoptStoppedWindowsDestroysUnverifiedDisk(t *testing.T) {
+	st := newTestStore(t)
+	fp := &fakeProv{powerStateBy: map[int]string{10001: "stopped"}}
+	mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "win", GuestOS: "windows", MaxConcurrentRunners: 10}}})
+	mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, nil)
+	require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.destroys) > 0 }, time.Second, time.Millisecond)
 }

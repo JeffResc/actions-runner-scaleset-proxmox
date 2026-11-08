@@ -89,6 +89,8 @@ scaleset:
   runner_group: default
   max_concurrent_runners: 50
 
+# See examples/windows-linux.yaml for a complete mixed-OS configuration.
+# Windows and Linux profiles require separate scale sets.
 # --- Multi-scaleset shape (issue #1) ---
 # As an alternative to the singular `scaleset:` + top-level
 # `github.scope` + top-level `profiles:` form above, declare a
@@ -375,6 +377,8 @@ pool:
 # profiles:
 #   - name: linux-x64
 #     labels: [self-hosted, linux, proxmox]   # == scaleset.labels
+#     # guest_os: linux             # default; use windows for a Windows template
+#     # windows_jit_path: 'C:\ProgramData\ActionsRunnerScaleSet\jitconfig' # Windows launcher must use the same path
 #     template_vmid: 9000           # optional override of the global proxmox.template_vmid
 #     cpu: 4                        # cores; 0 inherits the template default
 #     memory_mb: 8192               # 0 inherits the template default

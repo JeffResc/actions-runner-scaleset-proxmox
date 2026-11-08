@@ -113,7 +113,7 @@ func TestReconcile_OrphanPrunedWhenRowAppearsBeforeRemoveRunnerRetry(t *testing.
 			// prefix; ListRunnersByPrefix filters out anything
 			// else, so a foreign-prefix entry would look like
 			// an empty list to the cleanup logic.
-			_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":42,"name":"gh-runner-test-replacement","status":"online","busy":false}]}`))
+			_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":42,"name":"gh-runner-test-9998","status":"online","busy":false}]}`))
 		}
 	})
 	fs.srv.Close()
@@ -242,7 +242,7 @@ func TestListRunnersByPrefix_RetriesTransient5xx(t *testing.T) {
 		}
 		// Subsequent calls: success with one matching runner.
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":1,"name":"gh-runner-x","status":"online","busy":false}]}`))
+		_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":1,"name":"gh-runner-42","status":"online","busy":false}]}`))
 	}))
 	defer srv.Close()
 
